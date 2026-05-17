@@ -1,0 +1,6 @@
+anthropic
+python-telegram-bot
+pandas
+numpy
+requests
+python-dotenv

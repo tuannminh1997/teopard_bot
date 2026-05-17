@@ -1,0 +1,16 @@
+1. Lời nói đầu xin luôn ghi nhớ tiền của bạn là của bạn.
+2. Danh sách các lệnh được hỗ trợ:
+- /start hoặc chọn 'Bắt đầu' trên Menu: lấy User ID và kích hoạt bot.
+- /help hoặc chọn 'Giúp đỡ' trên Menu: xem cách sử dụng bot.
+- /listsymbols hoặc chọn 'Xem danh sách symbol' trên Menu: xem các coin hiện được hỗ trợ, nếu coin bạn cần phân tích không có trong danh sách, vui lòng liên hệ admin để được thêm vào.
+3. Cách sử dụng bot sau khi đã kích hoạt tài khoản:
+- Lấy danh sách coin được hỗ trợ.
+- Nhập vào khung chat tên coin trong danh sách, không cần phân biệt chữ hoa hay chữ thường, ví dụ: BTC hoặc btc.
+- Chọn khung thời gian cần phân tích và chờ đợi kết quả:
++ Ngắn hạn: phân tích xu hướng trải dài từ khung 4H đến tối đa 1W, phù hợp cho trade spot/future ngắn hạn.
++ Dài hạn: phân tích xu hướng trải dài từ khung 1W đến tối đa 3M, phù hợp cho trade spot/future dài hạn.
+
+Lưu ý:
+- Bot chỉ hỗ trợ phân tích, người đưa ra quyết định cuối cùng vẫn là bạn, nếu có thắc mắc đọc lại dòng 1.
+- Dù mỗi coin có biểu đồ và xu hướng khác nhau, tuy nhiên vẫn sẽ bị ảnh hưởng bởi BTC, cho nên nếu phân tích giữa BTC và coin bạn cần phân tích lệch xu hướng nhau thì hay cẩn thận.
+- Do kinh phí eo hẹp nên hiện tại giới hạn sử dụng bot mỗi ngày là 10 lượt.
