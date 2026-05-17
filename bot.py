@@ -36,11 +36,11 @@ async def setup_bot_menu(app: Application) -> None:
 
 
 def main() -> None:
-    def main() -> None:
-        print("BOT_TOKEN:", os.getenv("BOT_TOKEN"))
-        print("All env vars:", {k: v for k, v in os.environ.items() if 'BOT' in k or 'ANTHROPIC' in k})
-        if not BOT_TOKEN:
-            raise RuntimeError("Thiếu BOT_TOKEN trong file .env")
+    print("BOT_TOKEN:", os.getenv("BOT_TOKEN"))
+    print("All env vars:", {k: v for k, v in os.environ.items() if 'BOT' in k or 'ANTHROPIC' in k})
+    
+    if not BOT_TOKEN:
+        raise RuntimeError("Thiếu BOT_TOKEN trong file .env")
 
     app = (
         Application.builder()
