@@ -1,4 +1,5 @@
 ﻿import sqlite3
+import os
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -11,7 +12,7 @@ from telegram.ext import (
     filters,
 )
 
-DB_PATH = "bot.db"
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 ANALYZE_SHORT_CALLBACK_PREFIX = "analyze_short"
 ANALYZE_LONG_CALLBACK_PREFIX = "analyze_long"
 
