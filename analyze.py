@@ -370,7 +370,7 @@ def call_claude_analysis(symbol: str, mode: str) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=1500,
+        max_tokens=2000,
         temperature=0.5,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
