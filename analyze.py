@@ -13,20 +13,18 @@ load_dotenv()
 
 BINANCE_API_URL = "https://api.binance.com/api/v3/klines"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-4-sonnet-20250514")
 
 SHORT_TERM_TIMEFRAMES = {
     "4H": ("4h", 500),
     "12H": ("12h", 500),
     "24H": ("1d", 500),
-    "48H": ("48h_resampled", 500),
-    "1W": ("1w", 300),
 }
 
 LONG_TERM_TIMEFRAMES = {
+    "24H": ("1d", 500),
+    "48H": ("48h_resampled", 500),
     "1W": ("1w", 300),
-    "1M": ("1M", 200),
-    "3M": ("3m_resampled", 100),
 }
 
 
@@ -121,29 +119,6 @@ def resample_to_48h(df: pd.DataFrame | None) -> pd.DataFrame | None:
         .reset_index()
     )
 
-def resample_to_nmonths(df: pd.DataFrame | None, months: int) -> pd.DataFrame | None:
-    if df is None or df.empty:
-        return None
-
-    return (
-        df.set_index("timestamp")
-        .resample(f"{months}ME")
-        .agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-                "quote_volume": "sum",
-                "taker_buy_volume": "sum",
-                "taker_buy_quote_volume": "sum",
-                "count": "sum",
-            }
-        )
-        .dropna()
-        .reset_index()
-    )
 
 def calculate_ema(data: pd.Series, period: int) -> pd.Series:
     return data.ewm(span=period, adjust=False, min_periods=period).mean()
@@ -195,8 +170,8 @@ def calculate_macd(
     return macd_line, signal_line, histogram
 
 
-def calculate_technical_indicators(df: pd.DataFrame | None, min_rows: int = 80) -> pd.DataFrame | None:
-    if df is None or len(df) < min_rows:
+def calculate_technical_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None or len(df) < 80:
         return None
 
     result = df.copy()
@@ -236,32 +211,33 @@ def get_fear_greed_index() -> str:
         return "Chỉ số sợ hãi và tham lam: không có dữ liệu"
 
 
+def get_current_price(symbol: str) -> str:
+    try:
+        response = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": symbol},
+            timeout=30,
+        )
+        response.raise_for_status()
+        price = float(response.json()["price"])
+        return f"Giá hiện tại: {format_number(price)} USDT"
+    except Exception as exc:
+        print(f"Không lấy được giá hiện tại cho {symbol}: {exc}")
+        return "Giá hiện tại: không có dữ liệu"
+
+
 def get_timeframe_data(symbol: str, mode: str) -> dict[str, pd.DataFrame | None]:
     configs = SHORT_TERM_TIMEFRAMES if mode == "short" else LONG_TERM_TIMEFRAMES
     result: dict[str, pd.DataFrame | None] = {}
-
-    min_rows_map = {
-        "4H": 100,
-        "12H": 100,
-        "24H": 100,
-        "48H": 55,
-        "1W": 55,
-        "1M": 6,
-        "3M": 4,
-    }
 
     for label, (interval, limit) in configs.items():
         if interval == "48h_resampled":
             base_df = get_binance_klines(symbol, "12h", 1000)
             raw_df = resample_to_48h(base_df)
-        elif interval == "3m_resampled":
-            base_df = get_binance_klines(symbol, "1M", 300)
-            raw_df = resample_to_nmonths(base_df, 3)
         else:
             raw_df = get_binance_klines(symbol, interval, limit)
 
-        min_rows = min_rows_map.get(label, 80)
-        result[label] = calculate_technical_indicators(raw_df, min_rows)
+        result[label] = calculate_technical_indicators(raw_df)
 
     return result
 
@@ -279,7 +255,7 @@ def format_number(value: float) -> str:
     return f"{value:,.8f}"
 
 
-def format_timeframe_rows(df: pd.DataFrame, row_count: int = 20) -> str:
+def format_timeframe_rows(df: pd.DataFrame, row_count: int = 30) -> str:
     rows = []
 
     for _, row in df.tail(row_count).iterrows():
@@ -315,23 +291,30 @@ def format_analysis_prompt(
     mode: str,
     timeframe_data: dict[str, pd.DataFrame | None],
     fear_greed_info: str,
+    current_price_info: str,
 ) -> str:
     mode_label = "ngắn hạn" if mode == "short" else "dài hạn"
-    timeframe_label = "4H, 12H, 24H, 48H, 1W" if mode == "short" else "1W, 1M, 3M"
+    timeframe_label = "4H, 12H, 24H" if mode == "short" else "24H, 48H, 1W"
     focus_text = (
-        "Dùng toàn bộ 5 khung 4H, 12H, 24H, 48H, 1W để phân tích và đưa ra quyết định. Các khung 4H, 12H, 24H, 48H cho tín hiệu ngắn hạn, khung 1W xác nhận xu hướng tổng thể."
+        "Ưu tiên 4H và 12H để ra quyết định, dùng 24H để xác nhận xu hướng lớn hơn."
         if mode == "short"
-        else "Dùng toàn bộ 3 khung 1W, 1M, 3M để phân tích và đưa ra quyết định. Khung 1W cho tín hiệu ngắn trong dài hạn, 1M xác nhận xu hướng trung hạn, 3M xác nhận xu hướng tổng thể."
+        else "Ưu tiên 24H và 48H để ra quyết định, dùng 1W để xác nhận xu hướng lớn hơn."
     )
 
     prompt = f"""
 YÊU CẦU PHÂN TÍCH {mode_label.upper()} CHO {symbol}
 
+{current_price_info}
 Khung thời gian được cung cấp: {timeframe_label}
 Cách đọc dữ liệu: {focus_text}
 {fear_greed_info}
 
-Hãy dùng số liệu EMA, RSI, MACD, khối lượng trong dữ liệu bên dưới để phân tích và đưa ra chiến lược theo đúng định dạng yêu cầu.
+Chỉ trả về 2 phần sau:
+1. Chiến lược giao dịch
+2. Kịch bản & xác suất
+
+Không trả về các phần khác như xu hướng tổng quan, hỗ trợ kháng cự riêng lẻ, phân tích chỉ báo riêng lẻ hoặc kết luận dài.
+Hãy dùng số liệu EMA, RSI, MACD, khối lượng trong dữ liệu bên dưới để giải thích ngắn gọn cho chiến lược và kịch bản.
 
 Định dạng mỗi dòng dữ liệu:
 Thời gian | Mở cửa | Cao nhất | Thấp nhất | Đóng cửa | EMA7 | EMA25 | EMA50 | RSI6 | RSI12 | RSI24 | MACD | Tín hiệu MACD | Cột MACD | Khối lượng | Khối lượng trung bình 20 kỳ | Tỷ lệ khối lượng
@@ -360,32 +343,32 @@ def call_claude_analysis(symbol: str, mode: str) -> str:
 
     system_prompt = load_analysis_system_prompt()
     fear_greed_info = get_fear_greed_index()
+    current_price_info = get_current_price(binance_symbol)
     user_prompt = format_analysis_prompt(
         symbol=binance_symbol,
         mode=mode,
         timeframe_data=timeframe_data,
         fear_greed_info=fear_greed_info,
+        current_price_info=current_price_info,
     )
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=2000,
-        temperature=0.5,
+        max_tokens=3000,
+        temperature=0,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
         timeout=300,
     )
 
-    return response.content[0].text
+    return "".join(
+        block.text
+        for block in response.content
+        if hasattr(block, "text")
+    )
 
 
 async def analyze_symbol(symbol: str, mode: str) -> str:
     return await asyncio.to_thread(call_claude_analysis, symbol, mode)
-
-
-
-
-
-
-
