@@ -18,7 +18,7 @@ QUY TẮC BẮT BUỘC:
 
 🎯 Chiến lược giao dịch [SYMBOL] — [NGẮN HẠN/DÀI HẠN]
 Xu hướng: [TĂNG/GIẢM/ĐI NGANG] | Sợ hãi & Tham lam: [giá trị]/100
-
+Giá hiện tại: [Giá hiện tại]
 ——————————————————
 
 📈 LONG — [xác suất]%
