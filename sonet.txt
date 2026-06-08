@@ -1,0 +1,54 @@
+Chiến lược giao dịch BTCUSDT — NGẮN HẠN
+Xu hướng: GIẢM | Sợ hãi & Tham lam: 8/100
+Giá hiện tại: 62,850.72 USDT
+
+——————————————————
+
+💣 Thanh lý đáng chú ý:
+
+Cụm long: 61,000 – 61,400 — vùng này tập trung nhiều đáy nến 4H trong các phiên 06/06 đến 07/06 (low 60,393 – 60,746), đồng thời là vùng tâm lý tròn 61,000 nơi giá nhiều lần bật lại. Lệnh long đòn bẩy mở tại đây dễ bị quét nếu giá xuyên thủng.
+
+Cụm short: 63,800 – 64,500 — vùng high tập trung của các nến 4H ngày 04/06 (high 64,494) và 08/06 (high 63,863), cũng là vùng EMA7 4H hiện tại 62,488 đang hội tụ với EMA25 62,969. Lệnh short đòn bẩy mở tại đây dễ bị quét nếu giá vượt lên.
+
+Ảnh hưởng: Cụm short 63,800 – 64,500 được dùng để xác định entry SHORT và SL. Cụm long 61,000 – 61,400 được dùng làm TP1 SHORT và SL LONG nếu có kịch bản phục hồi.
+
+——————————————————
+
+📉 SHORT — 55%
+Entry: 63,600 – 64,200
+SL: 64,600
+TP1: 61,200
+TP2: 59,500
+Kích hoạt: Giá hồi về vùng 63,600 – 64,200 và nến 4H đóng cửa dưới EMA7 4H (62,488), RSI6 4H không vượt 70, khối lượng hồi thấp hơn trung bình 20 kỳ 5,338.
+Lý do: Trên 24H, MACD đang ở -4,050 và tiếp tục mở rộng cột âm -1,092, EMA7 24H (64,259) cách xa EMA25 (70,469) cho thấy xu hướng giảm còn mạnh. Trên 4H, EMA7 (62,488) và EMA25 (62,969) đều nằm dưới EMA50 (65,407), RSI24 4H chỉ 41.45 chưa hồi phục. Vùng entry 63,600 – 64,200 nằm trong cụm thanh lý short 63,800 – 64,500, nơi lệnh short đòn bẩy tập trung và có thể bị quét trước khi giá tiếp tục giảm, do đó entry thấp hơn đỉnh cụm để tránh bị quét oan.
+
+——————————————————
+
+📈 LONG — 15%
+Entry: 61,000 – 61,400
+SL: 60,200
+TP1: 63,000
+TP2: 64,200
+Kích hoạt: Giá chạm vùng 61,000 – 61,400, nến 4H đóng cửa tăng với khối lượng vượt trung bình 20 kỳ 5,338, RSI6 4H xuống dưới 20 và bật lên.
+Lý do: Vùng 61,000 – 61,400 là cụm thanh lý long tập trung (low 60,393 – 60,746 trên 4H ngày 06/06), nếu giá quét vùng này và hấp thụ được lực bán thì có thể bật kỹ thuật ngắn hạn. Tuy nhiên MACD 12H vẫn ở -3,488 và cột âm -89.56 chưa thu hẹp đủ, xác suất thấp, chỉ phù hợp scalp nhanh.
+
+——————————————————
+
+⏳ CHỜ — 30%
+Điều kiện chờ: Hiện tại giá 62,850 nằm giữa hai cụm thanh lý, không phải vùng entry tối ưu cho cả hai chiều. Chờ giá hồi về 63,600 – 64,200 để vào SHORT, hoặc chờ giá giảm về 61,000 – 61,400 để xem xét LONG scalp. Không vào lệnh tại vùng giữa vì rủi ro/lợi nhuận không hợp lý.
+
+——————————————————
+
+⚠️ Rủi ro chính:
+
+Rủi ro 1: Chỉ số sợ hãi 8/100 ở mức cực đoan, thị trường có thể xuất hiện bật kỹ thuật mạnh bất ngờ. Nến 4H ngày 07/06 20:00 tăng từ 61,217 lên 64,234 với khối lượng 6,995 (tỷ lệ 1.29) cho thấy lực mua đột biến vẫn có thể xuất hiện.
+
+Rủi ro 2: Khối lượng 24H hiện tại ngày 08/06 chỉ 5,332 so với trung bình 20 kỳ 19,530 (tỷ lệ 0.27), thị trường thanh khoản thấp khiến biến động giá có thể bị khuếch đại bất thường theo cả hai chiều.
+
+——————————————————
+
+📊 Tóm tắt kịch bản:
+
+Kịch bản xảy ra nhiều nhất (55%): Giá hồi nhẹ về vùng 63,600 – 64,200 rồi tiếp tục giảm về 61,000 – 59,500 do xu hướng giảm trên cả 3 khung thời gian còn nguyên vẹn với MACD 24H -4,050 và EMA7 24H (64,259) vẫn cách xa EMA25 (70,469).
+
+Cần theo dõi: Nến 4H đóng cửa vượt và giữ trên 64,500 kèm khối lượng trên 7,000 sẽ vô hiệu hóa kịch bản SHORT và báo hiệu đảo chiều ngắn hạn. Ngược lại, nến 4H đóng cửa dưới 61,000 với khối lượng cao xác nhận tiếp tục giảm về TP2 59,500.

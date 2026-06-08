@@ -1,0 +1,37 @@
+Chiến lược giao dịch BTCUSDT — NGẮN HẠN
+Xu hướng: GIẢM | Sợ hãi & Tham lam: 8/100
+Giá hiện tại: 62,918.54 USDT
+
+——————————————————
+
+💣 Thanh lý đáng chú ý:
+- Cụm long: 63,885.99 - 64,494.92 — vùng high tập trung từ nến 12H ngày 04/06, khối lượng tăng 1.19 lần, RSI6 lên 34.74 cho thấy lực mua vào
+- Cụm short: 60,438.01 - 61,056.47 — vùng low tập trung từ nến 12H ngày 05/06, khối lượng cao 2.79 lần, RSI6 xuống 14.08 cho thấy áp lực bán mạnh
+- Ảnh hưởng: Cụm short là vùng hỗ trợ chính để đặt SL cho lệnh SHORT, cụm long là mục tiêu TP1 khi giá giảm từ vùng entry hiện tại
+
+——————————————————
+
+📉 SHORT — 75%
+Entry: 62,700 - 62,918
+SL: 64,500
+TP1: 61,056
+TP2: 60,438
+Kích hoạt: Giá đóng cửa 4H ở 62,918.54 dưới EMA7 (62,505.86) và EMA25 (62,974.62), RSI6 ở 60.21 cho thấy quá mua nhưng MACD cột âm -545.27 xác nhận áp lực bán, khối lượng 4H cuối cùng 1,895.96 thấp hơn trung bình 5,332.32 cho thấy sức bán yếu dần
+Lý do: EMA7 đang dưới EMA25 (62,505.86 < 62,974.62) trên 4H, MACD cột âm -545.27 xác nhận xu hướng giảm, RSI6 cao 60.21 nhưng khối lượng giảm 0.36 lần so với trung bình cho thấy sự suy yếu. Entry gần cụm long 63,885.99 được bảo vệ, SL đặt trên cụm long để tránh bị quét oan, TP1 tại cụm short 61,056 nơi lệnh đòn bẩy long dễ bị quét
+
+——————————————————
+
+⏳ CHỜ — 25%
+Điều kiện chờ: Nếu giá phục hồi trên EMA25 (62,974.62) trên 4H và RSI6 vượt 70, cần xác nhận lại xu hướng trước khi vào SHORT. Nếu khối lượng tăng trên 1.5 lần trung bình khi giá ở 62,700-62,918, sẽ tăng xác suất SHORT lên 85%
+
+——————————————————
+
+⚠️ Rủi ro chính:
+- Khối lượng 4H cuối cùng 1,895.96 thấp hơn trung bình 5,332.32 (0.36 lần) cho thấy sức bán yếu, có thể dẫn đến phục hồi ngắn hạn trước khi tiếp tục giảm
+- RSI6 ở 60.21 gần vùng quá mua, nếu không có xác nhận từ khối lượng tăng, lệnh SHORT có thể bị dừng sớm
+
+——————————————————
+
+📊 Tóm tắt kịch bản:
+- Kịch bản xảy ra nhiều nhất (75%): Giá giảm từ 62,918 xuống cụm short 61,056-60,438 do MACD cột âm -545.27 và EMA7 dưới EMA25, khối lượng yếu cho thấy bán áp đảo
+- Cần theo dõi: Nếu khối lượng tăng đột biến trên 1.5 lần khi giá ở entry, SHORT sẽ mạnh hơn; nếu giá vượt 64,500 với khối lượng cao, kịch bản sẽ bị vô hiệu hóa
