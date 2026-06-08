@@ -356,10 +356,9 @@ def call_claude_analysis(symbol: str, mode: str) -> str:
     response = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=3000,
-        temperature=0,
+        temperature=0.1,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
         timeout=300,
     )
 
