@@ -218,6 +218,8 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def job_check_predictions(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Chạy mỗi giờ, tự check prediction PENDING đến hạn và thông báo admin."""
+    from datetime import datetime
+    print(f"[AUTO_CHECK] Job chạy lúc {datetime.now().isoformat()}", flush=True)
     from analyze import auto_check_pending_predictions
     from auth import ADMIN_USER_IDS
 
@@ -253,7 +255,7 @@ def register_symbol_handlers(app: Application) -> None:
     if app.job_queue is None:
         print("JobQueue is not available. Install python-telegram-bot[job-queue].")
     else:
-        app.job_queue.run_repeating(job_check_predictions, interval=3600, first=300)
+        app.job_queue.run_repeating(job_check_predictions, interval=60, first=30)
 
 
 def symbol_control_commands() -> list[BotCommand]:
