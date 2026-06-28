@@ -2,7 +2,7 @@ import asyncio
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import anthropic
@@ -52,6 +52,7 @@ def init_prediction_db() -> None:
                 mode                TEXT NOT NULL,
                 created_at          TEXT NOT NULL,
                 check_after_hours   INTEGER NOT NULL,
+                next_check_at       TEXT,
                 direction           TEXT NOT NULL,
                 entry_low           REAL,
                 entry_high          REAL,
@@ -73,10 +74,27 @@ def init_prediction_db() -> None:
             ("full_response",     "TEXT"),
             ("result_reason",     "TEXT"),
             ("market_snapshot",   "TEXT"),
+            ("next_check_at",     "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {definition}")
             except sqlite3.OperationalError:
+                pass
+        rows = conn.execute(
+            "SELECT id, created_at, check_after_hours FROM predictions "
+            "WHERE result = 'PENDING' AND (next_check_at IS NULL OR next_check_at = '')"
+        ).fetchall()
+        for pid, created_at, check_hours in rows:
+            try:
+                created = parse_utc_datetime(created_at)
+                if created is None:
+                    continue
+                next_check_at = (created + timedelta(hours=int(check_hours))).isoformat()
+                conn.execute(
+                    "UPDATE predictions SET next_check_at=? WHERE id=?",
+                    (next_check_at, pid),
+                )
+            except Exception:
                 pass
         conn.commit()
 
@@ -94,18 +112,20 @@ def save_prediction(
     reasoning_summary: str | None,
     full_response: str | None,
 ) -> int:
-    now         = datetime.now(timezone.utc).isoformat()
+    created_dt = datetime.now(timezone.utc)
+    now = created_dt.isoformat()
     check_hours = RESULT_CHECK_HOURS.get(mode, 24)
+    next_check_at = (created_dt + timedelta(hours=check_hours)).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
             """
             INSERT INTO predictions
-                (symbol, mode, created_at, check_after_hours, direction,
+                (symbol, mode, created_at, check_after_hours, next_check_at, direction,
                  entry_low, entry_high, sl, tp1, tp2,
                  market_snapshot, reasoning_summary, full_response)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (symbol, mode, now, check_hours, direction,
+            (symbol, mode, now, check_hours, next_check_at, direction,
              entry_low, entry_high, sl, tp1, tp2,
              market_snapshot, reasoning_summary, full_response),
         )
@@ -114,29 +134,37 @@ def save_prediction(
 
 
 def get_pending_predictions() -> list[dict]:
-    now = datetime.now(timezone.utc)
+    """
+    Chỉ lấy prediction PENDING đã đến hạn check.
+    Không quét toàn bộ PENDING rồi tự tính trong Python nữa.
+    """
+    now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT id, symbol, mode, created_at, check_after_hours, "
+            "SELECT id, symbol, mode, created_at, check_after_hours, next_check_at, "
             "direction, entry_low, entry_high, sl, tp1, tp2 "
-            "FROM predictions WHERE result = 'PENDING'"
+            "FROM predictions "
+            "WHERE result = 'PENDING' AND next_check_at IS NOT NULL AND next_check_at <= ?",
+            (now,),
         ).fetchall()
 
-    due = []
-    for row in rows:
-        pid, symbol, mode, created_at, check_hours, direction, entry_low, entry_high, sl, tp1, tp2 = row
-        try:
-            created = datetime.fromisoformat(created_at)
-        except Exception:
-            continue
-        if (now - created).total_seconds() / 3600 >= check_hours:
-            due.append({
-                "id": pid, "symbol": symbol, "mode": mode,
-                "created_at": created_at, "direction": direction,
-                "entry_low": entry_low, "entry_high": entry_high,
-                "sl": sl, "tp1": tp1, "tp2": tp2,
-            })
-    return due
+    return [
+        {
+            "id": row[0],
+            "symbol": row[1],
+            "mode": row[2],
+            "created_at": row[3],
+            "check_after_hours": row[4],
+            "next_check_at": row[5],
+            "direction": row[6],
+            "entry_low": row[7],
+            "entry_high": row[8],
+            "sl": row[9],
+            "tp1": row[10],
+            "tp2": row[11],
+        }
+        for row in rows
+    ]
 
 
 def update_prediction_result(
@@ -264,7 +292,18 @@ def get_binance_klines_since(
 
 
 def evaluate_prediction_with_candles(pred: dict, candles: pd.DataFrame | None) -> tuple[str, float | None, str]:
-    direction, sl, tp1 = pred["direction"], pred["sl"], pred["tp1"]
+    """
+    Chấm prediction theo đúng flow lệnh chờ:
+    1) Giá phải chạm vùng Entry trước.
+    2) Sau khi Entry được khớp, mới bắt đầu tính TP1/SL.
+    3) Nếu hết hạn mà chưa chạm Entry: NOT_FILLED.
+    """
+    direction = pred["direction"]
+    entry_low = pred.get("entry_low")
+    entry_high = pred.get("entry_high")
+    sl = pred.get("sl")
+    tp1 = pred.get("tp1")
+
     if not sl or not tp1:
         return "UNKNOWN", None, "Missing SL or TP1, cannot evaluate outcome."
     if candles is None or candles.empty:
@@ -276,32 +315,66 @@ def evaluate_prediction_with_candles(pred: dict, candles: pd.DataFrame | None) -
     if candles.empty:
         return "UNKNOWN", None, "No closed candle after prediction."
 
+    # Nếu không parse được Entry thì fallback về cách cũ: xem như đã vào lệnh ngay.
+    require_entry_fill = entry_low is not None and entry_high is not None
+    entry_filled = not require_entry_fill
+    entry_time = None
+
     for _, row in candles.iterrows():
         high = float(row["high"])
         low = float(row["low"])
+        close = float(row["close"])
         closed_at = str(row["close_time"])[:16]
+
+        if not entry_filled:
+            touched_entry = low <= float(entry_high) and high >= float(entry_low)
+            if not touched_entry:
+                continue
+            entry_filled = True
+            entry_time = closed_at
+
+            # Trong cùng một nến vừa chạm Entry mà cũng chạm TP/SL thì không biết thứ tự.
+            if direction == "LONG":
+                same_candle_tp = high >= tp1
+                same_candle_sl = low <= sl
+            elif direction == "SHORT":
+                same_candle_tp = low <= tp1
+                same_candle_sl = high >= sl
+            else:
+                same_candle_tp = same_candle_sl = False
+
+            if same_candle_tp or same_candle_sl:
+                return (
+                    "AMBIGUOUS",
+                    close,
+                    f"Entry zone and TP1/SL were touched in the same 15m candle at {closed_at}; order is unknown.",
+                )
+            continue
 
         if direction == "LONG":
             hit_tp = high >= tp1
             hit_sl = low <= sl
             if hit_tp and hit_sl:
-                return "AMBIGUOUS", float(row["close"]), f"TP1 and SL both touched in the same 15m candle at {closed_at}."
+                return "AMBIGUOUS", close, f"TP1 and SL both touched in the same 15m candle at {closed_at}."
             if hit_tp:
-                return "WIN", tp1, f"TP1 touched before SL at {closed_at}."
+                return "WIN", tp1, f"Entry filled at {entry_time or 'prediction time'}; TP1 touched before SL at {closed_at}."
             if hit_sl:
-                return "LOSS", sl, f"SL touched before TP1 at {closed_at}."
+                return "LOSS", sl, f"Entry filled at {entry_time or 'prediction time'}; SL touched before TP1 at {closed_at}."
 
         if direction == "SHORT":
             hit_tp = low <= tp1
             hit_sl = high >= sl
             if hit_tp and hit_sl:
-                return "AMBIGUOUS", float(row["close"]), f"TP1 and SL both touched in the same 15m candle at {closed_at}."
+                return "AMBIGUOUS", close, f"TP1 and SL both touched in the same 15m candle at {closed_at}."
             if hit_tp:
-                return "WIN", tp1, f"TP1 touched before SL at {closed_at}."
+                return "WIN", tp1, f"Entry filled at {entry_time or 'prediction time'}; TP1 touched before SL at {closed_at}."
             if hit_sl:
-                return "LOSS", sl, f"SL touched before TP1 at {closed_at}."
+                return "LOSS", sl, f"Entry filled at {entry_time or 'prediction time'}; SL touched before TP1 at {closed_at}."
 
-    return "PENDING_STILL", float(candles.iloc[-1]["close"]), "No TP1 or SL touch before expiry."
+    last_close = float(candles.iloc[-1]["close"])
+    if require_entry_fill and not entry_filled:
+        return "NOT_FILLED", last_close, "Entry zone was not touched before expiry."
+    return "PENDING_STILL", last_close, "Entry was filled, but TP1 or SL was not touched before expiry."
 
 
 async def auto_check_pending_predictions() -> list[str]:
@@ -329,7 +402,7 @@ async def auto_check_pending_predictions() -> list[str]:
         if result == "PENDING_STILL":
             result = "EXPIRED"
         update_prediction_result(pred["id"], result, price, reason)
-        emoji = {"WIN": "✅", "LOSS": "❌"}.get(result, "⏱")
+        emoji = {"WIN": "✅", "LOSS": "❌", "NOT_FILLED": "🚫", "AMBIGUOUS": "⚠️"}.get(result, "⏱")
         messages.append(
             f"{emoji} [{pred['symbol']} {pred['mode'].upper()}] "
             f"{pred['direction']} từ {pred['created_at'][:10]} → {result} "

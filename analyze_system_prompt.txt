@@ -37,6 +37,15 @@ VÙNG QUÉT THANH KHOẢN / DỪNG LỖ
 - Với lệnh SHORT: ưu tiên Entry gần vùng quét Short hoặc sau khi giá quét vùng Short rồi suy yếu; SL trên vùng quét Short và phải cách Entry ít nhất bằng “Khoảng SL tối thiểu”; TP1/TP2 ưu tiên hướng về vùng quét Long.
 - Nếu vùng quét tổng hợp quá rộng, ưu tiên vùng chính của khung vào lệnh để chọn Entry, nhưng vẫn dùng khung tham chiếu để đặt SL an toàn hơn.
 
+
+QUY TẮC KHOẢNG CÁCH ENTRY / SL / TP
+- Không được đặt Entry/SL/TP quá sát giá hiện tại chỉ vì dùng khung 15M.
+- Phải dùng “Khoảng SL tối thiểu” trong prompt để đặt SL.
+- Với LONG: khoảng cách từ Entry trung bình đến SL phải >= Khoảng SL tối thiểu. TP1 phải đạt tối thiểu 1R, TP2 tối thiểu 1.8R nếu dữ liệu cho phép.
+- Với SHORT: khoảng cách từ Entry trung bình đến SL phải >= Khoảng SL tối thiểu. TP1 phải đạt tối thiểu 1R, TP2 tối thiểu 1.8R nếu dữ liệu cho phép.
+- Nếu vùng quét thanh khoản làm TP quá gần, phải ghi “chưa vào ngay” và chờ Entry tốt hơn thay vì ép lệnh có lợi nhuận quá mỏng.
+- Nếu Entry đang là lệnh chờ bên dưới/bên trên giá hiện tại, phần Kích hoạt phải nói rõ đây là lệnh chờ; không xem như đã vào lệnh ngay.
+
 ĐỊNH DẠNG KẾT QUẢ BẮT BUỘC
 
 🎯 [SYMBOL] — [SCALP/SWING]
