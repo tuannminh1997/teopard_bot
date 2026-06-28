@@ -1,5 +1,5 @@
 anthropic
-python-telegram-bot
+python-telegram-bot[job-queue]
 pandas
 numpy
 requests

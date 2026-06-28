@@ -1,16 +1,33 @@
 1. Lời nói đầu xin luôn ghi nhớ tiền của bạn là của bạn.
-2. Danh sách các lệnh được hỗ trợ:
+
+2. Danh sách lệnh cho user:
 - /start hoặc chọn 'Bắt đầu' trên Menu: lấy User ID và kích hoạt bot.
-- /help hoặc chọn 'Giúp đỡ' trên Menu: xem cách sử dụng bot.
-- /listsymbols hoặc chọn 'Xem danh sách symbol' trên Menu: xem các coin hiện được hỗ trợ, nếu coin bạn cần phân tích không có trong danh sách, vui lòng liên hệ admin để được thêm vào.
-3. Cách sử dụng bot sau khi đã kích hoạt tài khoản:
-- Lấy danh sách coin được hỗ trợ.
-- Nhập vào khung chat tên coin trong danh sách, không cần phân biệt chữ hoa hay chữ thường, ví dụ: BTC hoặc btc.
-- Chọn khung thời gian cần phân tích và chờ đợi kết quả:
-+ Ngắn hạn: phân tích xu hướng trải dài từ khung 4H đến tối đa 1W, phù hợp cho trade spot/future ngắn hạn.
-+ Dài hạn: phân tích xu hướng trải dài từ khung 1W đến tối đa 3M, phù hợp cho trade spot/future dài hạn.
+- /whoami hoặc chọn 'Lấy User ID' trên Menu: xem User ID của bạn.
+- /help hoặc chọn 'Giúp đỡ' trên Menu: xem hướng dẫn.
+- /listsymbols hoặc chọn 'Xem danh sách symbol' trên Menu: xem các coin được hỗ trợ.
+
+3. Danh sách lệnh cho admin:
+- /adduser 123456789: thêm User ID vào whitelist.
+- /removeuser 123456789: xóa User ID khỏi whitelist.
+- /listusers: xem danh sách whitelist và số lượt đã dùng trong ngày.
+- /setlimit 123456789 10: set giới hạn lượt/ngày cho user.
+- /resetusage 123456789: reset số lượt đã dùng hôm nay của user.
+- /addsymbol BTC: thêm symbol vào danh sách coin được hỗ trợ.
+- /removesymbol BTC: xóa symbol khỏi danh sách coin được hỗ trợ.
+
+4. Cách sử dụng sau khi đã kích hoạt tài khoản:
+- Xem danh sách coin được hỗ trợ bằng /listsymbols.
+- Nhập tên coin vào khung chat, ví dụ: BTC hoặc btc (không phân biệt hoa thường).
+- Chọn kiểu phân tích:
+  + Scalp (15m/1H/4H): phân tích ngắn hạn trong ngày, phù hợp vào lệnh nhanh.
+  + Swing (4H/1D/1W): phân tích trung-dài hạn, phù hợp giữ lệnh vài ngày đến vài tuần.
+
+5. Về cơ chế tự học:
+- Bot lưu lại kết quả mỗi lần phân tích.
+- Sau 12h (Scalp) hoặc 24h (Swing), bot tự lấy nến Binance 15m để kiểm tra dự đoán trước đúng hay sai.
+- Lần phân tích tiếp theo, bot sẽ nhìn lại 5 lần gần nhất để điều chỉnh chiến lược.
 
 Lưu ý:
-- Bot chỉ hỗ trợ phân tích, người đưa ra quyết định cuối cùng vẫn là bạn, nếu có thắc mắc đọc lại dòng 1.
-- Dù mỗi coin có biểu đồ và xu hướng khác nhau, tuy nhiên vẫn sẽ bị ảnh hưởng bởi BTC, cho nên nếu phân tích giữa BTC và coin bạn cần phân tích lệch xu hướng nhau thì hay cẩn thận.
-- Do kinh phí eo hẹp nên hiện tại giới hạn sử dụng bot mỗi ngày là 10 lượt.
+- Bot chỉ hỗ trợ phân tích, người đưa ra quyết định cuối cùng vẫn là bạn. Đọc lại dòng 1 nếu có thắc mắc.
+- Mọi coin đều bị ảnh hưởng bởi BTC. Nếu phân tích coin bạn chọn lệch hướng với BTC, hãy cẩn thận.
+- Giới hạn mặc định: 10 lượt/ngày/người. Admin có thể thay đổi bằng /setlimit.

@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sqlite3
 
 from datetime import date
@@ -35,18 +35,51 @@ def load_admin_ids() -> set[int]:
 ADMIN_USER_IDS = load_admin_ids()
 
 
+DEFAULT_DAILY_LIMIT = 10
+
+
+def ensure_whitelist_default_limit(conn: sqlite3.Connection) -> None:
+    """Rebuild whitelist table if an old DB has daily_limit DEFAULT other than 10."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='whitelist'"
+    ).fetchone()
+    create_sql = row[0] if row else ""
+    if "daily_limit INTEGER NOT NULL DEFAULT 10" in create_sql:
+        return
+
+    conn.execute("ALTER TABLE whitelist RENAME TO whitelist_old")
+    conn.execute(f"""
+        CREATE TABLE whitelist (
+            user_id INTEGER PRIMARY KEY,
+            daily_limit INTEGER NOT NULL DEFAULT {DEFAULT_DAILY_LIMIT},
+            used_today INTEGER NOT NULL DEFAULT 0,
+            last_reset_date TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute(f"""
+        INSERT INTO whitelist (user_id, daily_limit, used_today, last_reset_date)
+        SELECT
+            user_id,
+            COALESCE(daily_limit, {DEFAULT_DAILY_LIMIT}),
+            COALESCE(used_today, 0),
+            COALESCE(last_reset_date, '')
+        FROM whitelist_old
+    """)
+    conn.execute("DROP TABLE whitelist_old")
+
+
 def init_auth_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS whitelist (
                 user_id INTEGER PRIMARY KEY,
-                daily_limit INTEGER NOT NULL DEFAULT 10,
+                daily_limit INTEGER NOT NULL DEFAULT {DEFAULT_DAILY_LIMIT},
                 used_today INTEGER NOT NULL DEFAULT 0,
                 last_reset_date TEXT NOT NULL DEFAULT ''
             )
         """)
         for col, definition in [
-            ("daily_limit", "INTEGER NOT NULL DEFAULT 10"),
+            ("daily_limit", f"INTEGER NOT NULL DEFAULT {DEFAULT_DAILY_LIMIT}"),
             ("used_today", "INTEGER NOT NULL DEFAULT 0"),
             ("last_reset_date", "TEXT NOT NULL DEFAULT ''"),
         ]:
@@ -54,6 +87,7 @@ def init_auth_db() -> None:
                 conn.execute(f"ALTER TABLE whitelist ADD COLUMN {col} {definition}")
             except sqlite3.OperationalError:
                 pass
+        ensure_whitelist_default_limit(conn)
         conn.commit()
 
 
@@ -62,7 +96,7 @@ def is_admin(user_id: int) -> bool:
 
 
 def is_account_activated(user_id: int) -> bool:
-    return user_id in verified_users and is_user_whitelisted(user_id)
+    return is_user_whitelisted(user_id)
 
 
 def is_user_authorized(user_id: int) -> bool:
@@ -75,9 +109,9 @@ def add_whitelist_user(user_id: int) -> None:
         conn.execute(
             """
             INSERT OR IGNORE INTO whitelist (user_id, daily_limit, used_today, last_reset_date)
-            VALUES (?, 10, 0, ?)
+            VALUES (?, ?, 0, ?)
             """,
-            (user_id, today),
+            (user_id, DEFAULT_DAILY_LIMIT, today),
         )
         conn.commit()
 
@@ -288,7 +322,7 @@ def get_user_usage(user_id: int) -> tuple[int, int]:
         ).fetchone()
 
         if row is None:
-            return 10, 0
+            return DEFAULT_DAILY_LIMIT, 0
 
         daily_limit, used_today, last_reset_date = row
 
