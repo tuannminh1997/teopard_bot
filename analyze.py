@@ -619,196 +619,290 @@ def estimate_liquidity_sweep_zones(
     timeframe_data: dict[str, pd.DataFrame | None],
 ) -> str:
     """
-    Ước lượng vùng quét thanh khoản/dừng lỗ từ high/low nến và tạo kế hoạch tham chiếu.
-
-    Lưu ý:
-    - Đây không phải dữ liệu thanh lý thật.
-    - Python tính khung Entry/SL/TP để tránh Claude đặt quá sát.
-    - Claude vẫn quyết định LONG/SHORT cuối cùng, nhưng không nên đi ngược khung rủi ro này.
+    Teopard V2 structure engine:
+    - Python tính vùng quét thanh khoản từ pivot/equal high/equal low + high/low fallback.
+    - Python tính cấu trúc thị trường, Fibonacci tham chiếu, ATR và kế hoạch Entry/SL/TP tham chiếu.
+    - Claude dùng các con số này để ra quyết định, không tự bịa vùng thanh khoản.
     """
     if mode == "short":
         main_label = "15M"
         confirm_label = "1H"
-        main_window_size = 50       # 50 nến 15M ≈ 12.5 giờ
-        confirm_window_size = 24    # 24 nến 1H ≈ 1 ngày
-        min_stop_desc = "max(2.0 x ATR 15M, 1.0 x ATR 1H)"
-        main_atr_mult = 2.0
-        confirm_atr_mult = 1.0
-        tp1_r = 1.2
-        tp2_r = 2.2
+        big_label = "4H"
+        main_window_size = 100       # 100 nến 15M ≈ 25 giờ
+        confirm_window_size = 50     # 50 nến 1H ≈ 2 ngày
+        big_window_size = 50
+        min_stop_desc = "max(2.5 x ATR 15M, 1.2 x ATR 1H, 0.6% giá)"
+        main_atr_mult = 2.5
+        confirm_atr_mult = 1.2
+        price_pct_risk = 0.006
+        tp1_r = 1.25
+        tp2_r = 2.25
     else:
         main_label = "4H"
         confirm_label = "1D"
-        main_window_size = 50       # 50 nến 4H ≈ 8.3 ngày
-        confirm_window_size = 20    # 20 nến 1D ≈ 20 ngày
-        min_stop_desc = "max(2.0 x ATR 4H, 0.5 x ATR 1D)"
-        main_atr_mult = 2.0
-        confirm_atr_mult = 0.5
-        tp1_r = 1.2
-        tp2_r = 2.2
+        big_label = "1W"
+        main_window_size = 100       # 100 nến 4H ≈ 16.6 ngày
+        confirm_window_size = 60     # 60 nến 1D ≈ 2 tháng
+        big_window_size = 52
+        min_stop_desc = "max(2.2 x ATR 4H, 0.7 x ATR 1D, 2.5% giá)"
+        main_atr_mult = 2.2
+        confirm_atr_mult = 0.7
+        price_pct_risk = 0.025
+        tp1_r = 1.3
+        tp2_r = 2.4
 
-    def get_window_stats(label: str, window_size: int) -> dict | None:
+    def get_df(label: str) -> pd.DataFrame | None:
         df = timeframe_data.get(label)
         if df is None or df.empty:
             return None
-        window = df.tail(window_size)
-        if window.empty:
+        return df
+
+    def safe_atr(df: pd.DataFrame | None) -> float | None:
+        if df is None or df.empty or "atr_14" not in df.columns:
             return None
-        atr = None
-        if "atr_14" in df.columns:
-            try:
-                raw_atr = float(df.iloc[-1]["atr_14"])
-                if not np.isnan(raw_atr):
-                    atr = raw_atr
-            except Exception:
-                atr = None
+        try:
+            v = float(df.iloc[-1]["atr_14"])
+            return None if np.isnan(v) else v
+        except Exception:
+            return None
+
+    def pivot_points(df: pd.DataFrame, window_size: int, side: str, left: int = 2, right: int = 2) -> list[float]:
+        w = df.tail(window_size).reset_index(drop=True)
+        if len(w) < left + right + 1:
+            return []
+        points: list[float] = []
+        for i in range(left, len(w) - right):
+            if side == "low":
+                val = float(w.loc[i, "low"])
+                if val <= float(w.loc[i-left:i+right, "low"].min()):
+                    points.append(val)
+            else:
+                val = float(w.loc[i, "high"])
+                if val >= float(w.loc[i-left:i+right, "high"].max()):
+                    points.append(val)
+        return points
+
+    def cluster_prices(prices: list[float], tolerance: float) -> list[dict]:
+        if not prices:
+            return []
+        tolerance = max(tolerance, 1e-12)
+        prices = sorted(prices)
+        clusters: list[list[float]] = []
+        current = [prices[0]]
+        for price in prices[1:]:
+            center = sum(current) / len(current)
+            if abs(price - center) <= tolerance:
+                current.append(price)
+            else:
+                clusters.append(current)
+                current = [price]
+        clusters.append(current)
+        result = []
+        for c in clusters:
+            center = sum(c) / len(c)
+            result.append({
+                "center": center,
+                "low": min(c),
+                "high": max(c),
+                "count": len(c),
+            })
+        return result
+
+    def best_cluster_zone(df: pd.DataFrame, window_size: int, side: str, atr: float | None) -> dict:
+        w = df.tail(window_size)
+        close = float(df.iloc[-1]["close"])
+        tol = (atr * 0.20) if atr else max(close * 0.0015, (float(w["high"].max()) - float(w["low"].min())) * 0.015)
+        pivots = pivot_points(df, window_size, side)
+        clusters = cluster_prices(pivots, tol)
+        if side == "low":
+            candidates = [c for c in clusters if c["center"] <= close]
+            fallback = float(w["low"].min())
+            if not candidates:
+                center, count = fallback, 1
+            else:
+                # Ưu tiên cụm có nhiều điểm chạm; nếu bằng nhau, lấy cụm gần giá hiện tại hơn.
+                best = sorted(candidates, key=lambda c: (-c["count"], abs(close - c["center"])))[0]
+                center, count = best["center"], best["count"]
+            buffer = max((atr or 0) * 0.20, close * 0.001)
+            return {"low": center - buffer, "high": center + buffer * 0.35, "center": center, "count": count}
+        candidates = [c for c in clusters if c["center"] >= close]
+        fallback = float(w["high"].max())
+        if not candidates:
+            center, count = fallback, 1
+        else:
+            best = sorted(candidates, key=lambda c: (-c["count"], abs(close - c["center"])))[0]
+            center, count = best["center"], best["count"]
+        buffer = max((atr or 0) * 0.20, close * 0.001)
+        return {"low": center - buffer * 0.35, "high": center + buffer, "center": center, "count": count}
+
+    def structure_block(df: pd.DataFrame | None, label: str, window_size: int) -> dict | None:
+        if df is None or df.empty:
+            return None
+        w = df.tail(window_size)
+        close = float(df.iloc[-1]["close"])
+        atr = safe_atr(df)
+        highs = pivot_points(df, window_size, "high")
+        lows = pivot_points(df, window_size, "low")
+        recent_high = highs[-1] if highs else float(w["high"].max())
+        recent_low = lows[-1] if lows else float(w["low"].min())
+        major_high = float(w["high"].max())
+        major_low = float(w["low"].min())
+        span = max(major_high - major_low, 0)
+        if span > 0:
+            # Nếu giá đang ở nửa dưới của biên độ, dùng nhịp giảm high→low để tính hồi lên.
+            fib_382 = major_low + 0.382 * span
+            fib_500 = major_low + 0.500 * span
+            fib_618 = major_low + 0.618 * span
+        else:
+            fib_382 = fib_500 = fib_618 = close
+        trend_hint = "giảm" if close < float(w["close"].iloc[0]) else "tăng"
         return {
             "label": label,
-            "window_size": len(window),
-            "low": float(window["low"].min()),
-            "high": float(window["high"].max()),
-            "close": float(df.iloc[-1]["close"]),
+            "close": close,
             "atr": atr,
+            "recent_high": recent_high,
+            "recent_low": recent_low,
+            "major_high": major_high,
+            "major_low": major_low,
+            "fib_382": fib_382,
+            "fib_500": fib_500,
+            "fib_618": fib_618,
+            "trend_hint": trend_hint,
         }
 
-    main = get_window_stats(main_label, main_window_size)
-    confirm = get_window_stats(confirm_label, confirm_window_size)
-
-    if main is None:
-        for label, df in timeframe_data.items():
-            if df is None:
-                continue
-            main = get_window_stats(label, min(50, len(df)))
-            if main is not None:
-                break
-
-    if main is None:
+    main_df = get_df(main_label)
+    confirm_df = get_df(confirm_label)
+    big_df = get_df(big_label)
+    if main_df is None:
         return "VÙNG QUÉT THANH KHOẢN ƯỚC LƯỢNG: Không đủ dữ liệu."
 
-    main_atr = main["atr"]
-    confirm_atr = confirm["atr"] if confirm else None
+    main_atr = safe_atr(main_df)
+    confirm_atr = safe_atr(confirm_df)
+    current_price = float(main_df.iloc[-1]["close"])
 
-    main_range = max(main["high"] - main["low"], 0)
-    main_buffer = (main_atr * 0.25) if main_atr else (main_range * 0.03)
+    main_long = best_cluster_zone(main_df, main_window_size, "low", main_atr)
+    main_short = best_cluster_zone(main_df, main_window_size, "high", main_atr)
 
-    main_long_low = main["low"] - main_buffer
-    main_long_high = main["low"]
-    main_short_low = main["high"]
-    main_short_high = main["high"] + main_buffer
+    confirm_long = confirm_short = None
+    if confirm_df is not None:
+        confirm_long = best_cluster_zone(confirm_df, confirm_window_size, "low", confirm_atr)
+        confirm_short = best_cluster_zone(confirm_df, confirm_window_size, "high", confirm_atr)
 
-    long_low = main_long_low
-    long_high = main_long_high
-    short_low = main_short_low
-    short_high = main_short_high
+    # Vùng gần: dùng cho Entry. Vùng sâu: dùng để đặt SL ngoài vùng bị quét.
+    long_near_low, long_near_high = main_long["low"], main_long["high"]
+    short_near_low, short_near_high = main_short["low"], main_short["high"]
+    if confirm_long:
+        long_deep_low = min(long_near_low, confirm_long["low"])
+        long_deep_high = max(long_near_high, confirm_long["high"])
+    else:
+        long_deep_low, long_deep_high = long_near_low, long_near_high
+    if confirm_short:
+        short_deep_low = min(short_near_low, confirm_short["low"])
+        short_deep_high = max(short_near_high, confirm_short["high"])
+    else:
+        short_deep_low, short_deep_high = short_near_low, short_near_high
 
-    confirm_line = ""
-    if confirm:
-        confirm_range = max(confirm["high"] - confirm["low"], 0)
-        confirm_buffer = (confirm_atr * 0.20) if confirm_atr else (confirm_range * 0.02)
-        confirm_long_low = confirm["low"] - confirm_buffer
-        confirm_long_high = confirm["low"]
-        confirm_short_low = confirm["high"]
-        confirm_short_high = confirm["high"] + confirm_buffer
-
-        # Vùng tổng hợp để Claude biết bối cảnh rộng hơn.
-        # Entry vẫn ưu tiên vùng chính, SL/TP dùng thêm ATR khung tham chiếu.
-        long_low = min(long_low, confirm_long_low)
-        long_high = max(long_high, confirm_long_high)
-        short_low = min(short_low, confirm_short_low)
-        short_high = max(short_high, confirm_short_high)
-        confirm_line = (
-            f"Tham chiếu {confirm['label']} {confirm['window_size']} nến: "
-            f"Long {fmt(confirm_long_low)}–{fmt(confirm_long_high)} | "
-            f"Short {fmt(confirm_short_low)}–{fmt(confirm_short_high)}"
-        )
-
-    stop_candidates = []
+    risk_candidates = [current_price * price_pct_risk]
     if main_atr:
-        stop_candidates.append(main_atr_mult * main_atr)
+        risk_candidates.append(main_atr_mult * main_atr)
     if confirm_atr:
-        stop_candidates.append(confirm_atr_mult * confirm_atr)
-    if not stop_candidates and main_range > 0:
-        stop_candidates.append(main_range * 0.20)
-    min_stop_distance = max(stop_candidates) if stop_candidates else None
+        risk_candidates.append(confirm_atr_mult * confirm_atr)
+    min_stop_distance = max(risk_candidates)
 
-    def plan_from_reference(direction: str) -> dict | None:
-        if min_stop_distance is None:
-            return None
+    main_struct = structure_block(main_df, main_label, main_window_size)
+    confirm_struct = structure_block(confirm_df, confirm_label, confirm_window_size) if confirm_df is not None else None
+    big_struct = structure_block(big_df, big_label, big_window_size) if big_df is not None else None
+
+    def reference_plan(direction: str) -> dict:
         risk = float(min_stop_distance)
         if direction == "LONG":
-            # Entry ưu tiên vùng quét Long chính, nhưng range được nới theo ATR để không quá hẹp.
-            entry_mid = main["low"]
-            entry_low = entry_mid - 0.15 * risk
-            entry_high = entry_mid + 0.10 * risk
-            sl = entry_mid - risk
-            tp1 = entry_mid + tp1_r * risk
-            tp2 = entry_mid + tp2_r * risk
-
-            # Nếu vùng quét Short nằm gần hơn mục tiêu 2R, vẫn giữ tối thiểu theo R để tránh TP quá sát.
-            if short_low > entry_mid and short_low > tp1:
-                tp2 = max(tp2, min(short_low, entry_mid + 2.8 * risk))
-        else:
-            entry_mid = main["high"]
+            # Entry ở vùng quét gần; SL phải nằm dưới cả vùng sâu và tối thiểu 1R.
+            entry_mid = (long_near_low + long_near_high) / 2
             entry_low = entry_mid - 0.10 * risk
-            entry_high = entry_mid + 0.15 * risk
-            sl = entry_mid + risk
-            tp1 = entry_mid - tp1_r * risk
-            tp2 = entry_mid - tp2_r * risk
-            if long_high < entry_mid and long_high < tp1:
-                tp2 = min(tp2, max(long_high, entry_mid - 2.8 * risk))
-
+            entry_high = entry_mid + 0.10 * risk
+            sl = min(entry_mid - risk, long_deep_low - 0.15 * risk)
+            real_risk = entry_mid - sl
+            tp1 = entry_mid + tp1_r * real_risk
+            tp2 = entry_mid + tp2_r * real_risk
+            # Nếu Fibonacci/kháng cự chính xa hơn TP mặc định, dùng làm tham chiếu tăng TP2.
+            for s in [main_struct, confirm_struct]:
+                if s:
+                    for k in ["fib_382", "fib_500", "fib_618", "recent_high"]:
+                        level = s[k]
+                        if level > entry_mid + real_risk:
+                            tp2 = max(tp2, min(level, entry_mid + 3.2 * real_risk))
+            if short_near_low > entry_mid + real_risk:
+                tp2 = max(tp2, min(short_near_low, entry_mid + 3.2 * real_risk))
+        else:
+            entry_mid = (short_near_low + short_near_high) / 2
+            entry_low = entry_mid - 0.10 * risk
+            entry_high = entry_mid + 0.10 * risk
+            sl = max(entry_mid + risk, short_deep_high + 0.15 * risk)
+            real_risk = sl - entry_mid
+            tp1 = entry_mid - tp1_r * real_risk
+            tp2 = entry_mid - tp2_r * real_risk
+            for s in [main_struct, confirm_struct]:
+                if s:
+                    for k in ["fib_618", "fib_500", "fib_382", "recent_low"]:
+                        level = s[k]
+                        if level < entry_mid - real_risk:
+                            tp2 = min(tp2, max(level, entry_mid - 3.2 * real_risk))
+            if long_near_high < entry_mid - real_risk:
+                tp2 = min(tp2, max(long_near_high, entry_mid - 3.2 * real_risk))
         return {
             "entry_low": entry_low,
             "entry_high": entry_high,
+            "entry_mid": entry_mid,
             "sl": sl,
             "tp1": tp1,
             "tp2": tp2,
-            "risk": risk,
+            "risk": real_risk,
         }
 
-    long_plan = plan_from_reference("LONG")
-    short_plan = plan_from_reference("SHORT")
+    long_plan = reference_plan("LONG")
+    short_plan = reference_plan("SHORT")
 
-    def format_plan(direction: str, plan: dict | None) -> str:
-        if not plan:
-            return f"{direction}: không đủ ATR để tính kế hoạch tham chiếu."
+    def format_plan(direction: str, plan: dict) -> str:
         return (
             f"{direction}: Entry {fmt(plan['entry_low'])}–{fmt(plan['entry_high'])} | "
             f"SL {fmt(plan['sl'])} | TP1 {fmt(plan['tp1'])} | TP2 {fmt(plan['tp2'])} | "
             f"R {fmt(plan['risk'])}"
         )
 
+    def format_struct(s: dict | None) -> str:
+        if not s:
+            return "Không đủ dữ liệu cấu trúc."
+        return (
+            f"{s['label']}: xu hướng {s['trend_hint']}, swing gần {fmt(s['recent_low'])}–{fmt(s['recent_high'])}, "
+            f"swing lớn {fmt(s['major_low'])}–{fmt(s['major_high'])}, "
+            f"Fib 0.382/0.5/0.618: {fmt(s['fib_382'])}/{fmt(s['fib_500'])}/{fmt(s['fib_618'])}"
+        )
+
     atr_parts = []
     if main_atr is not None:
-        atr_parts.append(f"ATR {main['label']}: {fmt(main_atr)}")
-    if confirm_atr is not None and confirm:
-        atr_parts.append(f"ATR {confirm['label']}: {fmt(confirm_atr)}")
+        atr_parts.append(f"ATR {main_label}: {fmt(main_atr)}")
+    if confirm_atr is not None:
+        atr_parts.append(f"ATR {confirm_label}: {fmt(confirm_atr)}")
     atr_line = " | ".join(atr_parts) if atr_parts else "ATR tham chiếu: N/A"
-    min_stop_line = (
-        f"Khoảng SL tối thiểu: {fmt(min_stop_distance)} ({min_stop_desc})"
-        if min_stop_distance is not None else
-        f"Khoảng SL tối thiểu: N/A ({min_stop_desc})"
-    )
 
     lines = [
         "VÙNG QUÉT THANH KHOẢN ƯỚC LƯỢNG:",
-        f"Vùng chính {main['label']} {main['window_size']} nến: "
-        f"Long {fmt(main_long_low)}–{fmt(main_long_high)} | "
-        f"Short {fmt(main_short_low)}–{fmt(main_short_high)}",
-    ]
-    if confirm_line:
-        lines.append(confirm_line)
-    lines.extend([
-        f"Vùng quét Long tổng hợp: {fmt(long_low)}–{fmt(long_high)}",
-        f"Vùng quét Short tổng hợp: {fmt(short_low)}–{fmt(short_high)}",
+        f"Vùng quét Long gần: {fmt(long_near_low)}–{fmt(long_near_high)} (cụm {main_label}, {main_long['count']} điểm chạm)",
+        f"Vùng quét Long sâu: {fmt(long_deep_low)}–{fmt(long_deep_high)}",
+        f"Vùng quét Short gần: {fmt(short_near_low)}–{fmt(short_near_high)} (cụm {main_label}, {main_short['count']} điểm chạm)",
+        f"Vùng quét Short sâu: {fmt(short_deep_low)}–{fmt(short_deep_high)}",
         atr_line,
-        min_stop_line,
+        f"Khoảng SL tối thiểu: {fmt(min_stop_distance)} ({min_stop_desc})",
+        "CẤU TRÚC THỊ TRƯỜNG DO PYTHON TÍNH:",
+        format_struct(main_struct),
+        format_struct(confirm_struct),
+        format_struct(big_struct),
         "KẾ HOẠCH THAM CHIẾU DO PYTHON TÍNH:",
         format_plan("LONG", long_plan),
         format_plan("SHORT", short_plan),
         "Quy tắc: Claude được chọn LONG/SHORT và chỉnh nhẹ kế hoạch, nhưng không được làm SL/TP gần hơn kế hoạch tham chiếu hoặc thấp hơn RR tối thiểu.",
-        "Lưu ý: đây là vùng quét thanh khoản/dừng lỗ ước lượng từ high/low nến, không phải dữ liệu thanh lý thật.",
-    ])
+        "Lưu ý: vùng quét thanh khoản là ước lượng từ pivot/equal high/equal low và high/low nến, không phải dữ liệu thanh lý thật.",
+    ]
     return "\n".join(lines)
 
 # ─── Fear & Greed ─────────────────────────────────────────────────────────────
