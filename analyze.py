@@ -436,6 +436,61 @@ def fmt(v, decimals: int = 2) -> str:
     return f"{v:,.8f}"
 
 
+def summarize_price_action_features(df: pd.DataFrame, lookback: int = 30) -> str:
+    """Tóm tắt hành vi giá từ nhiều nến, để Claude không phải đọc quá nhiều nến thô."""
+    if df is None or df.empty:
+        return "Thống kê hành vi giá: Không đủ dữ liệu."
+
+    window = df.tail(lookback).copy()
+    if window.empty:
+        return "Thống kê hành vi giá: Không đủ dữ liệu."
+
+    close_first = float(window.iloc[0]["close"])
+    close_last = float(window.iloc[-1]["close"])
+    high = float(window["high"].max())
+    low = float(window["low"].min())
+    range_value = high - low
+    change = close_last - close_first
+    change_pct = (change / close_first * 100) if close_first else 0
+
+    body = (window["close"] - window["open"]).abs()
+    candle_range = (window["high"] - window["low"]).replace(0, np.nan)
+    body_ratio = (body / candle_range).replace([np.inf, -np.inf], np.nan)
+
+    bullish = int((window["close"] > window["open"]).sum())
+    bearish = int((window["close"] < window["open"]).sum())
+
+    # Đếm chuỗi nến cùng màu ở cuối window
+    last_dir = 0
+    streak = 0
+    for _, row in window.iloc[::-1].iterrows():
+        cur_dir = 1 if row["close"] > row["open"] else (-1 if row["close"] < row["open"] else 0)
+        if last_dir == 0:
+            last_dir = cur_dir
+            streak = 1 if cur_dir != 0 else 0
+        elif cur_dir == last_dir and cur_dir != 0:
+            streak += 1
+        else:
+            break
+    streak_label = "xanh" if last_dir > 0 else ("đỏ" if last_dir < 0 else "trung tính")
+
+    largest_bull = window[window["close"] > window["open"]].copy()
+    largest_bear = window[window["close"] < window["open"]].copy()
+    largest_bull_move = float((largest_bull["close"] - largest_bull["open"]).max()) if not largest_bull.empty else 0.0
+    largest_bear_move = float((largest_bear["open"] - largest_bear["close"]).max()) if not largest_bear.empty else 0.0
+
+    vol_avg = float(window["vol_ratio"].mean()) if "vol_ratio" in window.columns else np.nan
+    close_pos = ((close_last - low) / range_value * 100) if range_value else 50
+
+    return (
+        f"Thống kê {len(window)} nến: đổi {fmt(change)} ({change_pct:.2f}%), "
+        f"biên độ {fmt(range_value)}, xanh/đỏ {bullish}/{bearish}, "
+        f"chuỗi cuối {streak} nến {streak_label}, "
+        f"nến xanh lớn nhất {fmt(largest_bull_move)}, nến đỏ lớn nhất {fmt(largest_bear_move)}, "
+        f"volume TB {fmt(vol_avg, 2)}x, vị trí đóng cửa trong biên độ {close_pos:.0f}%."
+    )
+
+
 def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
     if df is None or df.empty:
         return f"\nKHUNG {label}: Không đủ dữ liệu.\n"
@@ -480,6 +535,7 @@ def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
         f"  ATR(14)={fmt(last['atr_14'])}",
         f"  Volume={fmt(last['vol_ratio'],2)}x → {vol_lbl}",
         f"  High/Low 50 nến: {fmt(key_high)} / {fmt(key_low)}",
+        f"  {summarize_price_action_features(df, 30)}",
         f"  10 nến gần nhất:",
         candles,
     ])
@@ -493,7 +549,7 @@ def estimate_liquidity_sweep_zones(
     Ước lượng vùng quét thanh khoản/stop-loss từ high/low nến.
     Đây không phải dữ liệu liquidation heatmap thật.
 
-    Thiết kế mới:
+    Thiết kế:
     - SCALP: vùng chính lấy từ 15M 50 nến, tham chiếu thêm 1H 24 nến.
       ATR an toàn lấy từ cả 15M và 1H để tránh SL/TP quá sát.
     - SWING: vùng chính lấy từ 4H 50 nến, tham chiếu thêm 1D 20 nến.
@@ -538,10 +594,11 @@ def estimate_liquidity_sweep_zones(
     main = get_window_stats(main_label, main_window_size)
     confirm = get_window_stats(confirm_label, confirm_window_size)
 
-    # Fallback nếu thiếu dữ liệu khung mong muốn
     if main is None:
         for label, df in timeframe_data.items():
-            main = get_window_stats(label, min(50, len(df)) if df is not None else 50)
+            if df is None:
+                continue
+            main = get_window_stats(label, min(50, len(df)))
             if main is not None:
                 break
 
@@ -551,15 +608,18 @@ def estimate_liquidity_sweep_zones(
     main_atr = main["atr"]
     confirm_atr = confirm["atr"] if confirm else None
 
-    # Buffer để biến high/low thành một vùng, không phải một đường giá duy nhất.
-    # Dùng ATR của khung chính nếu có, nếu không dùng khoảng dao động high-low / 20.
     main_range = main["high"] - main["low"]
     main_buffer = (main_atr * 0.25) if main_atr else (main_range * 0.03)
 
-    long_low = main["low"] - main_buffer
-    long_high = main["low"]
-    short_low = main["high"]
-    short_high = main["high"] + main_buffer
+    main_long_low = main["low"] - main_buffer
+    main_long_high = main["low"]
+    main_short_low = main["high"]
+    main_short_high = main["high"] + main_buffer
+
+    long_low = main_long_low
+    long_high = main_long_high
+    short_low = main_short_low
+    short_high = main_short_high
 
     confirm_line = ""
     if confirm:
@@ -570,8 +630,6 @@ def estimate_liquidity_sweep_zones(
         confirm_short_low = confirm["high"]
         confirm_short_high = confirm["high"] + confirm_buffer
 
-        # Nếu vùng tham chiếu nằm gần vùng chính, mở rộng vùng tổng hợp.
-        # Nếu quá xa, vẫn truyền thành dòng tham chiếu riêng để Claude không kéo Entry/SL/TP quá rộng.
         long_low = min(long_low, confirm_long_low)
         long_high = max(long_high, confirm_long_high)
         short_low = min(short_low, confirm_short_low)
@@ -582,15 +640,13 @@ def estimate_liquidity_sweep_zones(
             f"Short {fmt(confirm_short_low)}–{fmt(confirm_short_high)}"
         )
 
-    # Khoảng SL tối thiểu để tránh quá sát khi dùng khung thấp.
+    stop_candidates = []
     if mode == "short":
-        stop_candidates = []
         if main_atr:
             stop_candidates.append(1.5 * main_atr)
         if confirm_atr:
             stop_candidates.append(0.6 * confirm_atr)
     else:
-        stop_candidates = []
         if main_atr:
             stop_candidates.append(1.5 * main_atr)
         if confirm_atr:
@@ -613,8 +669,8 @@ def estimate_liquidity_sweep_zones(
     lines = [
         "VÙNG QUÉT THANH KHOẢN ƯỚC LƯỢNG:",
         f"Vùng chính {main['label']} {main['window_size']} nến: "
-        f"Long {fmt(main['low'] - main_buffer)}–{fmt(main['low'])} | "
-        f"Short {fmt(main['high'])}–{fmt(main['high'] + main_buffer)}",
+        f"Long {fmt(main_long_low)}–{fmt(main_long_high)} | "
+        f"Short {fmt(main_short_low)}–{fmt(main_short_high)}",
     ]
     if confirm_line:
         lines.append(confirm_line)
