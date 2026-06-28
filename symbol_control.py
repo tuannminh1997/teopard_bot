@@ -255,7 +255,7 @@ def register_symbol_handlers(app: Application) -> None:
     if app.job_queue is None:
         print("JobQueue is not available. Install python-telegram-bot[job-queue].")
     else:
-        app.job_queue.run_repeating(job_check_predictions, interval=60, first=30)
+        app.job_queue.run_repeating(job_check_predictions, interval=3600, first=300)
 
 
 def symbol_control_commands() -> list[BotCommand]:
