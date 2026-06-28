@@ -31,20 +31,25 @@ VÙNG QUÉT THANH KHOẢN / DỪNG LỖ
   Vùng quét Long: [giá thấp]–[giá cao]
   Vùng quét Short: [giá thấp]–[giá cao]
 - Không giải thích dài phần thanh khoản.
-- Với SCALP: vùng chính được tính từ 15M 50 nến, tham chiếu thêm 1H. Không được đặt SL/TP chỉ dựa vào ATR 15M nếu quá sát. Phải dùng “Khoảng SL tối thiểu” trong prompt.
+- Nếu prompt có mục “KẾ HOẠCH THAM CHIẾU DO PYTHON TÍNH”, phải xem đó là khung định lượng chính cho Entry/SL/TP.
+- Claude được quyền chọn LONG hoặc SHORT theo bối cảnh, nhưng khi đã chọn hướng nào thì phải ưu tiên dùng kế hoạch tham chiếu của hướng đó.
+- Chỉ được chỉnh Entry/SL/TP tối đa khoảng 10% so với kế hoạch tham chiếu nếu có lý do rõ ràng từ vùng quét thanh khoản, EMA, RSI, MACD, ATR hoặc nến gần nhất.
+- Không được chỉnh làm SL gần Entry hơn “Khoảng SL tối thiểu”.
+- Không được chỉnh làm TP1 nhỏ hơn 1R hoặc TP2 nhỏ hơn 1.8R, trừ khi ghi rõ “không vào ngay” và điều kiện kích hoạt rất chặt.
+- Với SCALP: vùng chính được tính từ 15M 50 nến, tham chiếu thêm 1H. 15M chỉ dùng để canh điểm vào; SL/TP phải tôn trọng ATR và khung 1H để tránh quá sát.
 - Với SWING: vùng chính được tính từ 4H 50 nến, tham chiếu thêm 1D. Không overfit vào một nến 4H.
-- Với lệnh LONG: ưu tiên Entry gần vùng quét Long hoặc sau khi giá quét vùng Long rồi hồi phục; SL dưới vùng quét Long và phải cách Entry ít nhất bằng “Khoảng SL tối thiểu”; TP1/TP2 ưu tiên hướng về vùng quét Short.
-- Với lệnh SHORT: ưu tiên Entry gần vùng quét Short hoặc sau khi giá quét vùng Short rồi suy yếu; SL trên vùng quét Short và phải cách Entry ít nhất bằng “Khoảng SL tối thiểu”; TP1/TP2 ưu tiên hướng về vùng quét Long.
-- Nếu vùng quét tổng hợp quá rộng, ưu tiên vùng chính của khung vào lệnh để chọn Entry, nhưng vẫn dùng khung tham chiếu để đặt SL an toàn hơn.
-
+- Với LONG: ưu tiên Entry gần vùng quét Long hoặc sau khi giá quét vùng Long rồi hồi phục; SL dưới vùng quét Long và phải cách Entry ít nhất bằng “Khoảng SL tối thiểu”; TP1/TP2 ưu tiên hướng về vùng quét Short hoặc theo RR tham chiếu.
+- Với SHORT: ưu tiên Entry gần vùng quét Short hoặc sau khi giá quét vùng Short rồi suy yếu; SL trên vùng quét Short và phải cách Entry ít nhất bằng “Khoảng SL tối thiểu”; TP1/TP2 ưu tiên hướng về vùng quét Long hoặc theo RR tham chiếu.
 
 QUY TẮC KHOẢNG CÁCH ENTRY / SL / TP
 - Không được đặt Entry/SL/TP quá sát giá hiện tại chỉ vì dùng khung 15M.
-- Phải dùng “Khoảng SL tối thiểu” trong prompt để đặt SL.
-- Với LONG: khoảng cách từ Entry trung bình đến SL phải >= Khoảng SL tối thiểu. TP1 phải đạt tối thiểu 1R, TP2 tối thiểu 1.8R nếu dữ liệu cho phép.
-- Với SHORT: khoảng cách từ Entry trung bình đến SL phải >= Khoảng SL tối thiểu. TP1 phải đạt tối thiểu 1R, TP2 tối thiểu 1.8R nếu dữ liệu cho phép.
-- Nếu vùng quét thanh khoản làm TP quá gần, phải ghi “chưa vào ngay” và chờ Entry tốt hơn thay vì ép lệnh có lợi nhuận quá mỏng.
-- Nếu Entry đang là lệnh chờ bên dưới/bên trên giá hiện tại, phần Kích hoạt phải nói rõ đây là lệnh chờ; không xem như đã vào lệnh ngay.
+- Phải dùng “Khoảng SL tối thiểu” và “KẾ HOẠCH THAM CHIẾU DO PYTHON TÍNH” trong prompt.
+- Với LONG: khoảng cách từ Entry trung bình đến SL phải >= Khoảng SL tối thiểu. TP1 phải đạt tối thiểu 1R, TP2 tối thiểu 1.8R.
+- Với SHORT: khoảng cách từ Entry trung bình đến SL phải >= Khoảng SL tối thiểu. TP1 phải đạt tối thiểu 1R, TP2 tối thiểu 1.8R.
+- Nếu kế hoạch tham chiếu cho thấy Entry nằm xa giá hiện tại, phải ghi rõ đây là lệnh chờ, không xem như đã vào lệnh ngay.
+- Nếu giá hiện tại đã đi quá xa khỏi Entry tham chiếu và RR xấu, không được đuổi giá; phải ghi “chờ giá quay lại vùng Entry”.
+- Nếu vùng quét thanh khoản làm TP quá gần, phải ưu tiên TP theo RR tham chiếu thay vì chốt quá sát.
+- Nếu không thể tạo kế hoạch đạt RR tối thiểu, vẫn phải chọn LONG/SHORT theo yêu cầu hệ thống nhưng phần kích hoạt phải ghi rõ “chưa vào ngay”.
 
 ĐỊNH DẠNG KẾT QUẢ BẮT BUỘC
 
@@ -68,6 +73,7 @@ Entry: [giá thấp]–[giá cao]
 SL: [giá]
 TP1: [giá]
 TP2: [giá]
+Rủi ro mỗi lệnh: [khoảng cách Entry trung bình đến SL]
 Kích hoạt: [tối đa 2 câu, có điều kiện cụ thể]
 Lý do:
 - [ý 1 ngắn, có số]

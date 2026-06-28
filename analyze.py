@@ -619,27 +619,33 @@ def estimate_liquidity_sweep_zones(
     timeframe_data: dict[str, pd.DataFrame | None],
 ) -> str:
     """
-    Ước lượng vùng quét thanh khoản/stop-loss từ high/low nến.
-    Đây không phải dữ liệu liquidation heatmap thật.
+    Ước lượng vùng quét thanh khoản/dừng lỗ từ high/low nến và tạo kế hoạch tham chiếu.
 
-    Thiết kế:
-    - SCALP: vùng chính lấy từ 15M 50 nến, tham chiếu thêm 1H 24 nến.
-      ATR an toàn lấy từ cả 15M và 1H để tránh SL/TP quá sát.
-    - SWING: vùng chính lấy từ 4H 50 nến, tham chiếu thêm 1D 20 nến.
-      ATR an toàn lấy từ cả 4H và 1D.
+    Lưu ý:
+    - Đây không phải dữ liệu thanh lý thật.
+    - Python tính khung Entry/SL/TP để tránh Claude đặt quá sát.
+    - Claude vẫn quyết định LONG/SHORT cuối cùng, nhưng không nên đi ngược khung rủi ro này.
     """
     if mode == "short":
         main_label = "15M"
         confirm_label = "1H"
-        main_window_size = 50      # 50 nến 15M ≈ 12.5 giờ
-        confirm_window_size = 24   # 24 nến 1H ≈ 1 ngày
-        min_stop_desc = "max(1.5 x ATR 15M, 0.6 x ATR 1H)"
+        main_window_size = 50       # 50 nến 15M ≈ 12.5 giờ
+        confirm_window_size = 24    # 24 nến 1H ≈ 1 ngày
+        min_stop_desc = "max(2.0 x ATR 15M, 1.0 x ATR 1H)"
+        main_atr_mult = 2.0
+        confirm_atr_mult = 1.0
+        tp1_r = 1.2
+        tp2_r = 2.2
     else:
         main_label = "4H"
         confirm_label = "1D"
-        main_window_size = 50      # 50 nến 4H ≈ 8.3 ngày
-        confirm_window_size = 20   # 20 nến 1D ≈ 20 ngày
-        min_stop_desc = "max(1.5 x ATR 4H, 0.35 x ATR 1D)"
+        main_window_size = 50       # 50 nến 4H ≈ 8.3 ngày
+        confirm_window_size = 20    # 20 nến 1D ≈ 20 ngày
+        min_stop_desc = "max(2.0 x ATR 4H, 0.5 x ATR 1D)"
+        main_atr_mult = 2.0
+        confirm_atr_mult = 0.5
+        tp1_r = 1.2
+        tp2_r = 2.2
 
     def get_window_stats(label: str, window_size: int) -> dict | None:
         df = timeframe_data.get(label)
@@ -661,6 +667,7 @@ def estimate_liquidity_sweep_zones(
             "window_size": len(window),
             "low": float(window["low"].min()),
             "high": float(window["high"].max()),
+            "close": float(df.iloc[-1]["close"]),
             "atr": atr,
         }
 
@@ -681,7 +688,7 @@ def estimate_liquidity_sweep_zones(
     main_atr = main["atr"]
     confirm_atr = confirm["atr"] if confirm else None
 
-    main_range = main["high"] - main["low"]
+    main_range = max(main["high"] - main["low"], 0)
     main_buffer = (main_atr * 0.25) if main_atr else (main_range * 0.03)
 
     main_long_low = main["low"] - main_buffer
@@ -696,13 +703,15 @@ def estimate_liquidity_sweep_zones(
 
     confirm_line = ""
     if confirm:
-        confirm_range = confirm["high"] - confirm["low"]
+        confirm_range = max(confirm["high"] - confirm["low"], 0)
         confirm_buffer = (confirm_atr * 0.20) if confirm_atr else (confirm_range * 0.02)
         confirm_long_low = confirm["low"] - confirm_buffer
         confirm_long_high = confirm["low"]
         confirm_short_low = confirm["high"]
         confirm_short_high = confirm["high"] + confirm_buffer
 
+        # Vùng tổng hợp để Claude biết bối cảnh rộng hơn.
+        # Entry vẫn ưu tiên vùng chính, SL/TP dùng thêm ATR khung tham chiếu.
         long_low = min(long_low, confirm_long_low)
         long_high = max(long_high, confirm_long_high)
         short_low = min(short_low, confirm_short_low)
@@ -714,18 +723,60 @@ def estimate_liquidity_sweep_zones(
         )
 
     stop_candidates = []
-    if mode == "short":
-        if main_atr:
-            stop_candidates.append(1.5 * main_atr)
-        if confirm_atr:
-            stop_candidates.append(0.6 * confirm_atr)
-    else:
-        if main_atr:
-            stop_candidates.append(1.5 * main_atr)
-        if confirm_atr:
-            stop_candidates.append(0.35 * confirm_atr)
-
+    if main_atr:
+        stop_candidates.append(main_atr_mult * main_atr)
+    if confirm_atr:
+        stop_candidates.append(confirm_atr_mult * confirm_atr)
+    if not stop_candidates and main_range > 0:
+        stop_candidates.append(main_range * 0.20)
     min_stop_distance = max(stop_candidates) if stop_candidates else None
+
+    def plan_from_reference(direction: str) -> dict | None:
+        if min_stop_distance is None:
+            return None
+        risk = float(min_stop_distance)
+        if direction == "LONG":
+            # Entry ưu tiên vùng quét Long chính, nhưng range được nới theo ATR để không quá hẹp.
+            entry_mid = main["low"]
+            entry_low = entry_mid - 0.15 * risk
+            entry_high = entry_mid + 0.10 * risk
+            sl = entry_mid - risk
+            tp1 = entry_mid + tp1_r * risk
+            tp2 = entry_mid + tp2_r * risk
+
+            # Nếu vùng quét Short nằm gần hơn mục tiêu 2R, vẫn giữ tối thiểu theo R để tránh TP quá sát.
+            if short_low > entry_mid and short_low > tp1:
+                tp2 = max(tp2, min(short_low, entry_mid + 2.8 * risk))
+        else:
+            entry_mid = main["high"]
+            entry_low = entry_mid - 0.10 * risk
+            entry_high = entry_mid + 0.15 * risk
+            sl = entry_mid + risk
+            tp1 = entry_mid - tp1_r * risk
+            tp2 = entry_mid - tp2_r * risk
+            if long_high < entry_mid and long_high < tp1:
+                tp2 = min(tp2, max(long_high, entry_mid - 2.8 * risk))
+
+        return {
+            "entry_low": entry_low,
+            "entry_high": entry_high,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "risk": risk,
+        }
+
+    long_plan = plan_from_reference("LONG")
+    short_plan = plan_from_reference("SHORT")
+
+    def format_plan(direction: str, plan: dict | None) -> str:
+        if not plan:
+            return f"{direction}: không đủ ATR để tính kế hoạch tham chiếu."
+        return (
+            f"{direction}: Entry {fmt(plan['entry_low'])}–{fmt(plan['entry_high'])} | "
+            f"SL {fmt(plan['sl'])} | TP1 {fmt(plan['tp1'])} | TP2 {fmt(plan['tp2'])} | "
+            f"R {fmt(plan['risk'])}"
+        )
 
     atr_parts = []
     if main_atr is not None:
@@ -752,7 +803,11 @@ def estimate_liquidity_sweep_zones(
         f"Vùng quét Short tổng hợp: {fmt(short_low)}–{fmt(short_high)}",
         atr_line,
         min_stop_line,
-        "Lưu ý: đây là vùng quét thanh khoản/stop-loss ước lượng từ high/low nến, không phải dữ liệu thanh lý thật.",
+        "KẾ HOẠCH THAM CHIẾU DO PYTHON TÍNH:",
+        format_plan("LONG", long_plan),
+        format_plan("SHORT", short_plan),
+        "Quy tắc: Claude được chọn LONG/SHORT và chỉnh nhẹ kế hoạch, nhưng không được làm SL/TP gần hơn kế hoạch tham chiếu hoặc thấp hơn RR tối thiểu.",
+        "Lưu ý: đây là vùng quét thanh khoản/dừng lỗ ước lượng từ high/low nến, không phải dữ liệu thanh lý thật.",
     ])
     return "\n".join(lines)
 
