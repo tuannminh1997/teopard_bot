@@ -530,48 +530,48 @@ def get_current_price_str(symbol: str) -> tuple[str, float | None]:
 # ─── History formatter ────────────────────────
 
 def format_prediction_history(history: list[dict]) -> str:
+    """Tóm tắt lịch sử để model tự điều chỉnh bias. Đây là dữ liệu nội bộ, không hiển thị ra user."""
     if not history:
-        return "No previous analysis for this symbol/mode."
+        return "Chưa có lịch sử phân tích cho symbol/mode này."
 
-    lines = [f"RECENT LEARNING SUMMARY ({len(history)} latest analyses):"]
+    lines = [f"TÓM TẮT LỊCH SỬ NỘI BỘ ({len(history)} lần phân tích gần nhất):"]
     finished = [p for p in history if p["result"] in ("WIN", "LOSS")]
     if finished:
         wins = sum(1 for p in finished if p["result"] == "WIN")
         win_rate = wins / len(finished) * 100
-        lines.append(f"- Closed results: {wins}/{len(finished)} WIN, win rate {win_rate:.0f}%.")
+        lines.append(f"- Kết quả đã chốt: {wins}/{len(finished)} lần WIN, tỷ lệ thắng {win_rate:.0f}%.")
 
         long_finished = [p for p in finished if p["direction"] == "LONG"]
         short_finished = [p for p in finished if p["direction"] == "SHORT"]
         if long_finished:
             long_wins = sum(1 for p in long_finished if p["result"] == "WIN")
-            lines.append(f"- LONG: {long_wins}/{len(long_finished)} WIN.")
+            lines.append(f"- LONG: {long_wins}/{len(long_finished)} lần WIN.")
         if short_finished:
             short_wins = sum(1 for p in short_finished if p["result"] == "WIN")
-            lines.append(f"- SHORT: {short_wins}/{len(short_finished)} WIN.")
+            lines.append(f"- SHORT: {short_wins}/{len(short_finished)} lần WIN.")
 
     losses = [p for p in finished if p["result"] == "LOSS"]
     if losses:
         loss_dirs = [p["direction"] for p in losses]
         if loss_dirs.count("LONG") > loss_dirs.count("SHORT"):
-            lines.append("- Repeated issue: recent LONG calls have more losses. Require stronger bullish confirmation.")
+            lines.append("- Vấn đề lặp lại: các lệnh LONG gần đây thua nhiều hơn, cần xác nhận tăng mạnh hơn trước khi chọn LONG.")
         elif loss_dirs.count("SHORT") > loss_dirs.count("LONG"):
-            lines.append("- Repeated issue: recent SHORT calls have more losses. Require stronger bearish confirmation.")
+            lines.append("- Vấn đề lặp lại: các lệnh SHORT gần đây thua nhiều hơn, cần xác nhận giảm mạnh hơn trước khi chọn SHORT.")
 
     for i, p in enumerate(history, 1):
         entry = f"{fmt(p['entry_low'])}-{fmt(p['entry_high'])}" if p["entry_low"] and p["entry_high"] else "N/A"
-        checked = f"checked price {fmt(p['result_price'])}" if p["result_price"] else "not checked"
-        reason = p.get("result_reason") or "Outcome not checked yet."
-        decision_reason = p.get("reasoning_summary") or "No decision reasoning summary."
-        snapshot = p.get("market_snapshot") or "No market snapshot."
+        checked = f"giá kiểm tra {fmt(p['result_price'])}" if p["result_price"] else "chưa kiểm tra"
+        reason = p.get("result_reason") or "Chưa có kết quả kiểm tra."
+        decision_reason = p.get("reasoning_summary") or "Chưa có tóm tắt lý do quyết định."
+        snapshot = p.get("market_snapshot") or "Không có snapshot thị trường."
         lines.append(
             f"- #{i} {p['created_at'][:16]} {p['direction']} {p['result']} ({checked}); "
             f"Entry {entry}, SL {fmt(p['sl'])}, TP1 {fmt(p['tp1'])}, TP2 {fmt(p['tp2'])}. "
-            f"Decision why: {decision_reason} Outcome: {reason} Market then: {snapshot}"
+            f"Lý do quyết định: {decision_reason} Kết quả: {reason} Thị trường lúc đó: {snapshot}"
         )
 
-    lines.append("Use this summary as learning context; do not copy old full responses.")
+    lines.append("Chỉ dùng phần này để tự điều chỉnh bias; tuyệt đối không nhắc lại lịch sử trong câu trả lời cho user.")
     return "\n".join(lines)
-
 
 def build_user_prompt(
     symbol: str,
@@ -604,10 +604,12 @@ Phương pháp: {focus}
 ═══════════════════════════════
 
 Yêu cầu:
-1. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome và Market then.
-2. Trong mục "Nhìn lại lịch sử" phải nêu cụ thể lần trước đúng/sai vì lý do gì và lần này điều chỉnh bias nào.
-3. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
+1. Đọc kỹ TÓM TẮT LỊCH SỬ NỘI BỘ để tự điều chỉnh xu hướng ưu tiên.
+2. Không hiển thị, không nhắc lại, không diễn giải lịch sử trong câu trả lời cho user.
+3. Không copy phân tích cũ. Chỉ dùng lịch sử để tránh lặp lại lỗi.
 4. QUYẾT ĐỊNH cuối cùng bắt buộc là LONG hoặc SHORT, không được chỉ CHỜ.
+5. Toàn bộ câu trả lời phải bằng tiếng Việt, ngoại trừ các nhãn bắt buộc: LONG, SHORT, Entry, SL, TP1, TP2, F&G, EMA, RSI, MACD, USDT.
+6. Trả lời thật ngắn gọn theo format system prompt, tối đa 450 từ.
 """
 
 
@@ -625,7 +627,7 @@ def summarize_reasoning(full_response: str) -> str:
         client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=120,
+            max_tokens=80,
             temperature=0,
             messages=[{
                 "role": "user",
@@ -764,7 +766,7 @@ def call_claude_analysis(symbol: str, mode: str) -> str:
     client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=2500,
+        max_tokens=1200,
         temperature=0,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
