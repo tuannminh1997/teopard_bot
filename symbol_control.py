@@ -220,10 +220,12 @@ async def job_check_predictions(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Chạy mỗi giờ, tự check prediction PENDING đến hạn và thông báo admin."""
     from datetime import datetime
     print(f"[AUTO_CHECK] Job chạy lúc {datetime.now().isoformat()}", flush=True)
+
     from analyze import auto_check_pending_predictions
     from auth import ADMIN_USER_IDS
 
     messages = await auto_check_pending_predictions()
+    print(f"[AUTO_CHECK] Số kết quả đã chấm: {len(messages)}", flush=True)
 
     if not messages or not ADMIN_USER_IDS:
         return

@@ -399,6 +399,14 @@ def calculate_macd(data: pd.Series, fast=12, slow=26, signal=9):
     return macd_line, signal_line, macd_line - signal_line
 
 
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return true_range.rolling(period).mean()
+
+
 def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None or len(df) < 60:
         return None
@@ -412,6 +420,7 @@ def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
     r["macd_line"], r["macd_signal"], r["macd_hist"] = calculate_macd(r["close"])
     r["vol_ma20"]  = r["volume"].rolling(20).mean()
     r["vol_ratio"] = r["volume"] / r["vol_ma20"]
+    r["atr_14"]    = calculate_atr(r, 14)
     return r.dropna().reset_index(drop=True)
 
 
@@ -468,12 +477,155 @@ def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
         f"  EMA7={fmt(ema7)} EMA25={fmt(ema25)} EMA50={fmt(ema50)} → {ema_align}",
         f"  RSI(6)={fmt(last['rsi_6'],1)} RSI(14)={fmt(last['rsi_14'],1)}",
         f"  MACD={fmt(last['macd_line'],4)} Signal={fmt(last['macd_signal'],4)} Hist={fmt(last['macd_hist'],4)} → {macd_dir}{macd_cross}",
+        f"  ATR(14)={fmt(last['atr_14'])}",
         f"  Volume={fmt(last['vol_ratio'],2)}x → {vol_lbl}",
         f"  High/Low 50 nến: {fmt(key_high)} / {fmt(key_low)}",
         f"  10 nến gần nhất:",
         candles,
     ])
 
+
+def estimate_liquidity_sweep_zones(
+    mode: str,
+    timeframe_data: dict[str, pd.DataFrame | None],
+) -> str:
+    """
+    Ước lượng vùng quét thanh khoản/stop-loss từ high/low nến.
+    Đây không phải dữ liệu liquidation heatmap thật.
+
+    Thiết kế mới:
+    - SCALP: vùng chính lấy từ 15M 50 nến, tham chiếu thêm 1H 24 nến.
+      ATR an toàn lấy từ cả 15M và 1H để tránh SL/TP quá sát.
+    - SWING: vùng chính lấy từ 4H 50 nến, tham chiếu thêm 1D 20 nến.
+      ATR an toàn lấy từ cả 4H và 1D.
+    """
+    if mode == "short":
+        main_label = "15M"
+        confirm_label = "1H"
+        main_window_size = 50      # 50 nến 15M ≈ 12.5 giờ
+        confirm_window_size = 24   # 24 nến 1H ≈ 1 ngày
+        min_stop_desc = "max(1.5 x ATR 15M, 0.6 x ATR 1H)"
+    else:
+        main_label = "4H"
+        confirm_label = "1D"
+        main_window_size = 50      # 50 nến 4H ≈ 8.3 ngày
+        confirm_window_size = 20   # 20 nến 1D ≈ 20 ngày
+        min_stop_desc = "max(1.5 x ATR 4H, 0.35 x ATR 1D)"
+
+    def get_window_stats(label: str, window_size: int) -> dict | None:
+        df = timeframe_data.get(label)
+        if df is None or df.empty:
+            return None
+        window = df.tail(window_size)
+        if window.empty:
+            return None
+        atr = None
+        if "atr_14" in df.columns:
+            try:
+                raw_atr = float(df.iloc[-1]["atr_14"])
+                if not np.isnan(raw_atr):
+                    atr = raw_atr
+            except Exception:
+                atr = None
+        return {
+            "label": label,
+            "window_size": len(window),
+            "low": float(window["low"].min()),
+            "high": float(window["high"].max()),
+            "atr": atr,
+        }
+
+    main = get_window_stats(main_label, main_window_size)
+    confirm = get_window_stats(confirm_label, confirm_window_size)
+
+    # Fallback nếu thiếu dữ liệu khung mong muốn
+    if main is None:
+        for label, df in timeframe_data.items():
+            main = get_window_stats(label, min(50, len(df)) if df is not None else 50)
+            if main is not None:
+                break
+
+    if main is None:
+        return "VÙNG QUÉT THANH KHOẢN ƯỚC LƯỢNG: Không đủ dữ liệu."
+
+    main_atr = main["atr"]
+    confirm_atr = confirm["atr"] if confirm else None
+
+    # Buffer để biến high/low thành một vùng, không phải một đường giá duy nhất.
+    # Dùng ATR của khung chính nếu có, nếu không dùng khoảng dao động high-low / 20.
+    main_range = main["high"] - main["low"]
+    main_buffer = (main_atr * 0.25) if main_atr else (main_range * 0.03)
+
+    long_low = main["low"] - main_buffer
+    long_high = main["low"]
+    short_low = main["high"]
+    short_high = main["high"] + main_buffer
+
+    confirm_line = ""
+    if confirm:
+        confirm_range = confirm["high"] - confirm["low"]
+        confirm_buffer = (confirm_atr * 0.20) if confirm_atr else (confirm_range * 0.02)
+        confirm_long_low = confirm["low"] - confirm_buffer
+        confirm_long_high = confirm["low"]
+        confirm_short_low = confirm["high"]
+        confirm_short_high = confirm["high"] + confirm_buffer
+
+        # Nếu vùng tham chiếu nằm gần vùng chính, mở rộng vùng tổng hợp.
+        # Nếu quá xa, vẫn truyền thành dòng tham chiếu riêng để Claude không kéo Entry/SL/TP quá rộng.
+        long_low = min(long_low, confirm_long_low)
+        long_high = max(long_high, confirm_long_high)
+        short_low = min(short_low, confirm_short_low)
+        short_high = max(short_high, confirm_short_high)
+        confirm_line = (
+            f"Tham chiếu {confirm['label']} {confirm['window_size']} nến: "
+            f"Long {fmt(confirm_long_low)}–{fmt(confirm_long_high)} | "
+            f"Short {fmt(confirm_short_low)}–{fmt(confirm_short_high)}"
+        )
+
+    # Khoảng SL tối thiểu để tránh quá sát khi dùng khung thấp.
+    if mode == "short":
+        stop_candidates = []
+        if main_atr:
+            stop_candidates.append(1.5 * main_atr)
+        if confirm_atr:
+            stop_candidates.append(0.6 * confirm_atr)
+    else:
+        stop_candidates = []
+        if main_atr:
+            stop_candidates.append(1.5 * main_atr)
+        if confirm_atr:
+            stop_candidates.append(0.35 * confirm_atr)
+
+    min_stop_distance = max(stop_candidates) if stop_candidates else None
+
+    atr_parts = []
+    if main_atr is not None:
+        atr_parts.append(f"ATR {main['label']}: {fmt(main_atr)}")
+    if confirm_atr is not None and confirm:
+        atr_parts.append(f"ATR {confirm['label']}: {fmt(confirm_atr)}")
+    atr_line = " | ".join(atr_parts) if atr_parts else "ATR tham chiếu: N/A"
+    min_stop_line = (
+        f"Khoảng SL tối thiểu: {fmt(min_stop_distance)} ({min_stop_desc})"
+        if min_stop_distance is not None else
+        f"Khoảng SL tối thiểu: N/A ({min_stop_desc})"
+    )
+
+    lines = [
+        "VÙNG QUÉT THANH KHOẢN ƯỚC LƯỢNG:",
+        f"Vùng chính {main['label']} {main['window_size']} nến: "
+        f"Long {fmt(main['low'] - main_buffer)}–{fmt(main['low'])} | "
+        f"Short {fmt(main['high'])}–{fmt(main['high'] + main_buffer)}",
+    ]
+    if confirm_line:
+        lines.append(confirm_line)
+    lines.extend([
+        f"Vùng quét Long tổng hợp: {fmt(long_low)}–{fmt(long_high)}",
+        f"Vùng quét Short tổng hợp: {fmt(short_low)}–{fmt(short_high)}",
+        atr_line,
+        min_stop_line,
+        "Lưu ý: đây là vùng quét thanh khoản/stop-loss ước lượng từ high/low nến, không phải dữ liệu thanh lý thật.",
+    ])
+    return "\n".join(lines)
 
 # ─── Fear & Greed ─────────────────────────────────────────────────────────────
 
@@ -530,48 +682,48 @@ def get_current_price_str(symbol: str) -> tuple[str, float | None]:
 # ─── History formatter ────────────────────────
 
 def format_prediction_history(history: list[dict]) -> str:
-    """Tóm tắt lịch sử để model tự điều chỉnh bias. Đây là dữ liệu nội bộ, không hiển thị ra user."""
     if not history:
-        return "Chưa có lịch sử phân tích cho symbol/mode này."
+        return "No previous analysis for this symbol/mode."
 
-    lines = [f"TÓM TẮT LỊCH SỬ NỘI BỘ ({len(history)} lần phân tích gần nhất):"]
+    lines = [f"RECENT LEARNING SUMMARY ({len(history)} latest analyses):"]
     finished = [p for p in history if p["result"] in ("WIN", "LOSS")]
     if finished:
         wins = sum(1 for p in finished if p["result"] == "WIN")
         win_rate = wins / len(finished) * 100
-        lines.append(f"- Kết quả đã chốt: {wins}/{len(finished)} lần WIN, tỷ lệ thắng {win_rate:.0f}%.")
+        lines.append(f"- Closed results: {wins}/{len(finished)} WIN, win rate {win_rate:.0f}%.")
 
         long_finished = [p for p in finished if p["direction"] == "LONG"]
         short_finished = [p for p in finished if p["direction"] == "SHORT"]
         if long_finished:
             long_wins = sum(1 for p in long_finished if p["result"] == "WIN")
-            lines.append(f"- LONG: {long_wins}/{len(long_finished)} lần WIN.")
+            lines.append(f"- LONG: {long_wins}/{len(long_finished)} WIN.")
         if short_finished:
             short_wins = sum(1 for p in short_finished if p["result"] == "WIN")
-            lines.append(f"- SHORT: {short_wins}/{len(short_finished)} lần WIN.")
+            lines.append(f"- SHORT: {short_wins}/{len(short_finished)} WIN.")
 
     losses = [p for p in finished if p["result"] == "LOSS"]
     if losses:
         loss_dirs = [p["direction"] for p in losses]
         if loss_dirs.count("LONG") > loss_dirs.count("SHORT"):
-            lines.append("- Vấn đề lặp lại: các lệnh LONG gần đây thua nhiều hơn, cần xác nhận tăng mạnh hơn trước khi chọn LONG.")
+            lines.append("- Repeated issue: recent LONG calls have more losses. Require stronger bullish confirmation.")
         elif loss_dirs.count("SHORT") > loss_dirs.count("LONG"):
-            lines.append("- Vấn đề lặp lại: các lệnh SHORT gần đây thua nhiều hơn, cần xác nhận giảm mạnh hơn trước khi chọn SHORT.")
+            lines.append("- Repeated issue: recent SHORT calls have more losses. Require stronger bearish confirmation.")
 
     for i, p in enumerate(history, 1):
         entry = f"{fmt(p['entry_low'])}-{fmt(p['entry_high'])}" if p["entry_low"] and p["entry_high"] else "N/A"
-        checked = f"giá kiểm tra {fmt(p['result_price'])}" if p["result_price"] else "chưa kiểm tra"
-        reason = p.get("result_reason") or "Chưa có kết quả kiểm tra."
-        decision_reason = p.get("reasoning_summary") or "Chưa có tóm tắt lý do quyết định."
-        snapshot = p.get("market_snapshot") or "Không có snapshot thị trường."
+        checked = f"checked price {fmt(p['result_price'])}" if p["result_price"] else "not checked"
+        reason = p.get("result_reason") or "Outcome not checked yet."
+        decision_reason = p.get("reasoning_summary") or "No decision reasoning summary."
+        snapshot = p.get("market_snapshot") or "No market snapshot."
         lines.append(
             f"- #{i} {p['created_at'][:16]} {p['direction']} {p['result']} ({checked}); "
             f"Entry {entry}, SL {fmt(p['sl'])}, TP1 {fmt(p['tp1'])}, TP2 {fmt(p['tp2'])}. "
-            f"Lý do quyết định: {decision_reason} Kết quả: {reason} Thị trường lúc đó: {snapshot}"
+            f"Decision why: {decision_reason} Outcome: {reason} Market then: {snapshot}"
         )
 
-    lines.append("Chỉ dùng phần này để tự điều chỉnh bias; tuyệt đối không nhắc lại lịch sử trong câu trả lời cho user.")
+    lines.append("Use this summary as learning context; do not copy old full responses.")
     return "\n".join(lines)
+
 
 def build_user_prompt(
     symbol: str,
@@ -588,8 +740,9 @@ def build_user_prompt(
         "Dùng 4H để timing entry, 1D để xác nhận xu hướng, 1W để xác định big picture."
     )
 
-    history_block = format_prediction_history(history)
-    tf_blocks     = "".join(summarize_timeframe(lbl, df) for lbl, df in timeframe_data.items())
+    history_block    = format_prediction_history(history)
+    tf_blocks        = "".join(summarize_timeframe(lbl, df) for lbl, df in timeframe_data.items())
+    liquidity_block  = estimate_liquidity_sweep_zones(mode, timeframe_data)
 
     return f"""YÊU CẦU PHÂN TÍCH {mode_label} CHO {symbol}
 
@@ -602,14 +755,16 @@ Phương pháp: {focus}
 ═══════════════════════════════
 {tf_blocks}
 ═══════════════════════════════
+{liquidity_block}
+═══════════════════════════════
 
 Yêu cầu:
-1. Đọc kỹ TÓM TẮT LỊCH SỬ NỘI BỘ để tự điều chỉnh xu hướng ưu tiên.
-2. Không hiển thị, không nhắc lại, không diễn giải lịch sử trong câu trả lời cho user.
-3. Không copy phân tích cũ. Chỉ dùng lịch sử để tránh lặp lại lỗi.
+1. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome và Market then, nhưng chỉ dùng nội bộ để điều chỉnh quyết định.
+2. Không hiển thị RECENT LEARNING SUMMARY, lịch sử phân tích, hoặc mục "Nhìn lại lịch sử" trong câu trả lời cho user.
+3. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
 4. QUYẾT ĐỊNH cuối cùng bắt buộc là LONG hoặc SHORT, không được chỉ CHỜ.
-5. Toàn bộ câu trả lời phải bằng tiếng Việt, ngoại trừ các nhãn bắt buộc: LONG, SHORT, Entry, SL, TP1, TP2, F&G, EMA, RSI, MACD, USDT.
-6. Trả lời thật ngắn gọn theo format system prompt, tối đa 450 từ.
+5. Phải dùng mục VÙNG QUÉT THANH KHOẢN ƯỚC LƯỢNG để chọn Entry, SL, TP1, TP2.
+6. Toàn bộ câu trả lời phải là tiếng Việt tự nhiên, không chen từ tiếng Anh ngoài các ký hiệu được phép trong system prompt.
 """
 
 
@@ -627,7 +782,7 @@ def summarize_reasoning(full_response: str) -> str:
         client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=80,
+            max_tokens=120,
             temperature=0,
             messages=[{
                 "role": "user",
