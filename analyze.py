@@ -988,7 +988,9 @@ def build_feature_engineering_block(
         return "FEATURE_ENGINEERING: Không đủ dữ liệu để tính cấu trúc, Fibonacci, ATR và vùng quét. Không được tự bịa các phần này."
 
     main_df = timeframe_data.get(main_label)
-    structure_df = timeframe_data.get(structure_label) or main_df
+    structure_df = timeframe_data.get(structure_label)
+    if structure_df is None or structure_df.empty:
+        structure_df = main_df
     atr_main = _current_atr(main_df)
     atr_structure = _current_atr(structure_df)
     zones = _liquidity_zones(structure_df, price, atr_structure or atr_main)
