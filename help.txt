@@ -1,33 +1,60 @@
-1. Lời nói đầu xin luôn ghi nhớ tiền của bạn là của bạn.
+🐆 Teopard Bot - Hướng dẫn sử dụng
 
-2. Danh sách lệnh cho user:
-- /start hoặc chọn 'Bắt đầu' trên Menu: lấy User ID và kích hoạt bot.
-- /whoami hoặc chọn 'Lấy User ID' trên Menu: xem User ID của bạn.
-- /help hoặc chọn 'Giúp đỡ' trên Menu: xem hướng dẫn.
-- /listsymbols hoặc chọn 'Xem danh sách symbol' trên Menu: xem các coin được hỗ trợ.
+1. Kích hoạt tài khoản
+/start - Bắt đầu bot
+/whoami - Xem Telegram User ID của bạn
 
-3. Danh sách lệnh cho admin:
-- /adduser 123456789: thêm User ID vào whitelist.
-- /removeuser 123456789: xóa User ID khỏi whitelist.
-- /listusers: xem danh sách whitelist và số lượt đã dùng trong ngày.
-- /setlimit 123456789 10: set giới hạn lượt/ngày cho user.
-- /resetusage 123456789: reset số lượt đã dùng hôm nay của user.
-- /addsymbol BTC: thêm symbol vào danh sách coin được hỗ trợ.
-- /removesymbol BTC: xóa symbol khỏi danh sách coin được hỗ trợ.
+Nếu tài khoản chưa được kích hoạt, hãy gửi User ID cho admin để được thêm vào whitelist.
 
-4. Cách sử dụng sau khi đã kích hoạt tài khoản:
-- Xem danh sách coin được hỗ trợ bằng /listsymbols.
-- Nhập tên coin vào khung chat, ví dụ: BTC hoặc btc (không phân biệt hoa thường).
-- Chọn kiểu phân tích:
-  + Scalp (15m/1H/4H): phân tích ngắn hạn trong ngày, phù hợp vào lệnh nhanh.
-  + Swing (4H/1D/1W): phân tích trung-dài hạn, phù hợp giữ lệnh vài ngày đến vài tuần.
+2. Phân tích coin
+Gõ mã coin, ví dụ:
+BTC
+ETH
+SOL
 
-5. Về cơ chế tự học:
-- Bot lưu lại kết quả mỗi lần phân tích.
-- Sau 12h (Scalp) hoặc 24h (Swing), bot tự lấy nến Binance 15m để kiểm tra dự đoán trước đúng hay sai.
-- Lần phân tích tiếp theo, bot sẽ nhìn lại 5 lần gần nhất để điều chỉnh chiến lược.
+Sau đó chọn:
+- Scalp: phân tích ngắn hạn 15M / 1H / 4H
+- Swing: phân tích dài hạn 4H / 1D / 1W
 
-Lưu ý:
-- Bot chỉ hỗ trợ phân tích, người đưa ra quyết định cuối cùng vẫn là bạn. Đọc lại dòng 1 nếu có thắc mắc.
-- Mọi coin đều bị ảnh hưởng bởi BTC. Nếu phân tích coin bạn chọn lệch hướng với BTC, hãy cẩn thận.
-- Giới hạn mặc định: 10 lượt/ngày/người. Admin có thể thay đổi bằng /setlimit.
+3. Lệnh user
+/listsymbols - Xem danh sách coin được phép phân tích
+/stats - Xem thống kê win/loss của chính bạn
+/stats BTC - Xem thống kê BTCUSDT của chính bạn
+/history - Xem 10 dự đoán gần nhất của chính bạn
+/history BTC - Xem lịch sử BTCUSDT của chính bạn
+/dashboard - Xem dashboard nhanh của chính bạn
+/help - Xem hướng dẫn này
+
+Lưu ý: User thường chỉ xem được lịch sử/dashboad của chính mình, không xem được prediction của user khác.
+
+Bot tính sẵn dữ liệu kỹ thuật trước khi gửi AI: EMA, RSI, MACD, khối lượng, ATR, cấu trúc giá, Fibonacci, vùng quét Long/Short và rủi ro tối thiểu. Claude sẽ tự phân tích và tự đặt Entry/SL/TP; Python kiểm tra lại logic trước khi lưu prediction.
+
+4. Auto-check kết quả
+Scalp:
+- Chờ Entry tối đa 12h
+- Nếu khớp Entry, theo dõi tối đa 72h
+- Check mỗi 1h
+- Chấm TP/SL bằng nến 15M
+
+Swing:
+- Chờ Entry tối đa 24h
+- Nếu khớp Entry, theo dõi tối đa 7 ngày
+- Check mỗi 12h
+- Chấm TP/SL bằng nến 1H
+
+Khi có kết quả WIN / LOSS / NOT_FILLED / EXPIRED / AMBIGUOUS, bot sẽ gửi thông báo cho user tạo dự đoán và admin.
+
+5. Lệnh admin
+/adduser <user_id> - Thêm user vào whitelist
+/removeuser <user_id> - Xóa user khỏi whitelist
+/listusers - Xem danh sách whitelist
+/setlimit <user_id> <số lượt> - Set giới hạn lượt/ngày
+/resetusage <user_id> - Reset lượt dùng hôm nay
+/addsymbol BTC - Thêm symbol
+/removesymbol BTC - Xóa symbol
+/checknow - Kiểm tra prediction đến hạn ngay lập tức
+/clearhistory CONFIRM - Xóa toàn bộ lịch sử prediction, giữ whitelist và symbol
+
+Admin dùng /stats, /history, /dashboard sẽ xem dữ liệu toàn hệ thống.
+
+Telegram menu không hiện lệnh có tham số, nên các lệnh như /stats BTC, /history BTC, /adduser 123456789 phải gõ tay.

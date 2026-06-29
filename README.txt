@@ -1,78 +1,93 @@
-# Teopard Telegram Bot
+# Teopard Bot V4 Lifecycle
 
-Teopard là Telegram bot phân tích kỹ thuật coin theo 2 mode:
-- Scalp: 15m / 1H / 4H.
-- Swing: 4H / 1D / 1W.
+Bản này dùng lifecycle mới cho prediction:
 
-Bot lấy dữ liệu Binance, tính EMA/RSI/MACD/Volume, lấy Fear & Greed Index, gửi dữ liệu sang Claude/Anthropic để phân tích, sau đó lưu prediction vào SQLite để tự kiểm tra WIN/LOSS và dùng lịch sử cho lần phân tích sau.
-
-## 1. Cài đặt
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+```text
+PENDING_ENTRY -> ENTRY_FILLED -> WIN / LOSS / EXPIRED / AMBIGUOUS
+PENDING_ENTRY -> NOT_FILLED
 ```
 
-## 2. File .env cần có
+## Logic kiểm tra
 
-Tạo file `.env` cùng cấp với `bot.py`:
+Scalp:
+- Chờ Entry tối đa 12h.
+- Sau khi khớp Entry, theo dõi tối đa 72h.
+- Job check mỗi 1h.
+- Chấm TP/SL bằng nến 15M.
 
-```env
-BOT_TOKEN=your_telegram_bot_token
-ANTHROPIC_API_KEY=your_anthropic_api_key
-CLAUDE_MODEL=claude-haiku-4-5-20251001
-ADMIN_USER_IDS=123456789,987654321
-DB_PATH=bot.db
-```
+Swing:
+- Chờ Entry tối đa 24h.
+- Sau khi khớp Entry, theo dõi tối đa 7 ngày.
+- Job check mỗi 12h.
+- Chấm TP/SL bằng nến 1H.
 
-## 3. Chạy bot
+Kết quả tự động gửi cho user tạo prediction và admin. Format kết quả có thời gian phân tích theo giờ Việt Nam, Entry, SL, TP1, TP2, giá khớp Entry, giá check, thời gian giữ lệnh và ID prediction.
 
-```powershell
-python bot.py
-```
+## Lệnh user
 
-## 4. Lệnh user
+- `/start`
+- `/whoami`
+- `/help`
+- `/listsymbols`
+- `/stats`
+- `/stats BTC`
+- `/history`
+- `/history BTC`
+- `/dashboard`
 
-- `/start`: bắt đầu, lấy User ID và kích hoạt bot.
-- `/whoami`: xem User ID.
-- `/help`: xem hướng dẫn.
-- `/listsymbols`: xem danh sách symbol được hỗ trợ.
+Lưu ý: Telegram menu không hiển thị command kèm tham số, nên `/stats BTC` và `/history BTC` phải gõ tay.
 
-## 5. Lệnh admin
+## Lệnh admin
 
-- `/adduser 123456789`: thêm User ID vào whitelist.
-- `/removeuser 123456789`: xóa User ID khỏi whitelist.
-- `/listusers`: xem whitelist và số lượt đã dùng trong ngày.
-- `/setlimit 123456789 10`: set giới hạn lượt/ngày cho user.
-- `/resetusage 123456789`: reset lượt dùng hôm nay của user.
-- `/addsymbol BTC`: thêm symbol được hỗ trợ.
-- `/removesymbol BTC`: xóa symbol được hỗ trợ.
+Admin có toàn bộ lệnh user, cộng thêm:
 
-## 6. Flow sử dụng
+- `/adduser 123456789`
+- `/removeuser 123456789`
+- `/listusers`
+- `/setlimit 123456789 10`
+- `/resetusage 123456789`
+- `/addsymbol BTC`
+- `/removesymbol BTC`
+- `/checknow`
 
-1. User bấm `/start`.
-2. User lấy User ID và gửi cho admin.
-3. Admin cấp quyền bằng `/adduser user_id`.
-4. Admin thêm coin bằng `/addsymbol BTC` nếu chưa có.
-5. User nhập `BTC` vào chat.
-6. Bot hỏi chọn Scalp hoặc Swing.
-7. Bot phân tích và trả kết quả.
-8. Bot lưu prediction vào SQLite.
-9. Background job chạy mỗi giờ để kiểm tra prediction đến hạn.
+Menu riêng của admin đã được set bằng `BotCommandScopeChat`, nên admin sẽ thấy đủ các lệnh quản trị trong menu Telegram sau khi bot restart/redeploy.
 
-## 7. Cơ chế tự check prediction
+## Feature engineering V4.2
 
-- Scalp: check sau 12 giờ.
-- Swing: check sau 24 giờ.
-- Bot dùng nến Binance 15m kể từ thời điểm tạo prediction.
-- Nếu TP1 chạm trước SL: WIN.
-- Nếu SL chạm trước TP1: LOSS.
-- Nếu TP1 và SL cùng chạm trong một nến 15m: AMBIGUOUS.
-- Nếu hết thời gian mà chưa chạm TP1/SL: EXPIRED.
+Bot tính sẵn bằng Python trước khi gửi Claude:
+- EMA7/25/50, RSI6/14, MACD, Volume ratio, ATR14.
+- Chuỗi nến, wick/body của nến cuối.
+- Market structure, swing gần/swing lớn.
+- Fibonacci 0.382/0.5/0.618 từ swing đã tính.
+- Vùng quét Long/Short gần và sâu từ pivot/equal high/equal low.
+- Rủi ro tối thiểu đề xuất theo ATR/giá.
 
-## 8. Ghi chú
+Cấu trúc Hybrid AI Engine:
+- Python chỉ tính dữ liệu cứng và bản đồ kỹ thuật.
+- Claude tự phân tích, tự chọn LONG/SHORT và tự đặt Entry/SL/TP.
+- Python validator kiểm tra lại Entry/SL/TP trước khi lưu prediction để auto-check.
+- Nếu kế hoạch chưa hợp lệ, bot gọi Claude sửa lại một lần.
 
-- Giới hạn mặc định là 10 lượt/ngày/người.
-- Admin có thể đổi giới hạn bằng `/setlimit`.
-- Kết quả auto-check hiện gửi cho admin, chưa gửi lại trực tiếp cho user tạo prediction.
+Prompt đã chặn Claude tự bịa Fibonacci/vùng quét nếu Python không gửi dữ liệu.
+
+## Railway env
+
+- `BOT_TOKEN`
+- `ANTHROPIC_API_KEY`
+- `ADMIN_USER_IDS=5920124635`
+- `DB_PATH=/data/bot.db`
+
+Không commit `.env` hoặc `bot.db`.
+
+
+V4.1 privacy/history reset update:
+- User thường chỉ xem /stats, /history, /dashboard của chính mình.
+- Admin xem được thống kê/lịch sử toàn hệ thống.
+- Thêm /clearhistory CONFIRM cho admin để xóa toàn bộ prediction/history nhưng giữ whitelist và allowed_symbols.
+
+V4.3 Hybrid AI Engine update:
+- Bỏ kế hoạch tham chiếu LONG/SHORT cứng khỏi prompt.
+- Python cung cấp dữ liệu cứng: ATR/Fibonacci/structure/liquidity/risk floor.
+- Claude tự ra chiến lược và tự đặt Entry/SL/TP.
+- Python validator kiểm tra logic LONG/SHORT, khoảng cách SL, TP1/TP2 và entry quá xa trước khi lưu DB.
+- Nếu output chưa hợp lệ, bot gọi Claude sửa lại một lần.
