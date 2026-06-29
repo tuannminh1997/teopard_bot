@@ -514,7 +514,7 @@ async def auto_check_pending_predictions() -> dict:
     admin_messages: list[str] = []
     user_messages: list[tuple[int, str]] = []
 
-    print(f"[AUTO_CHECK] Due predictions: {len(due)} at {iso(utc_now())}", flush=True)
+    print(f"[AUTO_CHECK] Due predictions: {len(due)} at {format_vn_datetime(utc_now())} (VN) / {iso(utc_now())} (UTC)", flush=True)
 
     for pred in due:
         start_dt = parse_utc_datetime(pred.get("entry_filled_at")) or parse_utc_datetime(pred.get("created_at"))
@@ -528,7 +528,7 @@ async def auto_check_pending_predictions() -> dict:
         if action == "fill":
             mark_entry_filled(pred["id"], decision["price"], decision["filled_at"], pred["mode"])
             # Không spam user khi chỉ mới khớp Entry; vẫn log Railway.
-            print(f"[AUTO_CHECK] #{pred['id']} ENTRY_FILLED {pred['symbol']} {decision.get('reason')}", flush=True)
+            print(f"[AUTO_CHECK] #{pred['id']} ENTRY_FILLED {pred['symbol']} lúc {format_vn_datetime(decision.get('filled_at'))} (VN) - {decision.get('reason')}", flush=True)
             continue
 
         if action == "close":
@@ -1017,7 +1017,7 @@ def build_feature_engineering_block(
         f"- Fibonacci {structure_label}: 0.382={fmt(fib.get('0.382'))}; 0.5={fmt(fib.get('0.5'))}; 0.618={fmt(fib.get('0.618'))}",
         f"- Vùng quét Long gần: {fmt(long_near[0])}–{fmt(long_near[1])} (cụm {long_near[2]} điểm); sâu: {fmt(long_deep[0])}–{fmt(long_deep[1])}",
         f"- Vùng quét Short gần: {fmt(short_near[0])}–{fmt(short_near[1])} (cụm {short_near[2]} điểm); sâu: {fmt(short_deep[0])}–{fmt(short_deep[1])}",
-        "- Quy tắc rủi ro: Claude tự lập Entry/SL/TP, nhưng khoảng cách Entry–SL nên không nhỏ hơn rủi ro tối thiểu đề xuất; TP1 nên khoảng >= 0.8R, TP2 nên khoảng >= 1.4R.",
+        "- Quy tắc rủi ro: Claude tự lập Entry/SL/TP; khoảng cách Entry–SL nên bám theo ATR, cấu trúc và rủi ro tối thiểu đề xuất. Python không ép tỷ lệ R:R cứng.",
         "- Ghi chú: Vùng quét chỉ là ước lượng từ pivot/equal high/equal low và high/low nến, không phải dữ liệu thanh lý thật. Block này là bản đồ kỹ thuật, không phải lệnh giao dịch chốt sẵn.",
     ]
     return "\n".join(lines)
@@ -1342,11 +1342,13 @@ def validate_prediction_plan(
     current_price: float | None,
 ) -> list[str]:
     """
-    Python không chọn lệnh thay Claude. Hàm này chỉ đóng vai trò kiểm tra an toàn:
+    Python không chọn lệnh thay Claude. Hàm này chỉ đóng vai trò kiểm tra an toàn tối thiểu:
     - LONG/SHORT đúng chiều Entry/SL/TP.
     - Có đủ số để bot auto-check.
     - SL không quá sát Entry so với rủi ro tối thiểu Python đã tính.
-    - TP1/TP2 có tỷ lệ lợi nhuận/rủi ro tối thiểu.
+
+    Không chặn lệnh vì R:R thấp. R:R là lựa chọn chiến lược của Claude,
+    vẫn phải lưu prediction để có dữ liệu học WIN/LOSS.
     """
     errors: list[str] = []
     direction = (pred.get("direction") or "").upper()
@@ -1418,10 +1420,9 @@ def validate_prediction_plan(
         errors.append(
             f"SL quá sát Entry: rủi ro {fmt(risk)} nhỏ hơn 70% rủi ro tối thiểu đề xuất {fmt(min_risk)}."
         )
-    if reward1 <= 0 or reward1 < risk * 0.80:
-        errors.append(f"TP1 chưa đủ lợi nhuận so với rủi ro: reward1={fmt(reward1)}, risk={fmt(risk)}.")
-    if reward2 <= 0 or reward2 < risk * 1.40:
-        errors.append(f"TP2 chưa đủ lợi nhuận mở rộng: reward2={fmt(reward2)}, risk={fmt(risk)}.")
+    # Không validate R:R ở đây.
+    # TP1/TP2 chỉ cần đúng chiều so với Entry để auto-check được.
+    # Lệnh R:R thấp vẫn được lưu để bot có dữ liệu học WIN/LOSS thực tế.
 
     # Chặn số bịa quá xa giá hiện tại, nhưng không quá chặt để Swing vẫn có không gian.
     max_distance_pct = 0.08 if mode == "short" else 0.20

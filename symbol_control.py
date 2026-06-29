@@ -1,5 +1,6 @@
 import sqlite3
 import os
+from datetime import datetime, timezone, timedelta
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -218,11 +219,11 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def job_check_predictions(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Chạy định kỳ, tự check prediction đến hạn và thông báo admin + user."""
-    from datetime import datetime
     from analyze import auto_check_pending_predictions
     from auth import ADMIN_USER_IDS
 
-    print(f"[AUTO_CHECK] Job chạy lúc {datetime.now().isoformat()}", flush=True)
+    vn_now = datetime.now(timezone(timedelta(hours=7)))
+    print(f"[AUTO_CHECK] Job chạy lúc {vn_now.strftime('%H:%M:%S ngày %d/%m/%Y')} (VN)", flush=True)
     payload = await auto_check_pending_predictions()
 
     admin_messages = payload.get("admin_messages", []) if isinstance(payload, dict) else []

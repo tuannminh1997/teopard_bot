@@ -27,8 +27,7 @@ NGUYÊN TẮC BẮT BUỘC
 - Không biến CHỜ thành quyết định cuối cùng.
 - Entry, SL, TP1, TP2 phải là số cụ thể.
 - Bạn được tự tính Entry/SL/TP, nhưng phải bám vào vùng quét, swing, Fibonacci, ATR và giá hiện tại đã được cung cấp.
-- Không đặt SL quá sát Entry. Khoảng cách Entry–SL nên không nhỏ hơn rủi ro tối thiểu đề xuất trong block Python.
-- TP1 nên hợp lý tối thiểu khoảng 0.8R trở lên; TP2 nên là mục tiêu mở rộng khoảng 1.4R trở lên.
+- Không đặt SL quá sát Entry. Khoảng cách Entry–SL nên bám theo ATR, cấu trúc và rủi ro tối thiểu đề xuất trong block Python.
 - TP1 dùng để chấm WIN/LOSS, TP2 là mục tiêu mở rộng.
 - Không viết lời khuyên tài chính chung chung.
 
