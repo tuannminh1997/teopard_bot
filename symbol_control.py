@@ -269,10 +269,6 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.effective_message.reply_text(format_history(symbol, user_id=command_scope_user_id(update)))
 
 
-async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import format_stats
-    await update.effective_message.reply_text(format_stats(user_id=command_scope_user_id(update)))
-
 
 async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from auth import is_admin
@@ -333,7 +329,6 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("listsymbols",  list_symbols))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("history", history_command))
-    app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CommandHandler("clearhistory", clearhistory_command))
     app.add_handler(CommandHandler("checknow", checknow_command))
     app.add_handler(CallbackQueryHandler(
@@ -355,5 +350,4 @@ def symbol_control_commands() -> list[BotCommand]:
         BotCommand("listsymbols", "Xem danh sách coin hỗ trợ"),
         BotCommand("stats", "Xem thống kê win/loss, có thể gõ /stats BTC"),
         BotCommand("history", "Xem lịch sử, có thể gõ /history BTC"),
-        BotCommand("dashboard", "Xem dashboard nhanh"),
     ]

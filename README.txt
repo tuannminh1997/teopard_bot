@@ -33,7 +33,6 @@ Kết quả tự động gửi cho user tạo prediction và admin. Format kết
 - `/stats BTC`
 - `/history`
 - `/history BTC`
-- `/dashboard`
 
 Lưu ý: Telegram menu không hiển thị command kèm tham số, nên `/stats BTC` và `/history BTC` phải gõ tay.
 
@@ -81,7 +80,7 @@ Không commit `.env` hoặc `bot.db`.
 
 
 V4.1 privacy/history reset update:
-- User thường chỉ xem /stats, /history, /dashboard của chính mình.
+- User thường chỉ xem /stats và /history của chính mình.
 - Admin xem được thống kê/lịch sử toàn hệ thống.
 - Thêm /clearhistory CONFIRM cho admin để xóa toàn bộ prediction/history nhưng giữ whitelist và allowed_symbols.
 
@@ -91,3 +90,7 @@ V4.3 Hybrid AI Engine update:
 - Claude tự ra chiến lược và tự đặt Entry/SL/TP.
 - Python validator kiểm tra logic LONG/SHORT, khoảng cách SL, TP1/TP2 và entry quá xa trước khi lưu DB.
 - Nếu output chưa hợp lệ, bot gọi Claude sửa lại một lần.
+
+
+- Giữ /stats để xem hiệu suất WIN/LOSS/RR.
+- Giữ /history để xem danh sách prediction gần nhất.

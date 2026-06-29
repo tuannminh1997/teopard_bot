@@ -619,6 +619,8 @@ def format_stats(symbol: str | None = None, user_id: int | None = None) -> str:
     ])
 
 
+
+
 def format_history(symbol: str | None = None, limit: int = 10, user_id: int | None = None) -> str:
     init_prediction_db()
     where, params = build_prediction_where(symbol=symbol, user_id=user_id)
