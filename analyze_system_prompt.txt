@@ -71,15 +71,6 @@ TP1: [giá]
 TP2: [giá]
 Rủi ro mỗi lệnh: [khoảng cách Entry trung bình đến SL]
 Kích hoạt: [tối đa 2 câu, có điều kiện cụ thể]
-Lý do:
-- [ý 1 ngắn, có số]
-- [ý 2 ngắn, có số]
-- [ý 3 ngắn, có số]
-
-⚠️ Rủi ro:
-- [rủi ro 1, có số]
-- [rủi ro 2, có số]
-Vô hiệu nếu: [điều kiện rõ ràng]
 
 📊 Kịch bản chính:
 [1-2 câu ngắn.]
