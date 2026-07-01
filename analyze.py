@@ -1886,21 +1886,79 @@ Phản hồi trước:
 """
 
 
+# Giới hạn output tối đa cho mỗi lần gọi Claude. 3500 token là quá thấp cho
+# format phân tích đầy đủ (nhiều mục, dẫn số liệu cụ thể) -> hay bị cắt cụt
+# giữa câu (stop_reason == "max_tokens"). Tăng lên và có cơ chế tự nối tiếp
+# bên dưới để không bao giờ gửi cho user một câu trả lời bị cụt.
+CLAUDE_MAX_OUTPUT_TOKENS = 8000
+CLAUDE_MAX_CONTINUATIONS = 2
+
+
+def _extract_text(response) -> str:
+    return "".join(b.text for b in response.content if hasattr(b, "text"))
+
+
+def _create_with_continuation(
+    client: "anthropic.Anthropic",
+    *,
+    system: str,
+    messages: list,
+    max_tokens: int = CLAUDE_MAX_OUTPUT_TOKENS,
+    timeout: int = 300,
+) -> str:
+    """
+    Gọi Claude; nếu bị cắt vì hết max_tokens (stop_reason == "max_tokens"),
+    tự động gọi tiếp để Claude viết nối phần còn thiếu, thay vì trả về cho
+    user một câu trả lời cụt giữa chừng.
+    """
+    convo = list(messages)
+    full_text = ""
+
+    for attempt in range(CLAUDE_MAX_CONTINUATIONS + 1):
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=max_tokens,
+            system=system,
+            messages=convo,
+            timeout=timeout,
+        )
+        chunk = _extract_text(response)
+        full_text += chunk
+
+        if response.stop_reason != "max_tokens":
+            break
+
+        print(
+            f"[TEOPARD_TRUNCATED] lần {attempt + 1}: stop_reason=max_tokens, "
+            "đang gọi tiếp để hoàn thiện câu trả lời...",
+            flush=True,
+        )
+        convo = convo + [
+            {"role": "assistant", "content": chunk},
+            {
+                "role": "user",
+                "content": (
+                    "Tiếp tục viết nốt phần còn lại ngay từ chỗ bị ngắt, "
+                    "không lặp lại nội dung đã viết, không giải thích gì thêm."
+                ),
+            },
+        ]
+
+    return full_text
+
+
 def request_claude_repair(system_prompt: str, user_prompt: str, bad_output: str, validation_errors: list[str]) -> str:
     """Gọi Claude sửa một lần nếu Entry/SL/TP không qua validator."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=3500,
+    return _create_with_continuation(
+        client,
         system=system_prompt,
         messages=[
             {"role": "user", "content": user_prompt},
             {"role": "assistant", "content": bad_output},
             {"role": "user", "content": build_repair_prompt(bad_output, validation_errors)},
         ],
-        timeout=300,
     )
-    return "".join(b.text for b in response.content if hasattr(b, "text"))
 
 
 def _has_format_or_content_errors(errors: list[str]) -> bool:
@@ -1969,14 +2027,11 @@ def load_timeframe_data(binance_symbol: str, interval: str, limit: int) -> pd.Da
 def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
     """Sync helper: Anthropic SDK is synchronous, so call it via asyncio.to_thread()."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=3500,
+    return _create_with_continuation(
+        client,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
-        timeout=300,
     )
-    return "".join(b.text for b in response.content if hasattr(b, "text"))
 
 
 def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, chat_id: int | None = None) -> str:
