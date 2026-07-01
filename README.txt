@@ -76,7 +76,7 @@ Bot tính sẵn bằng Python trước khi gửi Claude:
 Cấu trúc Hybrid AI Engine:
 - Python chỉ tính dữ liệu cứng và bản đồ kỹ thuật.
 - Claude tự phân tích, tự chọn LONG/SHORT và tự đặt Entry/SL/TP.
-- Python validator kiểm tra lại Entry/SL/TP trước khi lưu prediction để auto-check.
+- Python không còn chặn risk/format trước khi gửi user. Claude trả phản hồi thế nào thì bot gửi user phản hồi đó. Python chỉ parse Entry/SL/TP để lưu auto-check nếu đủ số.
 - Nếu kế hoạch chưa hợp lệ, bot KHÔNG tự sửa và KHÔNG gọi Claude sửa lại; bot ẩn tín hiệu đó và lưu hidden REJECTED_PLAN để học/debug.
 
 Prompt đã chặn Claude tự bịa Fibonacci/vùng quét nếu Python không gửi dữ liệu.
@@ -100,7 +100,7 @@ V4.3 Hybrid AI Engine update:
 - Bỏ kế hoạch tham chiếu LONG/SHORT cứng khỏi prompt.
 - Python cung cấp dữ liệu cứng: ATR/Fibonacci/structure/liquidity/risk floor.
 - Claude tự ra chiến lược và tự đặt Entry/SL/TP.
-- Python validator kiểm tra logic LONG/SHORT, khoảng cách SL, TP1/TP2 và entry quá xa trước khi lưu DB.
+- Python không kiểm tra logic/risk để ẩn tín hiệu nữa. Claude tự chịu trách nhiệm phân tích Entry/SL/TP; bot chỉ parse số để auto-check nếu có đủ Entry/SL/TP.
 - Nếu output chưa hợp lệ, bot KHÔNG tự sửa và KHÔNG gọi Claude sửa lại; bot ẩn tín hiệu đó để tránh gửi plan thiếu/không an toàn cho user.
 
 V4.4 per-user learning update:
@@ -121,8 +121,7 @@ V4.6 feature snapshot learning update:
 - market_snapshot được giữ gọn cho dữ liệu thị trường cơ bản, feature_snapshot tách riêng để tránh prompt history quá rối.
 
 V4.8 rejected plan learning update:
-- Nếu Claude trả Entry/SL/TP không đạt validator, bot KHÔNG hiển thị plan lỗi cho user.
-- Bot chỉ trả thông báo ngắn: nếu thiếu format/thiếu mục bắt buộc thì báo chưa đủ dữ liệu hợp lệ để tạo phân tích; nếu Entry/SL/TP không đạt risk thì báo chưa có setup hợp lệ.
+- Nếu Claude trả LONG/SHORT, bot hiển thị trực tiếp cho user. Nếu parse đủ Entry/SL/TP thì bot lưu prediction để auto-check. Nếu không parse đủ số thì bot vẫn hiển thị phản hồi nhưng chỉ lưu hidden record để learning/debug, không auto-check.
 - Bot vẫn lưu hidden record `REJECTED_PLAN` để Claude học/debug, nhưng không auto-check và không hiện trong /history, /stats, /dashboard.
 
 
@@ -134,12 +133,11 @@ Cập nhật format phản hồi:
 V4.8 compact output guard update:
 - Output cho user dùng format rút gọn: không hiện riêng “Bối cảnh” và “Cấu trúc”.
 - Bot vẫn gửi dữ liệu EMA/RSI/MACD/ATR/Fibonacci/cấu trúc/vùng quét cho Claude để phân tích nội bộ.
-- Python validator bắt buộc phản hồi có đủ Thanh khoản, Quyết định, Entry/SL/TP, Kịch bản chính và Rủi ro để tránh output bị cụt.
+- Prompt vẫn yêu cầu Claude trả đủ Thanh khoản, Quyết định, Entry/SL/TP, Kịch bản chính và Rủi ro, nhưng Python không ẩn phản hồi nếu Claude thiếu format.
 
 
 Bản cập nhật thông báo lỗi:
-- Nếu Claude trả thiếu format hoặc kế hoạch Entry/SL/TP không đạt validator, bot không hiển thị plan lỗi.
-- User chỉ thấy một thông báo chung: “⚠️ Teopard chưa tìm thấy setup hợp lệ để tạo tín hiệu.”
+- Bot không còn dùng Python validator để ẩn phản hồi. Claude trả thế nào thì user thấy thế đó. Chỉ khi không parse đủ Entry/SL/TP thì bot không đưa vào auto-check.
 - Lỗi vẫn được lưu hidden dạng REJECTED_PLAN để phục vụ learning/debug, không xuất hiện trong history/stats/dashboard.
 
 V4.9 Sonnet Analyst Mode update:
@@ -147,5 +145,4 @@ V4.9 Sonnet Analyst Mode update:
 - Python gửi thêm `MARKET_REGIME_DO_PYTHON_PHAN_LOAI` để Claude biết thị trường đang trend, range/nhiễu, thanh khoản thấp hay biến động cao.
 - Python gửi thêm `RAW_CANDLE_CONTEXT_CHON_LOC` gồm nến thô có body%, râu trên/dưới, volume và taker-buy ratio nếu có để Sonnet đọc hành vi giá tốt hơn.
 - Claude phải so sánh nội bộ LONG / SHORT / NO_TRADE trước khi quyết định, nhưng không in bảng so sánh ra user.
-- Nếu Claude chọn NO_TRADE, bot không hiển thị phân tích đó như tín hiệu, không auto-check, không hiện trong /history/stats/dashboard; bot chỉ lưu hidden learning record để lần sau học được lúc nào nên đứng ngoài.
-- User vẫn chỉ thấy thông báo chung: “⚠️ Teopard chưa tìm thấy setup hợp lệ để tạo tín hiệu.”
+- Nếu Claude chọn NO_TRADE, bot hiển thị phản hồi NO_TRADE của Claude cho user và lưu hidden learning record; NO_TRADE không auto-check và không hiện trong /history/stats/dashboard.

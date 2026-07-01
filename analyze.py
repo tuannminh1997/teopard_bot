@@ -2028,8 +2028,13 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
 
     pred = parse_prediction_from_output(output)
 
-    if pred.get("direction") == "NO_TRADE":
-        log_hidden_rejection(binance_symbol, mode, pred, ["Claude chọn NO_TRADE."], output)
+    # Sonnet-trust mode:
+    # - Không dùng Python risk/format validator để ẩn phản hồi của Claude nữa.
+    # - Claude trả gì thì gửi user đúng nội dung đó.
+    # - Python chỉ parse tối thiểu Entry/SL/TP để lưu auto-check nếu đủ số.
+    direction = (pred.get("direction") or "").upper()
+
+    if direction == "NO_TRADE":
         save_no_trade_prediction(
             symbol=binance_symbol,
             mode=mode,
@@ -2040,43 +2045,23 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
             user_id=user_id,
             chat_id=chat_id,
         )
-        return maybe_append_not_saved_warning(output, ["Claude chọn NO_TRADE."])
+        return output
 
-    plan_errors = validate_prediction_plan(pred, mode, timeframe_data, current_price)
-    format_errors = validate_output_format(output)
-    validation_errors = plan_errors + format_errors
+    can_track = (
+        direction in ("LONG", "SHORT")
+        and pred.get("entry_low") is not None
+        and pred.get("entry_high") is not None
+        and pred.get("sl") is not None
+        and pred.get("tp1") is not None
+        and pred.get("tp2") is not None
+    )
 
-    # Không tự sửa / không gọi Claude repair lại kế hoạch.
-    # Nếu phản hồi thiếu format hoặc Entry/SL/TP không đạt quản trị rủi ro,
-    # bot sẽ ẩn tín hiệu đó, lưu REJECTED_PLAN nội bộ để học/debug,
-    # và yêu cầu user phân tích lại sau.
-    plan_validation_errors = plan_errors
-
-    if pred["direction"] in ("LONG", "SHORT") and not validation_errors:
+    if can_track:
         reasoning_summary = summarize_reasoning(output)
-
         save_prediction(
             symbol=binance_symbol,
             mode=mode,
-            direction=pred["direction"],
-            entry_low=pred["entry_low"],
-            entry_high=pred["entry_high"],
-            sl=pred["sl"],
-            tp1=pred["tp1"],
-            tp2=pred["tp2"],
-            market_snapshot=market_snapshot,
-            feature_snapshot=feature_snapshot,
-            reasoning_summary=reasoning_summary,
-            full_response=output,
-            user_id=user_id,
-            chat_id=chat_id,
-        )
-    elif validation_errors:
-        log_hidden_rejection(binance_symbol, mode, pred, validation_errors, output)
-        save_rejected_prediction(
-            symbol=binance_symbol,
-            mode=mode,
-            direction=pred.get("direction"),
+            direction=direction,
             entry_low=pred.get("entry_low"),
             entry_high=pred.get("entry_high"),
             sl=pred.get("sl"),
@@ -2084,15 +2069,39 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
             tp2=pred.get("tp2"),
             market_snapshot=market_snapshot,
             feature_snapshot=feature_snapshot,
-            reasoning_summary="Validator rejected plan: " + " ; ".join(validation_errors[:5]),
+            reasoning_summary=reasoning_summary,
             full_response=output,
-            validation_errors=validation_errors,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+    else:
+        # Không ẩn output. Chỉ lưu hidden để learning/debug vì bot không đủ số để auto-check.
+        missing = []
+        if direction not in ("LONG", "SHORT"):
+            missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO_TRADE.")
+        for field in ("entry_low", "entry_high", "sl", "tp1", "tp2"):
+            if pred.get(field) is None:
+                missing.append(f"Không parse được {field}.")
+        log_hidden_rejection(binance_symbol, mode, pred, missing, output)
+        save_rejected_prediction(
+            symbol=binance_symbol,
+            mode=mode,
+            direction=direction or pred.get("direction"),
+            entry_low=pred.get("entry_low"),
+            entry_high=pred.get("entry_high"),
+            sl=pred.get("sl"),
+            tp1=pred.get("tp1"),
+            tp2=pred.get("tp2"),
+            market_snapshot=market_snapshot,
+            feature_snapshot=feature_snapshot,
+            reasoning_summary="Không đủ số để auto-check: " + " ; ".join(missing[:5]),
+            full_response=output,
+            validation_errors=missing,
             user_id=user_id,
             chat_id=chat_id,
         )
 
-    return maybe_append_not_saved_warning(output, validation_errors)
-
+    return output
 
 async def collect_timeframe_data(binance_symbol: str, mode: str) -> dict[str, pd.DataFrame | None]:
     """
@@ -2166,8 +2175,13 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     pred = parse_prediction_from_output(output)
 
-    if pred.get("direction") == "NO_TRADE":
-        log_hidden_rejection(binance_symbol, mode, pred, ["Claude chọn NO_TRADE."], output)
+    # Sonnet-trust mode:
+    # - Không dùng Python risk/format validator để ẩn phản hồi của Claude nữa.
+    # - Claude trả gì thì gửi user đúng nội dung đó.
+    # - Python chỉ parse tối thiểu Entry/SL/TP để lưu auto-check nếu đủ số.
+    direction = (pred.get("direction") or "").upper()
+
+    if direction == "NO_TRADE":
         await asyncio.to_thread(
             save_no_trade_prediction,
             symbol=binance_symbol,
@@ -2179,44 +2193,24 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             user_id=user_id,
             chat_id=chat_id,
         )
-        return maybe_append_not_saved_warning(output, ["Claude chọn NO_TRADE."])
+        return output
 
-    plan_errors = validate_prediction_plan(pred, mode, timeframe_data, current_price)
-    format_errors = validate_output_format(output)
-    validation_errors = plan_errors + format_errors
+    can_track = (
+        direction in ("LONG", "SHORT")
+        and pred.get("entry_low") is not None
+        and pred.get("entry_high") is not None
+        and pred.get("sl") is not None
+        and pred.get("tp1") is not None
+        and pred.get("tp2") is not None
+    )
 
-    # Không tự sửa / không gọi Claude repair lại kế hoạch.
-    # Nếu phản hồi thiếu format hoặc Entry/SL/TP không đạt quản trị rủi ro,
-    # bot sẽ ẩn tín hiệu đó, lưu REJECTED_PLAN nội bộ để học/debug,
-    # và yêu cầu user phân tích lại sau.
-    plan_validation_errors = plan_errors
-
-    if pred["direction"] in ("LONG", "SHORT") and not validation_errors:
+    if can_track:
         reasoning_summary = await asyncio.to_thread(summarize_reasoning, output)
         await asyncio.to_thread(
             save_prediction,
             symbol=binance_symbol,
             mode=mode,
-            direction=pred["direction"],
-            entry_low=pred["entry_low"],
-            entry_high=pred["entry_high"],
-            sl=pred["sl"],
-            tp1=pred["tp1"],
-            tp2=pred["tp2"],
-            market_snapshot=market_snapshot,
-            feature_snapshot=feature_snapshot,
-            reasoning_summary=reasoning_summary,
-            full_response=output,
-            user_id=user_id,
-            chat_id=chat_id,
-        )
-    elif validation_errors:
-        log_hidden_rejection(binance_symbol, mode, pred, validation_errors, output)
-        await asyncio.to_thread(
-            save_rejected_prediction,
-            symbol=binance_symbol,
-            mode=mode,
-            direction=pred.get("direction"),
+            direction=direction,
             entry_low=pred.get("entry_low"),
             entry_high=pred.get("entry_high"),
             sl=pred.get("sl"),
@@ -2224,11 +2218,37 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             tp2=pred.get("tp2"),
             market_snapshot=market_snapshot,
             feature_snapshot=feature_snapshot,
-            reasoning_summary="Validator rejected plan: " + " ; ".join(validation_errors[:5]),
+            reasoning_summary=reasoning_summary,
             full_response=output,
-            validation_errors=validation_errors,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+    else:
+        # Không ẩn output. Chỉ lưu hidden để learning/debug vì bot không đủ số để auto-check.
+        missing = []
+        if direction not in ("LONG", "SHORT"):
+            missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO_TRADE.")
+        for field in ("entry_low", "entry_high", "sl", "tp1", "tp2"):
+            if pred.get(field) is None:
+                missing.append(f"Không parse được {field}.")
+        log_hidden_rejection(binance_symbol, mode, pred, missing, output)
+        await asyncio.to_thread(
+            save_rejected_prediction,
+            symbol=binance_symbol,
+            mode=mode,
+            direction=direction or pred.get("direction"),
+            entry_low=pred.get("entry_low"),
+            entry_high=pred.get("entry_high"),
+            sl=pred.get("sl"),
+            tp1=pred.get("tp1"),
+            tp2=pred.get("tp2"),
+            market_snapshot=market_snapshot,
+            feature_snapshot=feature_snapshot,
+            reasoning_summary="Không đủ số để auto-check: " + " ; ".join(missing[:5]),
+            full_response=output,
+            validation_errors=missing,
             user_id=user_id,
             chat_id=chat_id,
         )
 
-    return maybe_append_not_saved_warning(output, validation_errors)
+    return output
