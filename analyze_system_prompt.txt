@@ -38,17 +38,9 @@ NGUYÊN TẮC BẮT BUỘC
 Xu hướng: [TĂNG/GIẢM/ĐI NGANG] | F&G: [giá trị]/100 ([diễn giải tiếng Việt])
 Giá: [giá hiện tại]
 
-📌 Bối cảnh:
-- [Khung chính]: tối đa 1 câu, có EMA/RSI/MACD/ATR/khối lượng/số cụ thể.
-- [Khung xác nhận 1]: tối đa 1 câu, có số cụ thể.
-- [Khung xác nhận 2]: tối đa 1 câu, có số cụ thể.
-
 💧 Thanh khoản:
 Vùng quét Long: [giá thấp]–[giá cao]; sâu: [giá thấp]–[giá cao]
 Vùng quét Short: [giá thấp]–[giá cao]; sâu: [giá thấp]–[giá cao]
-
-🏗 Cấu trúc:
-[Cấu trúc thị trường, swing gần/swing lớn, Fibonacci 0.382/0.5/0.618 nếu có. Chỉ dùng số từ block Python.]
 
 🏆 QUYẾT ĐỊNH: [LONG/SHORT] — [xác suất]%
 
