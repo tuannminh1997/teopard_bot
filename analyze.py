@@ -1333,7 +1333,6 @@ def summarize_reasoning(full_response: str) -> str:
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=120,
-            temperature=0,
             messages=[{
                 "role": "user",
                 "content": (
@@ -1549,7 +1548,6 @@ def request_claude_repair(system_prompt: str, user_prompt: str, bad_output: str,
     response = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=2500,
-        temperature=0,
         system=system_prompt,
         messages=[
             {"role": "user", "content": user_prompt},
@@ -1589,7 +1587,6 @@ def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
     response = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=2500,
-        temperature=0,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
         timeout=300,
