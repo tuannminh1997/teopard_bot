@@ -18,13 +18,14 @@ Sau đó chọn:
 
 3. Lệnh user
 /listsymbols - Xem danh sách coin được phép phân tích
-/stats - Xem thống kê hiệu suất win/loss của chính bạn
-/stats BTC - Xem thống kê hiệu suất BTCUSDT của chính bạn
+/stats - Xem thống kê win/loss của chính bạn
+/stats BTC - Xem thống kê BTCUSDT của chính bạn
 /history - Xem 10 dự đoán gần nhất của chính bạn
 /history BTC - Xem lịch sử BTCUSDT của chính bạn
+/dashboard - Xem dashboard nhanh của chính bạn
 /help - Xem hướng dẫn này
 
-Lưu ý: User thường chỉ xem được thống kê/lịch sử của chính mình, không xem được prediction của user khác.
+Lưu ý: User thường chỉ xem được lịch sử/dashboard của chính mình, không xem được prediction của user khác.
 
 Bot tính sẵn dữ liệu kỹ thuật trước khi gửi AI: EMA, RSI, MACD, khối lượng, ATR, cấu trúc giá, Fibonacci, vùng quét Long/Short và rủi ro tối thiểu. Claude sẽ tự phân tích và tự đặt Entry/SL/TP; Python kiểm tra lại logic trước khi lưu prediction.
 
@@ -41,9 +42,22 @@ Swing:
 - Check mỗi 12h
 - Chấm TP/SL bằng nến 1H
 
-Khi có kết quả WIN / LOSS / NOT_FILLED / EXPIRED / AMBIGUOUS, bot sẽ gửi thông báo cho user tạo dự đoán và admin.
+Khi có kết quả WIN / LOSS / NOT_FILLED / EXPIRED / AMBIGUOUS, bot chỉ gửi thông báo cho user tạo dự đoán. Nếu admin chính là người tạo dự đoán thì admin vẫn nhận như một user bình thường, nhưng bot không gửi thêm bản tổng hợp admin.
 
 5. Lệnh admin
+Admin dùng lệnh user như người dùng bình thường:
+/stats - Xem thống kê của chính admin
+/history - Xem lịch sử của chính admin
+/dashboard - Xem dashboard của chính admin
+
+Admin muốn xem toàn hệ thống thì dùng lệnh riêng:
+/statsall - Xem thống kê toàn bộ user
+/statsall BTC - Xem thống kê BTCUSDT toàn bộ user
+/historyall - Xem lịch sử toàn bộ user
+/historyall BTC - Xem lịch sử BTCUSDT toàn bộ user
+/dashboardall - Xem dashboard toàn bộ hệ thống
+
+Lệnh quản trị:
 /adduser <user_id> - Thêm user vào whitelist
 /removeuser <user_id> - Xóa user khỏi whitelist
 /listusers - Xem danh sách whitelist
@@ -51,11 +65,13 @@ Khi có kết quả WIN / LOSS / NOT_FILLED / EXPIRED / AMBIGUOUS, bot sẽ gử
 /resetusage <user_id> - Reset lượt dùng hôm nay
 /addsymbol BTC - Thêm symbol
 /removesymbol BTC - Xóa symbol
-/checknow - Kiểm tra prediction đến hạn ngay lập tức
+/checknow - Kiểm tra prediction đến hạn ngay lập tức; kết quả chi tiết gửi cho user tạo lệnh, admin nhận thông báo số lượng kết quả mới
 /clearhistory CONFIRM - Xóa toàn bộ lịch sử prediction, giữ whitelist và symbol
 
-Admin dùng /stats và /history sẽ xem dữ liệu toàn hệ thống.
-
-Ghi chú: /stats dùng để xem hiệu suất WIN/LOSS và RR; /history dùng để xem danh sách prediction gần nhất.
-
 Telegram menu không hiện lệnh có tham số, nên các lệnh như /stats BTC, /history BTC, /adduser 123456789 phải gõ tay.
+
+Ghi chú admin: Admin dùng /historyall hoặc /historyall BTC sẽ thấy thêm User ID và Chat ID của từng prediction để biết lệnh đó thuộc user nào. /history chỉ xem lịch sử của chính admin nên không hiện User ID.
+
+Ghi chú học lại: Khi bạn phân tích coin, Claude chỉ dùng lịch sử phân tích của chính tài khoản bạn cho cùng coin/mode. Lịch sử của user khác không được đưa vào prompt học lại. Admin vẫn xem được thống kê/lịch sử toàn hệ thống khi dùng /statsall, /historyall, /dashboardall.
+
+Ghi chú học lại nâng cao: Lịch sử đưa cho Claude học gồm 5 phân tích gần nhất của chính bạn cho cùng coin/mode. Mỗi lịch sử có Entry/SL/TP, kết quả WIN/LOSS, lý do kết quả, reasoning cũ, market snapshot và feature snapshot gồm cấu trúc, Fibonacci, vùng quét, ATR/risk, EMA/RSI/MACD/volume.

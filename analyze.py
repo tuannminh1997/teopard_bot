@@ -82,7 +82,6 @@ def init_prediction_db() -> None:
                 symbol              TEXT NOT NULL,
                 mode                TEXT NOT NULL,
                 created_at          TEXT NOT NULL,
-                check_after_hours   INTEGER NOT NULL DEFAULT 12,
                 entry_wait_hours    INTEGER NOT NULL DEFAULT 12,
                 max_hold_hours      INTEGER NOT NULL DEFAULT 72,
                 next_check_at       TEXT,
@@ -99,6 +98,7 @@ def init_prediction_db() -> None:
                 rr_result           REAL,
                 hold_hours          REAL,
                 market_snapshot     TEXT,
+                feature_snapshot    TEXT,
                 reasoning_summary   TEXT,
                 full_response       TEXT,
                 result              TEXT NOT NULL DEFAULT 'PENDING_ENTRY',
@@ -110,7 +110,6 @@ def init_prediction_db() -> None:
         for col, definition in [
             ("user_id", "INTEGER"),
             ("chat_id", "INTEGER"),
-            ("check_after_hours", "INTEGER NOT NULL DEFAULT 12"),
             ("entry_wait_hours", "INTEGER NOT NULL DEFAULT 12"),
             ("max_hold_hours", "INTEGER NOT NULL DEFAULT 72"),
             ("next_check_at", "TEXT"),
@@ -124,17 +123,17 @@ def init_prediction_db() -> None:
             ("full_response", "TEXT"),
             ("result_reason", "TEXT"),
             ("market_snapshot", "TEXT"),
+            ("feature_snapshot", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {definition}")
             except sqlite3.OperationalError:
                 pass
 
-        # Migrate old PENDING rows to lifecycle naming and keep old check_after_hours compatible.
+        # Migrate old PENDING rows to lifecycle naming.
         try:
             conn.execute("UPDATE predictions SET result='PENDING_ENTRY' WHERE result='PENDING'")
             conn.execute("UPDATE predictions SET entry_status='PENDING_ENTRY' WHERE entry_status IS NULL OR entry_status='' ")
-            conn.execute("UPDATE predictions SET check_after_hours=entry_wait_hours WHERE check_after_hours IS NULL")
         except sqlite3.OperationalError:
             pass
         conn.commit()
@@ -150,6 +149,7 @@ def save_prediction(
     tp1: float | None,
     tp2: float | None,
     market_snapshot: str | None,
+    feature_snapshot: str | None,
     reasoning_summary: str | None,
     full_response: str | None,
     user_id: int | None = None,
@@ -164,16 +164,14 @@ def save_prediction(
         cursor = conn.execute(
             """
             INSERT INTO predictions
-                (user_id, chat_id, symbol, mode, created_at, check_after_hours,
-                 entry_wait_hours, max_hold_hours, next_check_at, direction,
-                 entry_low, entry_high, sl, tp1, tp2,
-                 entry_status, market_snapshot, reasoning_summary, full_response, result)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_ENTRY', ?, ?, ?, 'PENDING_ENTRY')
+                (user_id, chat_id, symbol, mode, created_at, entry_wait_hours, max_hold_hours,
+                 next_check_at, direction, entry_low, entry_high, sl, tp1, tp2,
+                 entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response, result)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_ENTRY', ?, ?, ?, ?, 'PENDING_ENTRY')
             """,
-            (user_id, chat_id, symbol, mode, iso(now), entry_wait,
-             entry_wait, max_hold, iso(next_check), direction,
-             entry_low, entry_high, sl, tp1, tp2,
-             market_snapshot, reasoning_summary, full_response),
+            (user_id, chat_id, symbol, mode, iso(now), entry_wait, max_hold,
+             iso(next_check), direction, entry_low, entry_high, sl, tp1, tp2,
+             market_snapshot, feature_snapshot, reasoning_summary, full_response),
         )
         conn.commit()
         return cursor.lastrowid
@@ -279,19 +277,35 @@ def update_prediction_result(
         conn.commit()
 
 
-def get_recent_predictions(symbol: str, mode: str, limit: int = PREDICTION_HISTORY_COUNT) -> list[dict]:
+def get_recent_predictions(
+    symbol: str,
+    mode: str,
+    user_id: int | None = None,
+    limit: int = PREDICTION_HISTORY_COUNT,
+) -> list[dict]:
+    """
+    Lấy lịch sử dùng cho Claude học lại.
+
+    Quy tắc privacy/per-user learning:
+    - Khi phân tích cho user nào, Claude chỉ nhận lịch sử của chính user đó.
+    - Không dùng lịch sử global của user khác để tránh nhiễu chiến lược và tránh lộ dữ liệu.
+    - Nếu user_id=None (ví dụ gọi legacy/manual), không đưa lịch sử học lại.
+    """
+    if user_id is None:
+        return []
+
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             """
             SELECT created_at, direction, entry_low, entry_high, sl, tp1, tp2,
                    reasoning_summary, full_response, result, result_price, result_reason,
-                   market_snapshot
+                   market_snapshot, feature_snapshot
             FROM predictions
-            WHERE symbol=? AND mode=?
+            WHERE symbol=? AND mode=? AND user_id=?
             ORDER BY id DESC
             LIMIT ?
             """,
-            (symbol, mode, limit),
+            (symbol, mode, user_id, limit),
         ).fetchall()
 
     return [
@@ -309,6 +323,7 @@ def get_recent_predictions(symbol: str, mode: str, limit: int = PREDICTION_HISTO
             "result_price":      row[10],
             "result_reason":     row[11],
             "market_snapshot":   row[12],
+            "feature_snapshot":  row[13],
         }
         for row in rows
     ]
@@ -514,7 +529,7 @@ async def auto_check_pending_predictions() -> dict:
     admin_messages: list[str] = []
     user_messages: list[tuple[int, str]] = []
 
-    print(f"[AUTO_CHECK] Due predictions: {len(due)} at {format_vn_datetime(utc_now())} (VN) / {iso(utc_now())} (UTC)", flush=True)
+    print(f"[AUTO_CHECK] Due predictions: {len(due)} at {iso(utc_now())}", flush=True)
 
     for pred in due:
         start_dt = parse_utc_datetime(pred.get("entry_filled_at")) or parse_utc_datetime(pred.get("created_at"))
@@ -528,7 +543,7 @@ async def auto_check_pending_predictions() -> dict:
         if action == "fill":
             mark_entry_filled(pred["id"], decision["price"], decision["filled_at"], pred["mode"])
             # Không spam user khi chỉ mới khớp Entry; vẫn log Railway.
-            print(f"[AUTO_CHECK] #{pred['id']} ENTRY_FILLED {pred['symbol']} lúc {format_vn_datetime(decision.get('filled_at'))} (VN) - {decision.get('reason')}", flush=True)
+            print(f"[AUTO_CHECK] #{pred['id']} ENTRY_FILLED {pred['symbol']} {decision.get('reason')}", flush=True)
             continue
 
         if action == "close":
@@ -619,8 +634,6 @@ def format_stats(symbol: str | None = None, user_id: int | None = None) -> str:
     ])
 
 
-
-
 def format_history(symbol: str | None = None, limit: int = 10, user_id: int | None = None) -> str:
     init_prediction_db()
     where, params = build_prediction_where(symbol=symbol, user_id=user_id)
@@ -628,7 +641,7 @@ def format_history(symbol: str | None = None, limit: int = 10, user_id: int | No
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             f"""
-            SELECT id, symbol, mode, direction, entry_low, entry_high, sl, tp1, tp2,
+            SELECT id, user_id, chat_id, symbol, mode, direction, entry_low, entry_high, sl, tp1, tp2,
                    result, result_price, created_at
             FROM predictions
             {where}
@@ -639,13 +652,22 @@ def format_history(symbol: str | None = None, limit: int = 10, user_id: int | No
         ).fetchall()
     if not rows:
         return "Chưa có lịch sử dự đoán."
+
+    # user_id=None chỉ được dùng cho admin, nên admin sẽ thấy lệnh thuộc user nào.
+    is_admin_scope = user_id is None
     lines = [f"🧾 10 dự đoán gần nhất {format_scope_label(symbol, user_id)}"]
     for row in rows:
-        pid, sym, mode, direction, entry_low, entry_high, sl, tp1, tp2, result, result_price, created_at = row
+        pid, owner_user_id, owner_chat_id, sym, mode, direction, entry_low, entry_high, sl, tp1, tp2, result, result_price, created_at = row
         mode_label = "SCALP" if mode == "short" else "SWING"
         created_label = format_vn_datetime(created_at) if created_at else "không rõ"
+        owner_line = ""
+        if is_admin_scope:
+            owner_label = str(owner_user_id) if owner_user_id is not None else "không rõ"
+            chat_label = str(owner_chat_id) if owner_chat_id is not None else "không rõ"
+            owner_line = f"User ID: {owner_label} | Chat ID: {chat_label}\n"
         lines.append(
             f"#{pid} {sym} {mode_label} {direction} → {result}\n"
+            f"{owner_line}"
             f"Thời gian phân tích: {created_label}\n"
             f"Entry {fmt(entry_low)}–{fmt(entry_high)} | SL {fmt(sl)} | TP1 {fmt(tp1)} | TP2 {fmt(tp2)}"
             + (f" | Giá check {fmt(result_price)}" if result_price else "")
@@ -1019,10 +1041,75 @@ def build_feature_engineering_block(
         f"- Fibonacci {structure_label}: 0.382={fmt(fib.get('0.382'))}; 0.5={fmt(fib.get('0.5'))}; 0.618={fmt(fib.get('0.618'))}",
         f"- Vùng quét Long gần: {fmt(long_near[0])}–{fmt(long_near[1])} (cụm {long_near[2]} điểm); sâu: {fmt(long_deep[0])}–{fmt(long_deep[1])}",
         f"- Vùng quét Short gần: {fmt(short_near[0])}–{fmt(short_near[1])} (cụm {short_near[2]} điểm); sâu: {fmt(short_deep[0])}–{fmt(short_deep[1])}",
-        "- Quy tắc rủi ro: Claude tự lập Entry/SL/TP; khoảng cách Entry–SL nên bám theo ATR, cấu trúc và rủi ro tối thiểu đề xuất. Python không ép tỷ lệ R:R cứng.",
+        "- Quy tắc rủi ro: Claude tự lập Entry/SL/TP, nhưng khoảng cách Entry–SL nên không nhỏ hơn rủi ro tối thiểu đề xuất; TP1 nên khoảng >= 0.8R, TP2 nên khoảng >= 1.4R.",
         "- Ghi chú: Vùng quét chỉ là ước lượng từ pivot/equal high/equal low và high/low nến, không phải dữ liệu thanh lý thật. Block này là bản đồ kỹ thuật, không phải lệnh giao dịch chốt sẵn.",
     ]
     return "\n".join(lines)
+
+
+def build_feature_snapshot(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+) -> str:
+    """
+    Snapshot kỹ thuật ngắn gọn để lưu vào DB và đưa vào history learning.
+
+    Khác với feature_block đầy đủ cho lần phân tích hiện tại, snapshot này chỉ giữ
+    các feature quan trọng nhất tại thời điểm ra lệnh để Claude học lại vì sao
+    lệnh cũ WIN/LOSS trong bối cảnh nào.
+    """
+    main_label, structure_label, big_label = _mode_labels(mode)
+    price = current_price or _last_close_from_data(timeframe_data)
+    if price is None:
+        return "Feature snapshot: không đủ dữ liệu."
+
+    main_df = timeframe_data.get(main_label)
+    structure_df = timeframe_data.get(structure_label)
+    if structure_df is None or structure_df.empty:
+        structure_df = main_df
+    big_df = timeframe_data.get(big_label)
+
+    atr_main = _current_atr(main_df)
+    atr_structure = _current_atr(structure_df)
+    zones = _liquidity_zones(structure_df, price, atr_structure or atr_main)
+    structure = _structure_info(structure_df, price)
+    risk = _risk_floor(timeframe_data, mode, price)
+    fib = structure.get("fib", {})
+
+    long_near = zones.get("long_near", (None, None, 0))
+    short_near = zones.get("short_near", (None, None, 0))
+    long_deep = zones.get("long_deep", (None, None))
+    short_deep = zones.get("short_deep", (None, None))
+
+    def compact_tf(label: str, df: pd.DataFrame | None) -> str:
+        if df is None or df.empty:
+            return f"{label}: N/A"
+        last = df.iloc[-1]
+        if last["ema_7"] > last["ema_25"] > last["ema_50"]:
+            ema = "EMA tăng"
+        elif last["ema_7"] < last["ema_25"] < last["ema_50"]:
+            ema = "EMA giảm"
+        else:
+            ema = "EMA đan xen"
+        return (
+            f"{label}: close {fmt(last['close'])}, {ema}, "
+            f"RSI14 {fmt(last['rsi_14'], 1)}, MACD_hist {fmt(last['macd_hist'], 4)}, "
+            f"ATR14 {fmt(last.get('atr_14'))}, vol {fmt(last['vol_ratio'], 2)}x"
+        )
+
+    parts = [
+        f"Mode {'SCALP' if mode == 'short' else 'SWING'}; frame entry {main_label}, structure {structure_label}, big {big_label}",
+        compact_tf(main_label, main_df),
+        compact_tf(structure_label, structure_df),
+        compact_tf(big_label, big_df),
+        f"Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; swing gần {fmt(structure.get('recent_low'))}-{fmt(structure.get('recent_high'))}; swing lớn {fmt(structure.get('major_low'))}-{fmt(structure.get('major_high'))}",
+        f"Fib {structure_label}: 0.382 {fmt(fib.get('0.382'))}, 0.5 {fmt(fib.get('0.5'))}, 0.618 {fmt(fib.get('0.618'))}",
+        f"Liquidity Long gần {fmt(long_near[0])}-{fmt(long_near[1])} / sâu {fmt(long_deep[0])}-{fmt(long_deep[1])}; Short gần {fmt(short_near[0])}-{fmt(short_near[1])} / sâu {fmt(short_deep[0])}-{fmt(short_deep[1])}",
+        f"ATR/risk: ATR {main_label} {fmt(atr_main)}, ATR {structure_label} {fmt(atr_structure)}, risk_floor {fmt(risk)}",
+        f"Nến {main_label}: {_consecutive_candles(main_df)}; {_wick_body_info(main_df)}",
+    ]
+    return " | ".join(parts)
 
 
 # ─── Format helpers ───────────────────────────────────────────────────────────
@@ -1145,7 +1232,7 @@ def format_prediction_history(history: list[dict]) -> str:
     if not history:
         return "No previous analysis for this symbol/mode."
 
-    lines = [f"RECENT LEARNING SUMMARY ({len(history)} latest analyses):"]
+    lines = [f"USER-SPECIFIC RECENT LEARNING SUMMARY ({len(history)} latest analyses from this user only):"]
     finished = [p for p in history if p["result"] in ("WIN", "LOSS")]
     if finished:
         wins = sum(1 for p in finished if p["result"] == "WIN")
@@ -1175,13 +1262,15 @@ def format_prediction_history(history: list[dict]) -> str:
         reason = p.get("result_reason") or "Outcome not checked yet."
         decision_reason = p.get("reasoning_summary") or "No decision reasoning summary."
         snapshot = p.get("market_snapshot") or "No market snapshot."
+        feature_snapshot = p.get("feature_snapshot") or "No feature snapshot."
         lines.append(
             f"- #{i} {p['created_at'][:16]} {p['direction']} {p['result']} ({checked}); "
             f"Entry {entry}, SL {fmt(p['sl'])}, TP1 {fmt(p['tp1'])}, TP2 {fmt(p['tp2'])}. "
-            f"Decision why: {decision_reason} Outcome: {reason} Market then: {snapshot}"
+            f"Decision why: {decision_reason} Outcome: {reason} "
+            f"Market then: {snapshot} Feature then: {feature_snapshot}"
         )
 
-    lines.append("Use this summary as learning context; do not copy old full responses.")
+    lines.append("Use this user-specific summary as learning context; do not copy old full responses and do not assume global user behavior.")
     return "\n".join(lines)
 
 
@@ -1344,13 +1433,11 @@ def validate_prediction_plan(
     current_price: float | None,
 ) -> list[str]:
     """
-    Python không chọn lệnh thay Claude. Hàm này chỉ đóng vai trò kiểm tra an toàn tối thiểu:
+    Python không chọn lệnh thay Claude. Hàm này chỉ đóng vai trò kiểm tra an toàn:
     - LONG/SHORT đúng chiều Entry/SL/TP.
     - Có đủ số để bot auto-check.
     - SL không quá sát Entry so với rủi ro tối thiểu Python đã tính.
-
-    Không chặn lệnh vì R:R thấp. R:R là lựa chọn chiến lược của Claude,
-    vẫn phải lưu prediction để có dữ liệu học WIN/LOSS.
+    - TP1/TP2 có tỷ lệ lợi nhuận/rủi ro tối thiểu.
     """
     errors: list[str] = []
     direction = (pred.get("direction") or "").upper()
@@ -1422,9 +1509,10 @@ def validate_prediction_plan(
         errors.append(
             f"SL quá sát Entry: rủi ro {fmt(risk)} nhỏ hơn 70% rủi ro tối thiểu đề xuất {fmt(min_risk)}."
         )
-    # Không validate R:R ở đây.
-    # TP1/TP2 chỉ cần đúng chiều so với Entry để auto-check được.
-    # Lệnh R:R thấp vẫn được lưu để bot có dữ liệu học WIN/LOSS thực tế.
+    if reward1 <= 0 or reward1 < risk * 0.80:
+        errors.append(f"TP1 chưa đủ lợi nhuận so với rủi ro: reward1={fmt(reward1)}, risk={fmt(risk)}.")
+    if reward2 <= 0 or reward2 < risk * 1.40:
+        errors.append(f"TP2 chưa đủ lợi nhuận mở rộng: reward2={fmt(reward2)}, risk={fmt(risk)}.")
 
     # Chặn số bịa quá xa giá hiện tại, nhưng không quá chặt để Swing vẫn có không gian.
     max_distance_pct = 0.08 if mode == "short" else 0.20
@@ -1537,12 +1625,13 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     fear_greed_info                  = get_fear_greed_index()
     current_price_str, current_price = get_current_price_str(binance_symbol)
     feature_block                    = build_feature_engineering_block(timeframe_data, mode, current_price)
+    feature_snapshot                 = build_feature_snapshot(timeframe_data, mode, current_price)
     market_snapshot                  = build_market_snapshot(
         timeframe_data,
         fear_greed_info,
         current_price_str,
-    ) + " | " + feature_block.replace("\n", " | ")
-    history                          = get_recent_predictions(binance_symbol, mode)
+    )
+    history                          = get_recent_predictions(binance_symbol, mode, user_id=user_id)
     user_prompt                      = build_user_prompt(
         symbol=binance_symbol,
         mode=mode,
@@ -1576,6 +1665,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
             tp1=pred["tp1"],
             tp2=pred["tp2"],
             market_snapshot=market_snapshot,
+            feature_snapshot=feature_snapshot,
             reasoning_summary=reasoning_summary,
             full_response=output,
             user_id=user_id,
@@ -1625,7 +1715,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     system_prompt_task = asyncio.to_thread(load_system_prompt)
     fear_greed_task = asyncio.to_thread(get_fear_greed_index)
     current_price_task = asyncio.to_thread(get_current_price_str, binance_symbol)
-    history_task = asyncio.to_thread(get_recent_predictions, binance_symbol, mode)
+    history_task = asyncio.to_thread(get_recent_predictions, binance_symbol, mode, user_id)
 
     system_prompt, fear_greed_info, price_tuple, history = await asyncio.gather(
         system_prompt_task,
@@ -1636,11 +1726,12 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     current_price_str, current_price = price_tuple
 
     feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
+    feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
     market_snapshot = build_market_snapshot(
         timeframe_data,
         fear_greed_info,
         current_price_str,
-    ) + " | " + feature_block.replace("\n", " | ")
+    )
     user_prompt = build_user_prompt(
         symbol=binance_symbol,
         mode=mode,
@@ -1681,6 +1772,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             tp1=pred["tp1"],
             tp2=pred["tp2"],
             market_snapshot=market_snapshot,
+            feature_snapshot=feature_snapshot,
             reasoning_summary=reasoning_summary,
             full_response=output,
             user_id=user_id,

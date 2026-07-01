@@ -1,6 +1,5 @@
 import sqlite3
 import os
-from datetime import datetime, timezone, timedelta
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -218,43 +217,38 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 # ─── Background job: auto check WIN/LOSS ─────────────────────────────────────
 
 async def job_check_predictions(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Chạy định kỳ, tự check prediction đến hạn và thông báo admin + user."""
+    """Chạy định kỳ, tự check prediction đến hạn và chỉ thông báo cho user tạo prediction."""
+    from datetime import datetime
     from analyze import auto_check_pending_predictions
-    from auth import ADMIN_USER_IDS
 
-    vn_now = datetime.now(timezone(timedelta(hours=7)))
-    print(f"[AUTO_CHECK] Job chạy lúc {vn_now.strftime('%H:%M:%S ngày %d/%m/%Y')} (VN)", flush=True)
+    print(f"[AUTO_CHECK] Job chạy lúc {datetime.now().isoformat()}", flush=True)
     payload = await auto_check_pending_predictions()
 
-    admin_messages = payload.get("admin_messages", []) if isinstance(payload, dict) else []
     user_messages = payload.get("user_messages", []) if isinstance(payload, dict) else []
 
-    # Gửi kết quả cho user tạo prediction.
+    # Chỉ gửi kết quả cho user tạo prediction.
+    # Không gửi thêm bản tổng hợp cho admin để tránh duplicate/spam khi nhiều user dùng bot.
     for chat_id, text in user_messages:
         try:
             await context.bot.send_message(chat_id=chat_id, text=text)
         except Exception as exc:
             print(f"Không gửi được kết quả cho chat {chat_id}: {exc}", flush=True)
 
-    # Gửi bản tổng hợp cho admin.
-    if admin_messages and ADMIN_USER_IDS:
-        text = "📋 Kết quả tự động kiểm tra dự đoán:\n\n" + "\n\n".join(admin_messages)
-        for admin_id in ADMIN_USER_IDS:
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=text)
-            except Exception as exc:
-                print(f"Không gửi được cho admin {admin_id}: {exc}", flush=True)
-
 
 def command_scope_user_id(update: Update) -> int | None:
-    from auth import is_admin
-
     user = update.effective_user
     if not user:
         return None
-    # Admin xem được thống kê/lịch sử toàn hệ thống.
-    # User thường chỉ xem prediction do chính họ tạo.
-    return None if is_admin(user.id) else user.id
+    # Mặc định mọi người, kể cả admin, xem dữ liệu của chính mình.
+    # Admin muốn xem toàn hệ thống dùng các lệnh riêng: /statsall, /historyall, /dashboardall.
+    return user.id
+
+
+def is_current_user_admin(update: Update) -> bool:
+    from auth import is_admin
+
+    user = update.effective_user
+    return bool(user and is_admin(user.id))
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -263,11 +257,44 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.effective_message.reply_text(format_stats(symbol, user_id=command_scope_user_id(update)))
 
 
+async def statsall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import format_stats
+
+    if not is_current_user_admin(update):
+        await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
+        return
+    symbol = context.args[0] if context.args else None
+    await update.effective_message.reply_text(format_stats(symbol, user_id=None))
+
+
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import format_history
     symbol = context.args[0] if context.args else None
     await update.effective_message.reply_text(format_history(symbol, user_id=command_scope_user_id(update)))
 
+
+async def historyall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import format_history
+
+    if not is_current_user_admin(update):
+        await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
+        return
+    symbol = context.args[0] if context.args else None
+    await update.effective_message.reply_text(format_history(symbol, user_id=None))
+
+
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import format_stats
+    await update.effective_message.reply_text(format_stats(user_id=command_scope_user_id(update)))
+
+
+async def dashboardall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import format_stats
+
+    if not is_current_user_admin(update):
+        await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
+        return
+    await update.effective_message.reply_text(format_stats(user_id=None))
 
 
 async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -293,7 +320,7 @@ async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from auth import is_admin, ADMIN_USER_IDS
+    from auth import is_admin
     from analyze import auto_check_pending_predictions
 
     admin = update.effective_user
@@ -306,6 +333,8 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     admin_messages = payload.get("admin_messages", []) if isinstance(payload, dict) else []
     user_messages = payload.get("user_messages", []) if isinstance(payload, dict) else []
 
+    # Khi admin ép check, vẫn gửi kết quả cho đúng user tạo prediction.
+    # Admin không nhận thêm bản chi tiết trùng lặp; admin xem tổng bằng /history, /stats hoặc /dashboard.
     for chat_id, text in user_messages:
         try:
             await context.bot.send_message(chat_id=chat_id, text=text)
@@ -316,7 +345,10 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.effective_message.reply_text("Không có prediction nào đến hạn hoặc có kết quả mới.")
         return
 
-    await update.effective_message.reply_text("📋 Kết quả kiểm tra ngay:\n\n" + "\n\n".join(admin_messages))
+    await update.effective_message.reply_text(
+        f"Đã kiểm tra xong. Có {len(admin_messages)} kết quả mới và đã gửi cho user tạo lệnh. "
+        "Admin dùng /history, /stats hoặc /dashboard để xem tổng."
+    )
 
 
 # ─── Register ────────────────────────────────────────────────────────────────
@@ -328,7 +360,11 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("removesymbol", remove_symbol))
     app.add_handler(CommandHandler("listsymbols",  list_symbols))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("statsall", statsall_command))
     app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("historyall", historyall_command))
+    app.add_handler(CommandHandler("dashboard", dashboard_command))
+    app.add_handler(CommandHandler("dashboardall", dashboardall_command))
     app.add_handler(CommandHandler("clearhistory", clearhistory_command))
     app.add_handler(CommandHandler("checknow", checknow_command))
     app.add_handler(CallbackQueryHandler(
@@ -350,4 +386,5 @@ def symbol_control_commands() -> list[BotCommand]:
         BotCommand("listsymbols", "Xem danh sách coin hỗ trợ"),
         BotCommand("stats", "Xem thống kê win/loss, có thể gõ /stats BTC"),
         BotCommand("history", "Xem lịch sử, có thể gõ /history BTC"),
+        BotCommand("dashboard", "Xem dashboard nhanh"),
     ]

@@ -21,7 +21,7 @@ Swing:
 - Job check mỗi 12h.
 - Chấm TP/SL bằng nến 1H.
 
-Kết quả tự động gửi cho user tạo prediction và admin. Format kết quả có thời gian phân tích theo giờ Việt Nam, Entry, SL, TP1, TP2, giá khớp Entry, giá check, thời gian giữ lệnh và ID prediction.
+Kết quả tự động chỉ gửi cho user tạo prediction. Admin không nhận bản tổng hợp tự động để tránh duplicate/spam; khi cần admin xem tổng bằng /stats, /history, /dashboard hoặc ép check bằng /checknow. Format kết quả có thời gian phân tích theo giờ Việt Nam, Entry, SL, TP1, TP2, giá khớp Entry, giá check, thời gian giữ lệnh và ID prediction.
 
 ## Lệnh user
 
@@ -29,16 +29,27 @@ Kết quả tự động gửi cho user tạo prediction và admin. Format kết
 - `/whoami`
 - `/help`
 - `/listsymbols`
-- `/stats`
-- `/stats BTC`
-- `/history`
-- `/history BTC`
+- `/stats` — thống kê của chính user đang dùng lệnh
+- `/stats BTC` — thống kê BTCUSDT của chính user đang dùng lệnh
+- `/history` — lịch sử của chính user đang dùng lệnh
+- `/history BTC` — lịch sử BTCUSDT của chính user đang dùng lệnh
+- `/dashboard` — dashboard của chính user đang dùng lệnh
 
 Lưu ý: Telegram menu không hiển thị command kèm tham số, nên `/stats BTC` và `/history BTC` phải gõ tay.
 
 ## Lệnh admin
 
-Admin có toàn bộ lệnh user, cộng thêm:
+Admin có toàn bộ lệnh user. Từ bản này, `/stats`, `/history`, `/dashboard` của admin cũng chỉ xem dữ liệu của chính admin để tránh rối.
+
+Admin muốn xem toàn hệ thống dùng lệnh riêng:
+
+- `/statsall`
+- `/statsall BTC`
+- `/historyall`
+- `/historyall BTC`
+- `/dashboardall`
+
+Lệnh quản trị:
 
 - `/adduser 123456789`
 - `/removeuser 123456789`
@@ -48,6 +59,7 @@ Admin có toàn bộ lệnh user, cộng thêm:
 - `/addsymbol BTC`
 - `/removesymbol BTC`
 - `/checknow`
+- `/clearhistory CONFIRM`
 
 Menu riêng của admin đã được set bằng `BotCommandScopeChat`, nên admin sẽ thấy đủ các lệnh quản trị trong menu Telegram sau khi bot restart/redeploy.
 
@@ -80,8 +92,8 @@ Không commit `.env` hoặc `bot.db`.
 
 
 V4.1 privacy/history reset update:
-- User thường chỉ xem /stats và /history của chính mình.
-- Admin xem được thống kê/lịch sử toàn hệ thống.
+- User thường chỉ xem /stats, /history, /dashboard của chính mình.
+- Admin xem được thống kê/lịch sử toàn hệ thống bằng /statsall, /historyall, /dashboardall.
 - Thêm /clearhistory CONFIRM cho admin để xóa toàn bộ prediction/history nhưng giữ whitelist và allowed_symbols.
 
 V4.3 Hybrid AI Engine update:
@@ -91,6 +103,19 @@ V4.3 Hybrid AI Engine update:
 - Python validator kiểm tra logic LONG/SHORT, khoảng cách SL, TP1/TP2 và entry quá xa trước khi lưu DB.
 - Nếu output chưa hợp lệ, bot gọi Claude sửa lại một lần.
 
+V4.4 per-user learning update:
+- Claude learning history được lọc theo user đang phân tích.
+- User A phân tích thì Claude chỉ nhận lịch sử của User A cho cùng symbol/mode.
+- User B không bị ảnh hưởng bởi lịch sử của User A.
+- Admin khi tự phân tích cũng chỉ dùng lịch sử của chính admin, không dùng lịch sử toàn hệ thống.
 
-- Giữ /stats để xem hiệu suất WIN/LOSS/RR.
-- Giữ /history để xem danh sách prediction gần nhất.
+V4.5 admin self/global history update:
+- `/history`, `/stats`, `/dashboard` luôn xem dữ liệu của chính người dùng lệnh, kể cả admin.
+- Admin muốn xem toàn hệ thống dùng `/historyall`, `/statsall`, `/dashboardall`.
+- `/historyall` và `/historyall BTC` hiện User ID / Chat ID để biết lệnh thuộc user nào.
+
+V4.6 feature snapshot learning update:
+- Thêm cột feature_snapshot trong bảng predictions.
+- Mỗi prediction lưu thêm snapshot kỹ thuật ngắn gọn tại lúc phân tích: EMA/RSI/MACD/ATR/volume, cấu trúc, Fibonacci, vùng quét Long/Short, risk floor, chuỗi nến/wick.
+- Khi Claude học từ 5 lịch sử gần nhất của chính user, prompt giờ có thêm Feature then để biết lệnh cũ WIN/LOSS trong bối cảnh cấu trúc/Fib/liquidity nào.
+- market_snapshot được giữ gọn cho dữ liệu thị trường cơ bản, feature_snapshot tách riêng để tránh prompt history quá rối.
