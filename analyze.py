@@ -524,16 +524,24 @@ def format_prediction_result_message(pred: dict, result: str, price: float | Non
 
 
 async def auto_check_pending_predictions() -> dict:
+    """Check predictions đến hạn, chỉ cập nhật DB và trả về số liệu tóm tắt.
+
+    Hàm này cố ý không tạo notification để gửi cho user/admin nữa.
+    User muốn xem kết quả thì chủ động dùng /history, /stats hoặc /dashboard.
+    """
     init_prediction_db()
     due = get_due_predictions()
-    admin_messages: list[str] = []
-    user_messages: list[tuple[int, str]] = []
+    entry_filled_count = 0
+    closed_count = 0
+    rescheduled_count = 0
+    skipped_count = 0
 
     print(f"[AUTO_CHECK] Due predictions: {len(due)} at {iso(utc_now())}", flush=True)
 
     for pred in due:
         start_dt = parse_utc_datetime(pred.get("entry_filled_at")) or parse_utc_datetime(pred.get("created_at"))
         if start_dt is None:
+            skipped_count += 1
             continue
         result_interval = get_result_check_interval(pred.get("mode", "short"))
         candles = await asyncio.to_thread(get_binance_klines_since, pred["symbol"], result_interval, start_dt)
@@ -542,7 +550,8 @@ async def auto_check_pending_predictions() -> dict:
 
         if action == "fill":
             mark_entry_filled(pred["id"], decision["price"], decision["filled_at"], pred["mode"])
-            # Không spam user khi chỉ mới khớp Entry; vẫn log Railway.
+            entry_filled_count += 1
+            # Không gửi tin khi khớp Entry; chỉ log Railway và lưu DB.
             print(f"[AUTO_CHECK] #{pred['id']} ENTRY_FILLED {pred['symbol']} {decision.get('reason')}", flush=True)
             continue
 
@@ -553,6 +562,7 @@ async def auto_check_pending_predictions() -> dict:
                 price = await asyncio.to_thread(get_current_price_raw, pred["symbol"])
             if price is None:
                 schedule_next_check(pred["id"], pred["mode"])
+                rescheduled_count += 1
                 continue
             entry_price = decision.get("entry_price") or pred.get("entry_price")
             entry_filled_at = decision.get("entry_filled_at") or parse_utc_datetime(pred.get("entry_filled_at"))
@@ -561,20 +571,31 @@ async def auto_check_pending_predictions() -> dict:
                 trade_closed_at=decision.get("closed_at"), entry_price=entry_price,
                 direction=pred.get("direction"), sl=pred.get("sl"), entry_filled_at=entry_filled_at,
             )
-            hold_hours = None
-            if entry_filled_at and decision.get("closed_at"):
-                hold_hours = max(0.0, (decision["closed_at"] - entry_filled_at).total_seconds() / 3600)
-            msg = format_prediction_result_message(pred, result, float(price), decision.get("reason") or "", entry_price, hold_hours)
-            admin_messages.append(msg)
-            if pred.get("chat_id"):
-                user_messages.append((int(pred["chat_id"]), msg))
+            closed_count += 1
+            print(
+                f"[AUTO_CHECK] #{pred['id']} CLOSED {pred['symbol']} {result} "
+                f"price={price} reason={decision.get('reason')}",
+                flush=True,
+            )
             continue
 
         if action == "reschedule":
             schedule_next_check(pred["id"], pred["mode"])
+            rescheduled_count += 1
             continue
 
-    return {"admin_messages": admin_messages, "user_messages": user_messages}
+        skipped_count += 1
+
+    return {
+        "due_count": len(due),
+        "entry_filled_count": entry_filled_count,
+        "closed_count": closed_count,
+        "rescheduled_count": rescheduled_count,
+        "skipped_count": skipped_count,
+        # Giữ key cũ để code cũ không crash nếu còn tham chiếu, nhưng luôn để rỗng.
+        "admin_messages": [],
+        "user_messages": [],
+    }
 
 
 # ─── Stats / History helpers ─────────────────────────────────────────────────

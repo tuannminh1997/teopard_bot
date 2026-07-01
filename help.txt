@@ -42,7 +42,7 @@ Swing:
 - Check mỗi 12h
 - Chấm TP/SL bằng nến 1H
 
-Khi có kết quả WIN / LOSS / NOT_FILLED / EXPIRED / AMBIGUOUS, bot chỉ gửi thông báo cho user tạo dự đoán. Nếu admin chính là người tạo dự đoán thì admin vẫn nhận như một user bình thường, nhưng bot không gửi thêm bản tổng hợp admin.
+Bot tự động check và cập nhật DB, nhưng không gửi thông báo kết quả tự động cho user/admin nữa. User muốn xem kết quả thì chủ động dùng /history, /stats hoặc /dashboard.
 
 5. Lệnh admin
 Admin dùng lệnh user như người dùng bình thường:
@@ -65,7 +65,7 @@ Lệnh quản trị:
 /resetusage <user_id> - Reset lượt dùng hôm nay
 /addsymbol BTC - Thêm symbol
 /removesymbol BTC - Xóa symbol
-/checknow - Kiểm tra prediction đến hạn ngay lập tức; kết quả chi tiết gửi cho user tạo lệnh, admin nhận thông báo số lượng kết quả mới
+/checknow - Kiểm tra prediction đến hạn ngay lập tức; chỉ cập nhật DB và báo số lượng, không gửi kết quả cho user/admin
 /clearhistory CONFIRM - Xóa toàn bộ lịch sử prediction, giữ whitelist và symbol
 
 Telegram menu không hiện lệnh có tham số, nên các lệnh như /stats BTC, /history BTC, /adduser 123456789 phải gõ tay.

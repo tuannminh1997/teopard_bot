@@ -217,22 +217,25 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 # ─── Background job: auto check WIN/LOSS ─────────────────────────────────────
 
 async def job_check_predictions(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Chạy định kỳ, tự check prediction đến hạn và chỉ thông báo cho user tạo prediction."""
+    """Chạy định kỳ, tự check prediction đến hạn và chỉ cập nhật DB, không gửi tin nhắn tự động."""
     from datetime import datetime
     from analyze import auto_check_pending_predictions
 
     print(f"[AUTO_CHECK] Job chạy lúc {datetime.now().isoformat()}", flush=True)
     payload = await auto_check_pending_predictions()
 
-    user_messages = payload.get("user_messages", []) if isinstance(payload, dict) else []
+    if isinstance(payload, dict):
+        print(
+            "[AUTO_CHECK] Done: "
+            f"due={payload.get('due_count', 0)}, "
+            f"entry_filled={payload.get('entry_filled_count', 0)}, "
+            f"closed={payload.get('closed_count', 0)}, "
+            f"rescheduled={payload.get('rescheduled_count', 0)}",
+            flush=True,
+        )
 
-    # Chỉ gửi kết quả cho user tạo prediction.
-    # Không gửi thêm bản tổng hợp cho admin để tránh duplicate/spam khi nhiều user dùng bot.
-    for chat_id, text in user_messages:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-        except Exception as exc:
-            print(f"Không gửi được kết quả cho chat {chat_id}: {exc}", flush=True)
+    # Không gửi thông báo tự động cho user/admin.
+    # User muốn xem kết quả thì dùng /history, /stats hoặc /dashboard.
 
 
 def command_scope_user_id(update: Update) -> int | None:
@@ -330,24 +333,28 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await update.effective_message.reply_text("Đang chạy kiểm tra dự đoán ngay bây giờ...")
     payload = await auto_check_pending_predictions()
-    admin_messages = payload.get("admin_messages", []) if isinstance(payload, dict) else []
-    user_messages = payload.get("user_messages", []) if isinstance(payload, dict) else []
 
-    # Khi admin ép check, vẫn gửi kết quả cho đúng user tạo prediction.
-    # Admin không nhận thêm bản chi tiết trùng lặp; admin xem tổng bằng /history, /stats hoặc /dashboard.
-    for chat_id, text in user_messages:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-        except Exception as exc:
-            print(f"Không gửi được kết quả cho chat {chat_id}: {exc}", flush=True)
+    if not isinstance(payload, dict):
+        await update.effective_message.reply_text("Đã kiểm tra xong.")
+        return
 
-    if not admin_messages:
-        await update.effective_message.reply_text("Không có prediction nào đến hạn hoặc có kết quả mới.")
+    closed_count = int(payload.get("closed_count", 0))
+    entry_filled_count = int(payload.get("entry_filled_count", 0))
+    rescheduled_count = int(payload.get("rescheduled_count", 0))
+    due_count = int(payload.get("due_count", 0))
+
+    if due_count == 0:
+        await update.effective_message.reply_text("Không có prediction nào đến hạn kiểm tra.")
         return
 
     await update.effective_message.reply_text(
-        f"Đã kiểm tra xong. Có {len(admin_messages)} kết quả mới và đã gửi cho user tạo lệnh. "
-        "Admin dùng /history, /stats hoặc /dashboard để xem tổng."
+        "Đã kiểm tra xong và cập nhật DB.\n"
+        f"Prediction đến hạn: {due_count}\n"
+        f"Mới khớp Entry: {entry_filled_count}\n"
+        f"Có kết quả cuối: {closed_count}\n"
+        f"Tiếp tục chờ: {rescheduled_count}\n\n"
+        "Bot không gửi thông báo tự động cho user/admin nữa. "
+        "Cần xem chi tiết thì dùng /history, /stats, /dashboard hoặc /historyall."
     )
 
 

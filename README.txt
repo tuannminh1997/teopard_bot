@@ -21,7 +21,7 @@ Swing:
 - Job check mỗi 12h.
 - Chấm TP/SL bằng nến 1H.
 
-Kết quả tự động chỉ gửi cho user tạo prediction. Admin không nhận bản tổng hợp tự động để tránh duplicate/spam; khi cần admin xem tổng bằng /stats, /history, /dashboard hoặc ép check bằng /checknow. Format kết quả có thời gian phân tích theo giờ Việt Nam, Entry, SL, TP1, TP2, giá khớp Entry, giá check, thời gian giữ lệnh và ID prediction.
+Auto-check chỉ cập nhật DB, không gửi kết quả tự động cho user/admin. User muốn xem kết quả thì dùng /history, /stats hoặc /dashboard. Admin muốn xem tổng hệ thống thì dùng /historyall, /statsall hoặc /dashboardall; muốn ép kiểm tra ngay dùng /checknow.
 
 ## Lệnh user
 
