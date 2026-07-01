@@ -1131,10 +1131,25 @@ def _reference_plans(current_price: float, zones: dict, risk: float) -> dict:
     return plans
 
 
+def _analysis_row(df: pd.DataFrame | None):
+    """
+    Dùng nến đã đóng gần nhất để đọc indicator/volume.
+
+    Binance thường trả kèm nến hiện tại đang chạy; volume của nến này rất thấp
+    nếu vừa mở nến, dễ làm Claude hiểu nhầm là thanh khoản yếu và chọn NO_TRADE.
+    Vì vậy indicator/regime/snapshot dùng nến -2 khi có đủ dữ liệu.
+    """
+    if df is None or df.empty:
+        return None
+    return df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+
+
 def _ema_state_from_last(df: pd.DataFrame | None) -> str:
     if df is None or df.empty:
         return "N/A"
-    last = df.iloc[-1]
+    last = _analysis_row(df)
+    if last is None:
+        return "N/A"
     if last["ema_7"] > last["ema_25"] > last["ema_50"]:
         return "EMA_TANG"
     if last["ema_7"] < last["ema_25"] < last["ema_50"]:
@@ -1145,7 +1160,9 @@ def _ema_state_from_last(df: pd.DataFrame | None) -> str:
 def _timeframe_regime(label: str, df: pd.DataFrame | None) -> str:
     if df is None or df.empty:
         return f"{label}: N/A"
-    last = df.iloc[-1]
+    last = _analysis_row(df)
+    if last is None:
+        return f"{label}: N/A"
     close = float(last["close"])
     ema_state = _ema_state_from_last(df)
     rsi = _safe_float(last.get("rsi_14"), 50.0) or 50.0
@@ -1219,7 +1236,7 @@ def build_market_regime_block(timeframe_data: dict[str, pd.DataFrame | None], mo
         f"- {main_state}",
         f"- {structure_state}",
         f"- {big_state}",
-        "- Cách dùng: nếu regime là RANGE_CHOPPY/MIXED_UNCLEAR hoặc thanh khoản quá thấp, Claude nên ưu tiên NO_TRADE trừ khi có vùng Entry rất rõ và tỷ lệ risk/reward đủ tốt.",
+        "- Cách dùng: RANGE_CHOPPY/MIXED_UNCLEAR hoặc thanh khoản thấp là cảnh báo rủi ro, không phải lý do tự động NO_TRADE. Nếu có vùng Entry rõ và risk/reward đạt, vẫn có thể tạo lệnh chờ LONG/SHORT.",
     ])
 
 
@@ -1388,8 +1405,11 @@ def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
     if df is None or df.empty:
         return f"\nKHUNG {label}: Không đủ dữ liệu.\n"
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) >= 2 else last
+    last = _analysis_row(df)
+    if last is None:
+        return f"\nKHUNG {label}: Không đủ dữ liệu.\n"
+    last_pos = df.index.get_loc(last.name) if hasattr(last, "name") else len(df) - 1
+    prev = df.iloc[max(0, int(last_pos) - 1)] if len(df) >= 2 else last
     ema7, ema25, ema50 = last["ema_7"], last["ema_25"], last["ema_50"]
 
     if ema7 > ema25 > ema50:
@@ -1447,7 +1467,10 @@ def build_market_snapshot(
             lines.append(f"{label}: no data")
             continue
 
-        last = df.iloc[-1]
+        last = _analysis_row(df)
+        if last is None:
+            lines.append(f"{label}: no data")
+            continue
         ema_align = "mixed"
         if last["ema_7"] > last["ema_25"] > last["ema_50"]:
             ema_align = "bullish"
@@ -1575,9 +1598,9 @@ Yêu cầu:
 1. Python chỉ cung cấp dữ liệu cứng: EMA/RSI/MACD/ATR, market regime, cấu trúc, Fibonacci, vùng quét, raw candle context, rủi ro tối thiểu. Không có kế hoạch LONG/SHORT chốt sẵn.
 2. Claude phải tự phân tích và tự lập Entry/SL/TP dựa trên dữ liệu cứng đó. Không được tự tạo thêm Fibonacci/vùng quét nếu block Python ghi N/A hoặc không đủ dữ liệu.
 3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO_TRADE theo xu hướng đa khung, vị trí giá, vùng quét, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user.
-4. Chỉ chọn LONG hoặc SHORT khi setup đủ rõ, Entry hợp lý và risk/reward đạt yêu cầu. Nếu thị trường nhiễu, vùng vào lệnh không rõ, volume quá yếu, hoặc LONG/SHORT đều kém → chọn NO_TRADE.
+4. Chỉ chọn LONG hoặc SHORT khi setup đủ rõ, Entry hợp lý và risk/reward đạt yêu cầu. Nếu thị trường nhiễu, vùng vào lệnh không rõ, hoặc LONG/SHORT đều kém → chọn NO_TRADE. Không dùng NO_TRADE chỉ vì giá chưa chạm Entry; hãy dùng lệnh chờ nếu vùng Entry rõ.
 5. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tôn trọng rủi ro tối thiểu đề xuất theo ATR/giá.
-6. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu.
+6. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Chỉ chọn NO_TRADE khi không thể tạo tín hiệu hợp lệ.
 7. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
 8. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
 9. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO_TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
@@ -1792,28 +1815,35 @@ def validate_prediction_plan(
 
 
 
-REQUIRED_OUTPUT_SECTIONS = [
-    "💧 Thanh khoản",
-    "🏆 QUYẾT ĐỊNH",
-    "Entry:",
-    "SL:",
-    "TP1:",
-    "TP2:",
-    "📊 Kịch bản chính",
-    "⚠️ Rủi ro",
+REQUIRED_OUTPUT_PATTERNS = [
+    ("Thanh khoản", r"thanh\s*khoản"),
+    ("QUYẾT ĐỊNH", r"quyết\s*định\s*:\s*(LONG|SHORT|NO[_\s-]?TRADE)"),
+    ("Entry", r"\bEntry\s*:"),
+    ("SL", r"\bSL\s*:"),
+    ("TP1", r"\bTP1\s*:"),
+    ("TP2", r"\bTP2\s*:"),
+    ("Kịch bản chính", r"kịch\s*bản\s*chính"),
+    ("Rủi ro", r"rủi\s*ro"),
 ]
 
 
 def validate_output_format(output: str) -> list[str]:
-    """Bắt Claude trả đúng form để user không thấy bản phân tích cụt/mất mục."""
+    """
+    Kiểm tra format theo kiểu mềm, không phụ thuộc emoji/viết hoa-thường.
+
+    Bản trước dùng exact string như “📊 Kịch bản chính”, nên chỉ cần Claude
+    bỏ emoji hoặc đổi hoa-thường là bị reject dù nội dung đủ.
+    """
     errors: list[str] = []
     text = output or ""
-    for section in REQUIRED_OUTPUT_SECTIONS:
-        if section not in text:
-            errors.append(f"Thiếu mục bắt buộc trong phản hồi: {section}")
+    for label, pattern in REQUIRED_OUTPUT_PATTERNS:
+        if not re.search(pattern, text, re.IGNORECASE):
+            errors.append(f"Thiếu mục bắt buộc trong phản hồi: {label}")
     # Không hiển thị các mục dài mà user đã yêu cầu ẩn; Claude vẫn phân tích nội bộ và tóm tắt ở Kịch bản chính.
-    if "📌 Bối cảnh" in text or "🏗 Cấu trúc" in text:
-        errors.append("Không hiển thị mục 'Bối cảnh' hoặc 'Cấu trúc' riêng; hãy tóm tắt ngắn vào 'Kịch bản chính'.")
+    if re.search(r"bối\s*cảnh", text, re.IGNORECASE) or re.search(r"cấu\s*trúc", text, re.IGNORECASE):
+        # Chỉ chặn nếu nó là tiêu đề riêng, không chặn khi nhắc gọn trong câu.
+        if re.search(r"(?m)^\s*(?:📌\s*)?Bối\s*cảnh\s*:", text, re.IGNORECASE) or re.search(r"(?m)^\s*(?:🏗\s*)?Cấu\s*trúc\s*:", text, re.IGNORECASE):
+            errors.append("Không hiển thị mục 'Bối cảnh' hoặc 'Cấu trúc' riêng; hãy tóm tắt ngắn vào 'Kịch bản chính'.")
     # Tránh nhầm chữ swing trong phân tích kỹ thuật với mode SWING.
     lowered = text.lower()
     if "swing gần" in lowered or "swing lớn" in lowered:
@@ -1889,6 +1919,17 @@ def build_no_trade_summary(output: str) -> str:
         return "Claude chọn NO_TRADE nhưng không có lý do rõ."
     # Giữ ngắn để history learning không quá dài.
     return "NO_TRADE: " + text[:600]
+
+
+def log_hidden_rejection(symbol: str, mode: str, pred: dict, validation_errors: list[str], output: str) -> None:
+    """Log nội bộ để debug trên Railway khi user chỉ thấy message chung."""
+    try:
+        print("[TEOPARD_REJECTED]", flush=True)
+        print(f"symbol={symbol} mode={mode} direction={pred.get('direction')}", flush=True)
+        print("errors=" + " | ".join(str(e) for e in (validation_errors or [])), flush=True)
+        print("output_preview=" + (output or "")[:1500].replace("\n", " "), flush=True)
+    except Exception:
+        pass
 
 
 def maybe_append_not_saved_warning(output: str, errors: list[str]) -> str:
@@ -1988,6 +2029,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     pred = parse_prediction_from_output(output)
 
     if pred.get("direction") == "NO_TRADE":
+        log_hidden_rejection(binance_symbol, mode, pred, ["Claude chọn NO_TRADE."], output)
         save_no_trade_prediction(
             symbol=binance_symbol,
             mode=mode,
@@ -2030,6 +2072,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
             chat_id=chat_id,
         )
     elif validation_errors:
+        log_hidden_rejection(binance_symbol, mode, pred, validation_errors, output)
         save_rejected_prediction(
             symbol=binance_symbol,
             mode=mode,
@@ -2124,6 +2167,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     pred = parse_prediction_from_output(output)
 
     if pred.get("direction") == "NO_TRADE":
+        log_hidden_rejection(binance_symbol, mode, pred, ["Claude chọn NO_TRADE."], output)
         await asyncio.to_thread(
             save_no_trade_prediction,
             symbol=binance_symbol,
@@ -2167,6 +2211,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             chat_id=chat_id,
         )
     elif validation_errors:
+        log_hidden_rejection(binance_symbol, mode, pred, validation_errors, output)
         await asyncio.to_thread(
             save_rejected_prediction,
             symbol=binance_symbol,
