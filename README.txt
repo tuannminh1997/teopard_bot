@@ -119,3 +119,8 @@ V4.6 feature snapshot learning update:
 - Mỗi prediction lưu thêm snapshot kỹ thuật ngắn gọn tại lúc phân tích: EMA/RSI/MACD/ATR/volume, cấu trúc, Fibonacci, vùng quét Long/Short, risk floor, chuỗi nến/wick.
 - Khi Claude học từ 5 lịch sử gần nhất của chính user, prompt giờ có thêm Feature then để biết lệnh cũ WIN/LOSS trong bối cảnh cấu trúc/Fib/liquidity nào.
 - market_snapshot được giữ gọn cho dữ liệu thị trường cơ bản, feature_snapshot tách riêng để tránh prompt history quá rối.
+
+V4.8 rejected plan learning update:
+- Nếu Claude trả Entry/SL/TP không đạt validator sau 1 lần repair, bot KHÔNG hiển thị plan lỗi cho user.
+- Bot chỉ trả thông báo ngắn: chưa có setup hợp lệ.
+- Bot vẫn lưu hidden record `REJECTED_PLAN` để Claude học/debug, nhưng không auto-check và không hiện trong /history, /stats, /dashboard.

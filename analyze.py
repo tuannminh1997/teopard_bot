@@ -177,6 +177,56 @@ def save_prediction(
         return cursor.lastrowid
 
 
+def save_rejected_prediction(
+    symbol: str,
+    mode: str,
+    direction: str | None,
+    entry_low: float | None,
+    entry_high: float | None,
+    sl: float | None,
+    tp1: float | None,
+    tp2: float | None,
+    market_snapshot: str | None,
+    feature_snapshot: str | None,
+    reasoning_summary: str | None,
+    full_response: str | None,
+    validation_errors: list[str],
+    user_id: int | None = None,
+    chat_id: int | None = None,
+) -> int:
+    """
+    Lưu các phân tích bị Python validator từ chối để Claude học tránh lặp lại lỗi.
+
+    Những dòng này KHÔNG được auto-check vì result='REJECTED_PLAN' không nằm trong
+    query get_due_predictions(). Mục đích chỉ là learning/history/debug, không tính
+    như WIN/LOSS.
+    """
+    now = utc_now()
+    reason = " ; ".join(validation_errors[:8]) if validation_errors else "Plan bị từ chối bởi Python validator."
+    safe_direction = (direction or "REJECTED").upper()
+    if safe_direction not in ("LONG", "SHORT"):
+        safe_direction = "REJECTED"
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO predictions
+                (user_id, chat_id, symbol, mode, created_at, entry_wait_hours, max_hold_hours,
+                 next_check_at, direction, entry_low, entry_high, sl, tp1, tp2,
+                 entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response,
+                 result, result_reason, result_checked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
+                    'REJECTED_PLAN', ?, ?, ?, ?, 'REJECTED_PLAN', ?, ?)
+            """,
+            (user_id, chat_id, symbol, mode, iso(now),
+             ENTRY_WAIT_HOURS.get(mode, 24), TRADE_MAX_HOLD_HOURS.get(mode, 72),
+             safe_direction, entry_low, entry_high, sl, tp1, tp2,
+             market_snapshot, feature_snapshot, reasoning_summary, full_response, reason, iso(now)),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
 def _row_to_pred(row) -> dict:
     keys = [
         "id", "user_id", "chat_id", "symbol", "mode", "created_at",
@@ -600,7 +650,11 @@ async def auto_check_pending_predictions() -> dict:
 
 # ─── Stats / History helpers ─────────────────────────────────────────────────
 
-def build_prediction_where(symbol: str | None = None, user_id: int | None = None) -> tuple[str, list]:
+def build_prediction_where(
+    symbol: str | None = None,
+    user_id: int | None = None,
+    include_rejected: bool = False,
+) -> tuple[str, list]:
     clauses: list[str] = []
     params: list = []
     if symbol:
@@ -610,6 +664,11 @@ def build_prediction_where(symbol: str | None = None, user_id: int | None = None
     if user_id is not None:
         clauses.append("user_id=?")
         params.append(user_id)
+    # REJECTED_PLAN là bản ghi học nội bộ, không hiển thị trong /history, /stats, /dashboard
+    # để user/admin không nhầm nó là một tín hiệu thật. get_recent_predictions() vẫn đọc được
+    # các bản ghi này để Claude học từ lỗi validator.
+    if not include_rejected:
+        clauses.append("result!='REJECTED_PLAN'")
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     return where, params
 
@@ -663,7 +722,7 @@ def format_history(symbol: str | None = None, limit: int = 10, user_id: int | No
         rows = conn.execute(
             f"""
             SELECT id, user_id, chat_id, symbol, mode, direction, entry_low, entry_high, sl, tp1, tp2,
-                   result, result_price, created_at
+                   result, result_price, created_at, result_reason
             FROM predictions
             {where}
             ORDER BY id DESC
@@ -678,7 +737,7 @@ def format_history(symbol: str | None = None, limit: int = 10, user_id: int | No
     is_admin_scope = user_id is None
     lines = [f"🧾 10 dự đoán gần nhất {format_scope_label(symbol, user_id)}"]
     for row in rows:
-        pid, owner_user_id, owner_chat_id, sym, mode, direction, entry_low, entry_high, sl, tp1, tp2, result, result_price, created_at = row
+        pid, owner_user_id, owner_chat_id, sym, mode, direction, entry_low, entry_high, sl, tp1, tp2, result, result_price, created_at, result_reason = row
         mode_label = "SCALP" if mode == "short" else "SWING"
         created_label = format_vn_datetime(created_at) if created_at else "không rõ"
         owner_line = ""
@@ -686,12 +745,17 @@ def format_history(symbol: str | None = None, limit: int = 10, user_id: int | No
             owner_label = str(owner_user_id) if owner_user_id is not None else "không rõ"
             chat_label = str(owner_chat_id) if owner_chat_id is not None else "không rõ"
             owner_line = f"User ID: {owner_label} | Chat ID: {chat_label}\n"
+        reason_line = ""
+        if result == "REJECTED_PLAN" and result_reason:
+            short_reason = str(result_reason)[:260] + ("..." if len(str(result_reason)) > 260 else "")
+            reason_line = f"\nLý do không auto-check: {short_reason}"
         lines.append(
             f"#{pid} {sym} {mode_label} {direction} → {result}\n"
             f"{owner_line}"
             f"Thời gian phân tích: {created_label}\n"
             f"Entry {fmt(entry_low)}–{fmt(entry_high)} | SL {fmt(sl)} | TP1 {fmt(tp1)} | TP2 {fmt(tp2)}"
             + (f" | Giá check {fmt(result_price)}" if result_price else "")
+            + reason_line
         )
     return "\n\n".join(lines)
 
@@ -1581,11 +1645,21 @@ def request_claude_repair(system_prompt: str, user_prompt: str, bad_output: str,
 
 
 def maybe_append_not_saved_warning(output: str, errors: list[str]) -> str:
+    """
+    Nếu Claude vẫn trả plan không hợp lệ sau 1 lần repair, KHÔNG show nguyên plan lỗi cho user.
+
+    Lý do: user có thể hiểu nhầm đó là tín hiệu tham khảo và vào lệnh theo một kế hoạch
+    mà Python validator đã đánh rớt. Bot chỉ trả thông báo ngắn, còn bản ghi lỗi được
+    lưu nội bộ dưới result=REJECTED_PLAN để Claude học tránh lặp lại.
+    """
     if not errors:
         return output
-    msg = "\n\n⚠️ Bot chưa lưu prediction này để auto-check vì kế hoạch chưa qua kiểm tra logic:\n"
-    msg += "\n".join(f"- {e}" for e in errors[:5])
-    return output + msg
+    return (
+        "⚠️ Teopard chưa tìm thấy setup hợp lệ để tạo tín hiệu.\n\n"
+        "Kế hoạch Entry / SL / TP của AI chưa đạt kiểm tra quản trị rủi ro, "
+        "nên bot không hiển thị lệnh này và không đưa vào auto-check.\n\n"
+        "Bạn có thể thử phân tích lại sau khi giá thay đổi, hoặc chọn khung Scalp/Swing khác."
+    )
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1686,6 +1760,24 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
             feature_snapshot=feature_snapshot,
             reasoning_summary=reasoning_summary,
             full_response=output,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+    elif validation_errors:
+        save_rejected_prediction(
+            symbol=binance_symbol,
+            mode=mode,
+            direction=pred.get("direction"),
+            entry_low=pred.get("entry_low"),
+            entry_high=pred.get("entry_high"),
+            sl=pred.get("sl"),
+            tp1=pred.get("tp1"),
+            tp2=pred.get("tp2"),
+            market_snapshot=market_snapshot,
+            feature_snapshot=feature_snapshot,
+            reasoning_summary="Validator rejected plan: " + " ; ".join(validation_errors[:5]),
+            full_response=output,
+            validation_errors=validation_errors,
             user_id=user_id,
             chat_id=chat_id,
         )
@@ -1793,6 +1885,25 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             feature_snapshot=feature_snapshot,
             reasoning_summary=reasoning_summary,
             full_response=output,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+    elif validation_errors:
+        await asyncio.to_thread(
+            save_rejected_prediction,
+            symbol=binance_symbol,
+            mode=mode,
+            direction=pred.get("direction"),
+            entry_low=pred.get("entry_low"),
+            entry_high=pred.get("entry_high"),
+            sl=pred.get("sl"),
+            tp1=pred.get("tp1"),
+            tp2=pred.get("tp2"),
+            market_snapshot=market_snapshot,
+            feature_snapshot=feature_snapshot,
+            reasoning_summary="Validator rejected plan: " + " ; ".join(validation_errors[:5]),
+            full_response=output,
+            validation_errors=validation_errors,
             user_id=user_id,
             chat_id=chat_id,
         )
