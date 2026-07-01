@@ -59,6 +59,7 @@ def get_result_check_interval(mode: str) -> str:
     return RESULT_CHECK_INTERVAL.get(mode, "15m")
 
 PREDICTION_HISTORY_COUNT = 5
+HIDDEN_LEARNING_RESULTS = ("REJECTED_PLAN", "NO_TRADE")
 VN_TZ = timezone(timedelta(hours=7))
 
 
@@ -224,6 +225,43 @@ def save_rejected_prediction(
              ENTRY_WAIT_HOURS.get(mode, 24), ENTRY_WAIT_HOURS.get(mode, 24), TRADE_MAX_HOLD_HOURS.get(mode, 72),
              safe_direction, entry_low, entry_high, sl, tp1, tp2,
              market_snapshot, feature_snapshot, reasoning_summary, full_response, reason, iso(now)),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def save_no_trade_prediction(
+    symbol: str,
+    mode: str,
+    market_snapshot: str | None,
+    feature_snapshot: str | None,
+    reasoning_summary: str | None,
+    full_response: str | None,
+    user_id: int | None = None,
+    chat_id: int | None = None,
+) -> int:
+    """
+    Lưu quyết định NO_TRADE để Claude học được lúc nào nên đứng ngoài.
+
+    Bản ghi này KHÔNG được auto-check, KHÔNG hiện trong /history, /stats, /dashboard.
+    Nó chỉ được dùng trong per-user learning context cho những lần phân tích sau.
+    """
+    now = utc_now()
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO predictions
+                (user_id, chat_id, symbol, mode, created_at, check_after_hours, entry_wait_hours, max_hold_hours,
+                 next_check_at, direction, entry_low, entry_high, sl, tp1, tp2,
+                 entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response,
+                 result, result_reason, result_checked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'NO_TRADE', NULL, NULL, NULL, NULL, NULL,
+                    'NO_TRADE', ?, ?, ?, ?, 'NO_TRADE', ?, ?)
+            """,
+            (user_id, chat_id, symbol, mode, iso(now),
+             ENTRY_WAIT_HOURS.get(mode, 24), ENTRY_WAIT_HOURS.get(mode, 24), TRADE_MAX_HOLD_HOURS.get(mode, 72),
+             market_snapshot, feature_snapshot, reasoning_summary or "Claude chọn NO_TRADE.", full_response,
+             "Claude chọn NO_TRADE vì chưa có setup đủ rõ hoặc risk/reward chưa đáng để tạo tín hiệu.", iso(now)),
         )
         conn.commit()
         return cursor.lastrowid
@@ -666,11 +704,11 @@ def build_prediction_where(
     if user_id is not None:
         clauses.append("user_id=?")
         params.append(user_id)
-    # REJECTED_PLAN là bản ghi học nội bộ, không hiển thị trong /history, /stats, /dashboard
-    # để user/admin không nhầm nó là một tín hiệu thật. get_recent_predictions() vẫn đọc được
-    # các bản ghi này để Claude học từ lỗi validator.
+    # REJECTED_PLAN và NO_TRADE là bản ghi học nội bộ, không hiển thị trong /history, /stats, /dashboard
+    # để user/admin không nhầm chúng là tín hiệu thật. get_recent_predictions() vẫn đọc được
+    # các bản ghi này để Claude học từ lỗi validator hoặc các lần nên đứng ngoài.
     if not include_rejected:
-        clauses.append("result!='REJECTED_PLAN'")
+        clauses.append("result NOT IN ('REJECTED_PLAN', 'NO_TRADE')")
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     return where, params
 
@@ -1093,6 +1131,139 @@ def _reference_plans(current_price: float, zones: dict, risk: float) -> dict:
     return plans
 
 
+def _ema_state_from_last(df: pd.DataFrame | None) -> str:
+    if df is None or df.empty:
+        return "N/A"
+    last = df.iloc[-1]
+    if last["ema_7"] > last["ema_25"] > last["ema_50"]:
+        return "EMA_TANG"
+    if last["ema_7"] < last["ema_25"] < last["ema_50"]:
+        return "EMA_GIAM"
+    return "EMA_DAN_XEN"
+
+
+def _timeframe_regime(label: str, df: pd.DataFrame | None) -> str:
+    if df is None or df.empty:
+        return f"{label}: N/A"
+    last = df.iloc[-1]
+    close = float(last["close"])
+    ema_state = _ema_state_from_last(df)
+    rsi = _safe_float(last.get("rsi_14"), 50.0) or 50.0
+    atr_pct = _safe_float(last.get("atr_pct"), 0.0) or 0.0
+    vol_ratio = _safe_float(last.get("vol_ratio"), 1.0) or 1.0
+    ema_spread_pct = abs(float(last["ema_7"]) - float(last["ema_50"])) / max(close, 1e-12) * 100
+
+    if ema_state == "EMA_TANG" and close >= float(last["ema_25"]) and rsi >= 52:
+        trend_tag = "TRENDING_UP"
+    elif ema_state == "EMA_GIAM" and close <= float(last["ema_25"]) and rsi <= 48:
+        trend_tag = "TRENDING_DOWN"
+    elif ema_spread_pct < 0.20 or 42 <= rsi <= 58:
+        trend_tag = "RANGE_CHOPPY"
+    else:
+        trend_tag = "MIXED_TRANSITION"
+
+    if atr_pct >= 1.20:
+        vol_tag = "HIGH_VOLATILITY"
+    elif atr_pct <= 0.25:
+        vol_tag = "LOW_VOLATILITY"
+    else:
+        vol_tag = "NORMAL_VOLATILITY"
+
+    if vol_ratio >= 1.50:
+        volume_tag = "HIGH_VOLUME"
+    elif vol_ratio <= 0.70:
+        volume_tag = "LOW_VOLUME"
+    else:
+        volume_tag = "NORMAL_VOLUME"
+
+    return (
+        f"{label}: {trend_tag}, {vol_tag}, {volume_tag}; "
+        f"EMA={ema_state}, RSI14={fmt(rsi,1)}, ATR%={fmt(atr_pct,2)}, Vol={fmt(vol_ratio,2)}x"
+    )
+
+
+def build_market_regime_block(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
+    main_label, structure_label, big_label = _mode_labels(mode)
+    main_state = _timeframe_regime(main_label, timeframe_data.get(main_label))
+    structure_state = _timeframe_regime(structure_label, timeframe_data.get(structure_label))
+    big_state = _timeframe_regime(big_label, timeframe_data.get(big_label))
+
+    states = [main_state, structure_state, big_state]
+    down_count = sum("TRENDING_DOWN" in s for s in states)
+    up_count = sum("TRENDING_UP" in s for s in states)
+    range_count = sum("RANGE_CHOPPY" in s for s in states)
+    low_volume_count = sum("LOW_VOLUME" in s for s in states)
+    high_vol_count = sum("HIGH_VOLATILITY" in s for s in states)
+
+    if down_count >= 2:
+        overall = "REGIME_CHINH: BEAR_TREND"
+    elif up_count >= 2:
+        overall = "REGIME_CHINH: BULL_TREND"
+    elif range_count >= 2:
+        overall = "REGIME_CHINH: RANGE_CHOPPY"
+    else:
+        overall = "REGIME_CHINH: MIXED_UNCLEAR"
+
+    modifiers = []
+    if low_volume_count >= 2:
+        modifiers.append("LOW_LIQUIDITY_RISK")
+    if high_vol_count >= 2:
+        modifiers.append("HIGH_VOLATILITY_RISK")
+    if ("TRENDING_UP" in main_state and "TRENDING_DOWN" in structure_state) or ("TRENDING_DOWN" in main_state and "TRENDING_UP" in structure_state):
+        modifiers.append("LOWER_TIMEFRAME_PULLBACK_AGAINST_STRUCTURE")
+    modifier_text = ", ".join(modifiers) if modifiers else "không có modifier lớn"
+
+    return "\n".join([
+        "MARKET_REGIME_DO_PYTHON_PHAN_LOAI:",
+        f"- {overall}; modifier: {modifier_text}",
+        f"- {main_state}",
+        f"- {structure_state}",
+        f"- {big_state}",
+        "- Cách dùng: nếu regime là RANGE_CHOPPY/MIXED_UNCLEAR hoặc thanh khoản quá thấp, Claude nên ưu tiên NO_TRADE trừ khi có vùng Entry rất rõ và tỷ lệ risk/reward đủ tốt.",
+    ])
+
+
+def _format_candle_compact(row) -> str:
+    open_ = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
+    volume = float(row.get("volume", 0) or 0)
+    rng = max(high - low, 1e-12)
+    body_pct = abs(close - open_) / rng * 100
+    upper_pct = (high - max(open_, close)) / rng * 100
+    lower_pct = (min(open_, close) - low) / rng * 100
+    direction = "xanh" if close > open_ else "đỏ" if close < open_ else "doji"
+    taker_ratio = None
+    try:
+        if volume > 0:
+            taker_ratio = float(row.get("taker_buy_volume", 0) or 0) / volume * 100
+    except Exception:
+        taker_ratio = None
+    taker_text = f" TakerBuy:{fmt(taker_ratio,1)}%" if taker_ratio is not None else ""
+    return (
+        f"{str(row['timestamp'])[:16]} {direction} "
+        f"O:{fmt(open_)} H:{fmt(high)} L:{fmt(low)} C:{fmt(close)} "
+        f"Body:{body_pct:.0f}% U:{upper_pct:.0f}% D:{lower_pct:.0f}% "
+        f"Vol:{fmt(row.get('vol_ratio'),2)}x{taker_text}"
+    )
+
+
+def build_raw_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
+    """Gửi thêm nến thô có body/wick để Sonnet đọc hành vi giá, nhưng vẫn giữ gọn."""
+    main_label, structure_label, _ = _mode_labels(mode)
+    blocks = ["RAW_CANDLE_CONTEXT_CHON_LOC:"]
+    for label, n in [(main_label, 24), (structure_label, 12)]:
+        df = timeframe_data.get(label)
+        if df is None or df.empty:
+            blocks.append(f"- {label}: Không đủ dữ liệu nến thô.")
+            continue
+        rows = ["  " + _format_candle_compact(row) for _, row in df.tail(n).iterrows()]
+        blocks.append(f"- {label}: {n} nến gần nhất, dùng để đọc phá giả/rút râu/đuối lực:")
+        blocks.extend(rows)
+    return "\n".join(blocks)
+
+
 def build_feature_engineering_block(
     timeframe_data: dict[str, pd.DataFrame | None],
     mode: str,
@@ -1122,9 +1293,10 @@ def build_feature_engineering_block(
     lines = [
         "FEATURE_ENGINEERING_DO_PYTHON_TINH_SAN:",
         f"- Mode: {'SCALP' if mode == 'short' else 'SWING'} | Khung vào lệnh: {main_label} | Khung cấu trúc: {structure_label} | Khung lớn: {big_label}",
+        build_market_regime_block(timeframe_data, mode),
         f"- ATR14 {main_label}: {fmt(atr_main)} | ATR14 {structure_label}: {fmt(atr_structure)} | Rủi ro tối thiểu đề xuất: {fmt(risk)} USDT",
         f"- Chuỗi nến {main_label}: {_consecutive_candles(main_df)} | Nến cuối: {_wick_body_info(main_df)}",
-        f"- Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; swing gần {fmt(structure.get('recent_low'))}–{fmt(structure.get('recent_high'))}; swing lớn {fmt(structure.get('major_low'))}–{fmt(structure.get('major_high'))}",
+        f"- Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}–{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}–{fmt(structure.get('major_high'))}",
         f"- Fibonacci {structure_label}: 0.382={fmt(fib.get('0.382'))}; 0.5={fmt(fib.get('0.5'))}; 0.618={fmt(fib.get('0.618'))}",
         f"- Vùng quét Long gần: {fmt(long_near[0])}–{fmt(long_near[1])} (cụm {long_near[2]} điểm); sâu: {fmt(long_deep[0])}–{fmt(long_deep[1])}",
         f"- Vùng quét Short gần: {fmt(short_near[0])}–{fmt(short_near[1])} (cụm {short_near[2]} điểm); sâu: {fmt(short_deep[0])}–{fmt(short_deep[1])}",
@@ -1187,10 +1359,11 @@ def build_feature_snapshot(
 
     parts = [
         f"Mode {'SCALP' if mode == 'short' else 'SWING'}; frame entry {main_label}, structure {structure_label}, big {big_label}",
+        build_market_regime_block(timeframe_data, mode).replace("\n", " / "),
         compact_tf(main_label, main_df),
         compact_tf(structure_label, structure_df),
         compact_tf(big_label, big_df),
-        f"Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; swing gần {fmt(structure.get('recent_low'))}-{fmt(structure.get('recent_high'))}; swing lớn {fmt(structure.get('major_low'))}-{fmt(structure.get('major_high'))}",
+        f"Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}-{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}-{fmt(structure.get('major_high'))}",
         f"Fib {structure_label}: 0.382 {fmt(fib.get('0.382'))}, 0.5 {fmt(fib.get('0.5'))}, 0.618 {fmt(fib.get('0.618'))}",
         f"Liquidity Long gần {fmt(long_near[0])}-{fmt(long_near[1])} / sâu {fmt(long_deep[0])}-{fmt(long_deep[1])}; Short gần {fmt(short_near[0])}-{fmt(short_near[1])} / sâu {fmt(short_deep[0])}-{fmt(short_deep[1])}",
         f"ATR/risk: ATR {main_label} {fmt(atr_main)}, ATR {structure_label} {fmt(atr_structure)}, risk_floor {fmt(risk)}",
@@ -1379,6 +1552,7 @@ def build_user_prompt(
 
     history_block = format_prediction_history(history)
     tf_blocks     = "".join(summarize_timeframe(lbl, df) for lbl, df in timeframe_data.items())
+    raw_candle_block = build_raw_candle_context(timeframe_data, mode)
     feature_block = feature_block or build_feature_engineering_block(timeframe_data, mode, None)
 
     return f"""YÊU CẦU PHÂN TÍCH {mode_label} CHO {symbol}
@@ -1392,16 +1566,21 @@ Phương pháp: {focus}
 ═══════════════════════════════
 {history_block}
 ═══════════════════════════════
+{raw_candle_block}
+═══════════════════════════════
 {tf_blocks}
 ═══════════════════════════════
 
 Yêu cầu:
-1. Python chỉ cung cấp dữ liệu cứng: EMA/RSI/MACD/ATR, cấu trúc, Fibonacci, vùng quét, rủi ro tối thiểu. Không có kế hoạch LONG/SHORT chốt sẵn.
+1. Python chỉ cung cấp dữ liệu cứng: EMA/RSI/MACD/ATR, market regime, cấu trúc, Fibonacci, vùng quét, raw candle context, rủi ro tối thiểu. Không có kế hoạch LONG/SHORT chốt sẵn.
 2. Claude phải tự phân tích và tự lập Entry/SL/TP dựa trên dữ liệu cứng đó. Không được tự tạo thêm Fibonacci/vùng quét nếu block Python ghi N/A hoặc không đủ dữ liệu.
-3. Entry/SL/TP phải hợp logic với hướng giao dịch và tôn trọng rủi ro tối thiểu đề xuất theo ATR/giá.
-4. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome và Market then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
-5. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
-6. QUYẾT ĐỊNH cuối cùng bắt buộc là LONG hoặc SHORT, không được chỉ CHỜ.
+3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO_TRADE theo xu hướng đa khung, vị trí giá, vùng quét, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user.
+4. Chỉ chọn LONG hoặc SHORT khi setup đủ rõ, Entry hợp lý và risk/reward đạt yêu cầu. Nếu thị trường nhiễu, vùng vào lệnh không rõ, volume quá yếu, hoặc LONG/SHORT đều kém → chọn NO_TRADE.
+5. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tôn trọng rủi ro tối thiểu đề xuất theo ATR/giá.
+6. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu.
+7. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
+8. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
+9. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO_TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
 """
 
 
@@ -1454,9 +1633,9 @@ def parse_prediction_from_output(output: str) -> dict:
 
     # Direction: ưu tiên dòng QUYẾT ĐỊNH, fallback emoji
     direction = "WAIT"
-    m = re.search(r"QUYẾT ĐỊNH[:\s]+(LONG|SHORT)", output, re.IGNORECASE)
+    m = re.search(r"QUYẾT ĐỊNH[:\s]+(LONG|SHORT|NO[_\s-]?TRADE)", output, re.IGNORECASE)
     if m:
-        direction = m.group(1).upper()
+        direction = m.group(1).upper().replace(" ", "_").replace("-", "_")
     elif re.search(r"📈\s*LONG", output):
         direction = "LONG"
     elif re.search(r"📉\s*SHORT", output):
@@ -1533,8 +1712,10 @@ def validate_prediction_plan(
     tp1 = pred.get("tp1")
     tp2 = pred.get("tp2")
 
+    if direction == "NO_TRADE":
+        return errors
     if direction not in ("LONG", "SHORT"):
-        errors.append("QUYẾT ĐỊNH phải là LONG hoặc SHORT.")
+        errors.append("QUYẾT ĐỊNH phải là LONG, SHORT hoặc NO_TRADE.")
         return errors
 
     required = {
@@ -1610,6 +1791,50 @@ def validate_prediction_plan(
     return errors
 
 
+
+REQUIRED_OUTPUT_SECTIONS = [
+    "💧 Thanh khoản",
+    "🏆 QUYẾT ĐỊNH",
+    "Entry:",
+    "SL:",
+    "TP1:",
+    "TP2:",
+    "📊 Kịch bản chính",
+    "⚠️ Rủi ro",
+]
+
+
+def validate_output_format(output: str) -> list[str]:
+    """Bắt Claude trả đúng form để user không thấy bản phân tích cụt/mất mục."""
+    errors: list[str] = []
+    text = output or ""
+    for section in REQUIRED_OUTPUT_SECTIONS:
+        if section not in text:
+            errors.append(f"Thiếu mục bắt buộc trong phản hồi: {section}")
+    # Không hiển thị các mục dài mà user đã yêu cầu ẩn; Claude vẫn phân tích nội bộ và tóm tắt ở Kịch bản chính.
+    if "📌 Bối cảnh" in text or "🏗 Cấu trúc" in text:
+        errors.append("Không hiển thị mục 'Bối cảnh' hoặc 'Cấu trúc' riêng; hãy tóm tắt ngắn vào 'Kịch bản chính'.")
+    # Tránh nhầm chữ swing trong phân tích kỹ thuật với mode SWING.
+    lowered = text.lower()
+    if "swing gần" in lowered or "swing lớn" in lowered:
+        errors.append("Không dùng chữ 'swing gần/swing lớn' trong phản hồi cho user; hãy đổi thành 'đỉnh/đáy gần' và 'biên lớn'.")
+    return errors
+
+
+def sanitize_user_output(output: str) -> str:
+    """Dọn một số wording dễ gây nhầm trước khi gửi user/lưu full_response."""
+    replacements = {
+        "swing gần": "đỉnh/đáy gần",
+        "Swing gần": "Đỉnh/đáy gần",
+        "swing lớn": "biên lớn",
+        "Swing lớn": "Biên lớn",
+    }
+    text = output or ""
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
 def build_repair_prompt(bad_output: str, validation_errors: list[str]) -> str:
     errors = "\n".join(f"- {e}" for e in validation_errors)
     return f"""Phản hồi trước chưa đạt kiểm tra logic của Python validator.
@@ -1621,7 +1846,9 @@ Yêu cầu sửa:
 - Giữ nguyên dữ liệu thị trường trong prompt gốc.
 - Không tự tạo Fibonacci/vùng quét/ATR ngoài block Python.
 - Tự điều chỉnh lại QUYẾT ĐỊNH, Entry, SL, TP1, TP2 sao cho hợp logic.
-- Trả lại TOÀN BỘ phân tích theo đúng format bắt buộc.
+- Trả lại TOÀN BỘ phân tích theo đúng format bắt buộc rút gọn cho user.
+- Không thêm mục “📌 Bối cảnh” hoặc “🏗 Cấu trúc”; chỉ tóm tắt vào “📊 Kịch bản chính”.
+- Bắt buộc có đủ “📊 Kịch bản chính” và “⚠️ Rủi ro”.
 - Không giải thích rằng bạn đang sửa lỗi.
 
 Phản hồi trước:
@@ -1634,7 +1861,7 @@ def request_claude_repair(system_prompt: str, user_prompt: str, bad_output: str,
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=2500,
+        max_tokens=3500,
         system=system_prompt,
         messages=[
             {"role": "user", "content": user_prompt},
@@ -1646,19 +1873,39 @@ def request_claude_repair(system_prompt: str, user_prompt: str, bad_output: str,
     return "".join(b.text for b in response.content if hasattr(b, "text"))
 
 
+def _has_format_or_content_errors(errors: list[str]) -> bool:
+    """True nếu lỗi đến từ phản hồi thiếu form/nội dung, không phải lỗi risk plan."""
+    markers = (
+        "Thiếu mục bắt buộc trong phản hồi",
+        "Không hiển thị mục",
+        "Không dùng chữ",
+    )
+    return any(any(marker in err for marker in markers) for err in (errors or []))
+
+
+def build_no_trade_summary(output: str) -> str:
+    text = (output or "").strip().replace("\n", " ")
+    if not text:
+        return "Claude chọn NO_TRADE nhưng không có lý do rõ."
+    # Giữ ngắn để history learning không quá dài.
+    return "NO_TRADE: " + text[:600]
+
+
 def maybe_append_not_saved_warning(output: str, errors: list[str]) -> str:
     """
-    Nếu Claude vẫn trả plan không hợp lệ sau 1 lần repair, KHÔNG show nguyên plan lỗi cho user.
+    Nếu phản hồi của Claude không đạt guard, KHÔNG show nguyên plan lỗi cho user.
 
-    Lý do: user có thể hiểu nhầm đó là tín hiệu tham khảo và vào lệnh theo một kế hoạch
-    mà Python validator đã đánh rớt. Bot chỉ trả thông báo ngắn, còn bản ghi lỗi được
-    lưu nội bộ dưới result=REJECTED_PLAN để Claude học tránh lặp lại.
+    Dù lỗi là thiếu format hay Entry/SL/TP chưa đạt quản trị rủi ro, user chỉ thấy
+    một thông báo chung để tránh rối. Bản lỗi vẫn được lưu hidden dưới
+    result=REJECTED_PLAN để Claude học/debug nội bộ, nhưng không auto-check và
+    không xuất hiện trong history/stats/dashboard của user.
     """
     if not errors:
         return output
+
     return (
         "⚠️ Teopard chưa tìm thấy setup hợp lệ để tạo tín hiệu.\n\n"
-        "Kế hoạch Entry / SL / TP của AI chưa đạt kiểm tra quản trị rủi ro, "
+        "Phân tích AI chưa đạt kiểm tra format hoặc quản trị rủi ro, "
         "nên bot không hiển thị lệnh này và không đưa vào auto-check.\n\n"
         "Bạn có thể thử phân tích lại sau khi giá thay đổi, hoặc chọn khung Scalp/Swing khác."
     )
@@ -1683,7 +1930,7 @@ def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=2500,
+        max_tokens=3500,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
         timeout=300,
@@ -1736,15 +1983,32 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         feature_block=feature_block,
     )
 
-    output = request_claude_analysis(system_prompt, user_prompt)
+    output = sanitize_user_output(request_claude_analysis(system_prompt, user_prompt))
 
     pred = parse_prediction_from_output(output)
-    validation_errors = validate_prediction_plan(pred, mode, timeframe_data, current_price)
-    if validation_errors:
-        repaired = request_claude_repair(system_prompt, user_prompt, output, validation_errors)
-        repaired_pred = parse_prediction_from_output(repaired)
-        repaired_errors = validate_prediction_plan(repaired_pred, mode, timeframe_data, current_price)
-        output, pred, validation_errors = repaired, repaired_pred, repaired_errors
+
+    if pred.get("direction") == "NO_TRADE":
+        save_no_trade_prediction(
+            symbol=binance_symbol,
+            mode=mode,
+            market_snapshot=market_snapshot,
+            feature_snapshot=feature_snapshot,
+            reasoning_summary=build_no_trade_summary(output),
+            full_response=output,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        return maybe_append_not_saved_warning(output, ["Claude chọn NO_TRADE."])
+
+    plan_errors = validate_prediction_plan(pred, mode, timeframe_data, current_price)
+    format_errors = validate_output_format(output)
+    validation_errors = plan_errors + format_errors
+
+    # Không tự sửa / không gọi Claude repair lại kế hoạch.
+    # Nếu phản hồi thiếu format hoặc Entry/SL/TP không đạt quản trị rủi ro,
+    # bot sẽ ẩn tín hiệu đó, lưu REJECTED_PLAN nội bộ để học/debug,
+    # và yêu cầu user phân tích lại sau.
+    plan_validation_errors = plan_errors
 
     if pred["direction"] in ("LONG", "SHORT") and not validation_errors:
         reasoning_summary = summarize_reasoning(output)
@@ -1855,21 +2119,33 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     )
 
     # Anthropic SDK đang sync, nên gọi trong worker thread để không block bot.
-    output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
+    output = sanitize_user_output(await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt))
 
     pred = parse_prediction_from_output(output)
-    validation_errors = validate_prediction_plan(pred, mode, timeframe_data, current_price)
-    if validation_errors:
-        repaired = await asyncio.to_thread(
-            request_claude_repair,
-            system_prompt,
-            user_prompt,
-            output,
-            validation_errors,
+
+    if pred.get("direction") == "NO_TRADE":
+        await asyncio.to_thread(
+            save_no_trade_prediction,
+            symbol=binance_symbol,
+            mode=mode,
+            market_snapshot=market_snapshot,
+            feature_snapshot=feature_snapshot,
+            reasoning_summary=build_no_trade_summary(output),
+            full_response=output,
+            user_id=user_id,
+            chat_id=chat_id,
         )
-        repaired_pred = parse_prediction_from_output(repaired)
-        repaired_errors = validate_prediction_plan(repaired_pred, mode, timeframe_data, current_price)
-        output, pred, validation_errors = repaired, repaired_pred, repaired_errors
+        return maybe_append_not_saved_warning(output, ["Claude chọn NO_TRADE."])
+
+    plan_errors = validate_prediction_plan(pred, mode, timeframe_data, current_price)
+    format_errors = validate_output_format(output)
+    validation_errors = plan_errors + format_errors
+
+    # Không tự sửa / không gọi Claude repair lại kế hoạch.
+    # Nếu phản hồi thiếu format hoặc Entry/SL/TP không đạt quản trị rủi ro,
+    # bot sẽ ẩn tín hiệu đó, lưu REJECTED_PLAN nội bộ để học/debug,
+    # và yêu cầu user phân tích lại sau.
+    plan_validation_errors = plan_errors
 
     if pred["direction"] in ("LONG", "SHORT") and not validation_errors:
         reasoning_summary = await asyncio.to_thread(summarize_reasoning, output)

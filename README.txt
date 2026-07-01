@@ -68,7 +68,7 @@ Menu riêng của admin đã được set bằng `BotCommandScopeChat`, nên adm
 Bot tính sẵn bằng Python trước khi gửi Claude:
 - EMA7/25/50, RSI6/14, MACD, Volume ratio, ATR14.
 - Chuỗi nến, wick/body của nến cuối.
-- Market structure, swing gần/swing lớn.
+- Market structure, đỉnh/đáy gần/biên lớn.
 - Fibonacci 0.382/0.5/0.618 từ swing đã tính.
 - Vùng quét Long/Short gần và sâu từ pivot/equal high/equal low.
 - Rủi ro tối thiểu đề xuất theo ATR/giá.
@@ -77,7 +77,7 @@ Cấu trúc Hybrid AI Engine:
 - Python chỉ tính dữ liệu cứng và bản đồ kỹ thuật.
 - Claude tự phân tích, tự chọn LONG/SHORT và tự đặt Entry/SL/TP.
 - Python validator kiểm tra lại Entry/SL/TP trước khi lưu prediction để auto-check.
-- Nếu kế hoạch chưa hợp lệ, bot gọi Claude sửa lại một lần.
+- Nếu kế hoạch chưa hợp lệ, bot KHÔNG tự sửa và KHÔNG gọi Claude sửa lại; bot ẩn tín hiệu đó và lưu hidden REJECTED_PLAN để học/debug.
 
 Prompt đã chặn Claude tự bịa Fibonacci/vùng quét nếu Python không gửi dữ liệu.
 
@@ -101,7 +101,7 @@ V4.3 Hybrid AI Engine update:
 - Python cung cấp dữ liệu cứng: ATR/Fibonacci/structure/liquidity/risk floor.
 - Claude tự ra chiến lược và tự đặt Entry/SL/TP.
 - Python validator kiểm tra logic LONG/SHORT, khoảng cách SL, TP1/TP2 và entry quá xa trước khi lưu DB.
-- Nếu output chưa hợp lệ, bot gọi Claude sửa lại một lần.
+- Nếu output chưa hợp lệ, bot KHÔNG tự sửa và KHÔNG gọi Claude sửa lại; bot ẩn tín hiệu đó để tránh gửi plan thiếu/không an toàn cho user.
 
 V4.4 per-user learning update:
 - Claude learning history được lọc theo user đang phân tích.
@@ -121,6 +121,31 @@ V4.6 feature snapshot learning update:
 - market_snapshot được giữ gọn cho dữ liệu thị trường cơ bản, feature_snapshot tách riêng để tránh prompt history quá rối.
 
 V4.8 rejected plan learning update:
-- Nếu Claude trả Entry/SL/TP không đạt validator sau 1 lần repair, bot KHÔNG hiển thị plan lỗi cho user.
-- Bot chỉ trả thông báo ngắn: chưa có setup hợp lệ.
+- Nếu Claude trả Entry/SL/TP không đạt validator, bot KHÔNG hiển thị plan lỗi cho user.
+- Bot chỉ trả thông báo ngắn: nếu thiếu format/thiếu mục bắt buộc thì báo chưa đủ dữ liệu hợp lệ để tạo phân tích; nếu Entry/SL/TP không đạt risk thì báo chưa có setup hợp lệ.
 - Bot vẫn lưu hidden record `REJECTED_PLAN` để Claude học/debug, nhưng không auto-check và không hiện trong /history, /stats, /dashboard.
+
+
+Cập nhật format phản hồi:
+- Bắt buộc có đủ các mục Thanh khoản, Quyết định, Entry/SL/TP, Kịch bản chính và Rủi ro.
+- Bot không dùng cụm “swing gần/swing lớn” trong output cho user; thay bằng “đỉnh/đáy gần/biên lớn”.
+- Nếu Claude trả thiếu format, Python không tự sửa nội dung; bot ẩn phản hồi đó, trả thông báo “chưa đủ dữ liệu hợp lệ để tạo phân tích” cho user và lưu hidden REJECTED_PLAN để học/debug.
+
+V4.8 compact output guard update:
+- Output cho user dùng format rút gọn: không hiện riêng “Bối cảnh” và “Cấu trúc”.
+- Bot vẫn gửi dữ liệu EMA/RSI/MACD/ATR/Fibonacci/cấu trúc/vùng quét cho Claude để phân tích nội bộ.
+- Python validator bắt buộc phản hồi có đủ Thanh khoản, Quyết định, Entry/SL/TP, Kịch bản chính và Rủi ro để tránh output bị cụt.
+
+
+Bản cập nhật thông báo lỗi:
+- Nếu Claude trả thiếu format hoặc kế hoạch Entry/SL/TP không đạt validator, bot không hiển thị plan lỗi.
+- User chỉ thấy một thông báo chung: “⚠️ Teopard chưa tìm thấy setup hợp lệ để tạo tín hiệu.”
+- Lỗi vẫn được lưu hidden dạng REJECTED_PLAN để phục vụ learning/debug, không xuất hiện trong history/stats/dashboard.
+
+V4.9 Sonnet Analyst Mode update:
+- Thêm quyền quyết định `NO_TRADE`: Claude không còn bị ép phải chọn LONG/SHORT khi setup xấu.
+- Python gửi thêm `MARKET_REGIME_DO_PYTHON_PHAN_LOAI` để Claude biết thị trường đang trend, range/nhiễu, thanh khoản thấp hay biến động cao.
+- Python gửi thêm `RAW_CANDLE_CONTEXT_CHON_LOC` gồm nến thô có body%, râu trên/dưới, volume và taker-buy ratio nếu có để Sonnet đọc hành vi giá tốt hơn.
+- Claude phải so sánh nội bộ LONG / SHORT / NO_TRADE trước khi quyết định, nhưng không in bảng so sánh ra user.
+- Nếu Claude chọn NO_TRADE, bot không hiển thị phân tích đó như tín hiệu, không auto-check, không hiện trong /history/stats/dashboard; bot chỉ lưu hidden learning record để lần sau học được lúc nào nên đứng ngoài.
+- User vẫn chỉ thấy thông báo chung: “⚠️ Teopard chưa tìm thấy setup hợp lệ để tạo tín hiệu.”
