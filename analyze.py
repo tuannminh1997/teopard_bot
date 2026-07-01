@@ -82,6 +82,7 @@ def init_prediction_db() -> None:
                 symbol              TEXT NOT NULL,
                 mode                TEXT NOT NULL,
                 created_at          TEXT NOT NULL,
+                check_after_hours   INTEGER NOT NULL DEFAULT 12,
                 entry_wait_hours    INTEGER NOT NULL DEFAULT 12,
                 max_hold_hours      INTEGER NOT NULL DEFAULT 72,
                 next_check_at       TEXT,
@@ -110,6 +111,7 @@ def init_prediction_db() -> None:
         for col, definition in [
             ("user_id", "INTEGER"),
             ("chat_id", "INTEGER"),
+            ("check_after_hours", "INTEGER NOT NULL DEFAULT 12"),
             ("entry_wait_hours", "INTEGER NOT NULL DEFAULT 12"),
             ("max_hold_hours", "INTEGER NOT NULL DEFAULT 72"),
             ("next_check_at", "TEXT"),
@@ -164,12 +166,12 @@ def save_prediction(
         cursor = conn.execute(
             """
             INSERT INTO predictions
-                (user_id, chat_id, symbol, mode, created_at, entry_wait_hours, max_hold_hours,
+                (user_id, chat_id, symbol, mode, created_at, check_after_hours, entry_wait_hours, max_hold_hours,
                  next_check_at, direction, entry_low, entry_high, sl, tp1, tp2,
                  entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response, result)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_ENTRY', ?, ?, ?, ?, 'PENDING_ENTRY')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_ENTRY', ?, ?, ?, ?, 'PENDING_ENTRY')
             """,
-            (user_id, chat_id, symbol, mode, iso(now), entry_wait, max_hold,
+            (user_id, chat_id, symbol, mode, iso(now), entry_wait, entry_wait, max_hold,
              iso(next_check), direction, entry_low, entry_high, sl, tp1, tp2,
              market_snapshot, feature_snapshot, reasoning_summary, full_response),
         )
@@ -211,15 +213,15 @@ def save_rejected_prediction(
         cursor = conn.execute(
             """
             INSERT INTO predictions
-                (user_id, chat_id, symbol, mode, created_at, entry_wait_hours, max_hold_hours,
+                (user_id, chat_id, symbol, mode, created_at, check_after_hours, entry_wait_hours, max_hold_hours,
                  next_check_at, direction, entry_low, entry_high, sl, tp1, tp2,
                  entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response,
                  result, result_reason, result_checked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
                     'REJECTED_PLAN', ?, ?, ?, ?, 'REJECTED_PLAN', ?, ?)
             """,
             (user_id, chat_id, symbol, mode, iso(now),
-             ENTRY_WAIT_HOURS.get(mode, 24), TRADE_MAX_HOLD_HOURS.get(mode, 72),
+             ENTRY_WAIT_HOURS.get(mode, 24), ENTRY_WAIT_HOURS.get(mode, 24), TRADE_MAX_HOLD_HOURS.get(mode, 72),
              safe_direction, entry_low, entry_high, sl, tp1, tp2,
              market_snapshot, feature_snapshot, reasoning_summary, full_response, reason, iso(now)),
         )
