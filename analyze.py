@@ -34,6 +34,10 @@ OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Teopard Bot")
 
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", os.getenv("CLAUDE_MAX_TOKENS", "8000")))
 LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "2"))
+# Call tóm tắt reasoning dùng token riêng và KHÔNG continuation để tránh GLM lặp length vì reasoning token.
+LLM_SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_SUMMARY_MAX_OUTPUT_TOKENS", "600"))
+# Mặc định tắt reasoning cho summary. Phân tích chính vẫn dùng OPENROUTER_REASONING_EFFORT nếu bạn set high/xhigh.
+OPENROUTER_SUMMARY_REASONING_EFFORT = os.getenv("OPENROUTER_SUMMARY_REASONING_EFFORT", "off").strip()
 # Giữ tên cũ để code cũ không crash nếu còn tham chiếu.
 CLAUDE_MAX_TOKENS = LLM_MAX_OUTPUT_TOKENS
 
@@ -1670,7 +1674,13 @@ def _anthropic_create_once(system: str | None, messages: list, max_tokens: int, 
     }
 
 
-def _openrouter_create_once(system: str | None, messages: list, max_tokens: int, timeout: int) -> dict:
+def _openrouter_create_once(
+    system: str | None,
+    messages: list,
+    max_tokens: int,
+    timeout: int,
+    reasoning_effort: str | None = None,
+) -> dict:
     """Gọi GLM/OpenRouter bằng Chat Completions API, không cần thêm thư viện openai.
     OpenRouter khuyến nghị max_completion_tokens thay cho max_tokens."""
     headers = {
@@ -1692,10 +1702,16 @@ def _openrouter_create_once(system: str | None, messages: list, max_tokens: int,
         "max_completion_tokens": max_tokens,
     }
 
-    # Một số provider có hỗ trợ reasoning effort. Để trống mặc định để tránh lỗi schema.
-    reasoning_effort = os.getenv("OPENROUTER_REASONING_EFFORT", "").strip()
-    if reasoning_effort:
-        payload["reasoning"] = {"effort": reasoning_effort}
+    # Một số provider có hỗ trợ reasoning effort.
+    # - Phân tích chính: dùng OPENROUTER_REASONING_EFFORT nếu có set, ví dụ high/xhigh.
+    # - Summary: truyền reasoning_effort="off" để không đốt hết 120-600 token vào reasoning ẩn.
+    if reasoning_effort is None:
+        effective_reasoning_effort = os.getenv("OPENROUTER_REASONING_EFFORT", "").strip()
+    else:
+        effective_reasoning_effort = (reasoning_effort or "").strip()
+
+    if effective_reasoning_effort.lower() not in ("", "off", "none", "false", "0"):
+        payload["reasoning"] = {"effort": effective_reasoning_effort}
 
     r = requests.post(
         f"{OPENROUTER_BASE_URL}/chat/completions",
@@ -1721,10 +1737,16 @@ def _openrouter_create_once(system: str | None, messages: list, max_tokens: int,
     }
 
 
-def llm_create_once(system: str | None, messages: list, max_tokens: int, timeout: int) -> dict:
+def llm_create_once(
+    system: str | None,
+    messages: list,
+    max_tokens: int,
+    timeout: int,
+    reasoning_effort: str | None = None,
+) -> dict:
     ensure_ai_config()
     if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai"):
-        return _openrouter_create_once(system, messages, max_tokens, timeout)
+        return _openrouter_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
     return _anthropic_create_once(system, messages, max_tokens, timeout)
 
 
@@ -1740,6 +1762,8 @@ def create_with_continuation(
     messages: list,
     max_tokens: int = LLM_MAX_OUTPUT_TOKENS,
     timeout: int = 300,
+    allow_continuation: bool = True,
+    reasoning_effort: str | None = None,
 ) -> str:
     """
     Gọi model hiện tại; nếu provider báo bị cắt vì max token thì gọi tiếp để nối output.
@@ -1747,8 +1771,15 @@ def create_with_continuation(
     """
     convo = list(messages)
     full_text = ""
-    for attempt in range(LLM_MAX_CONTINUATIONS + 1):
-        result = llm_create_once(system, convo, max_tokens=max_tokens, timeout=timeout)
+    max_attempts = LLM_MAX_CONTINUATIONS + 1 if allow_continuation else 1
+    for attempt in range(max_attempts):
+        result = llm_create_once(
+            system,
+            convo,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            reasoning_effort=reasoning_effort,
+        )
         chunk = result.get("text") or ""
         full_text += chunk
         stop_reason = result.get("stop_reason")
@@ -1762,7 +1793,13 @@ def create_with_continuation(
             pass
         if not _is_length_stop(stop_reason):
             break
-        print("[LLM_TRUNCATED] Output bị cắt vì max_tokens, gọi tiếp để nối phần còn lại...", flush=True)
+        if not allow_continuation:
+            print(
+                "[LLM_LENGTH_NO_CONTINUE] Model trả stop_reason=length nhưng call này không continuation.",
+                flush=True,
+            )
+            break
+        print("[LLM_TRUNCATED] Model trả stop_reason=length, gọi tiếp để nối phần còn lại...", flush=True)
         convo = convo + [
             {"role": "assistant", "content": chunk},
             {
@@ -1791,14 +1828,16 @@ def summarize_reasoning(full_response: str) -> str:
                 "role": "user",
                 "content": (
                     "Tóm tắt trong 1-2 câu (tối đa 60 từ) lý do kỹ thuật chính "
-                    "dẫn đến quyết định LONG/SHORT trong phân tích sau. "
-                    "Chỉ nêu các chỉ báo cụ thể (EMA, RSI, MACD, volume) và mức giá. "
+                    "dẫn đến quyết định LONG/SHORT/NO_TRADE trong phân tích sau. "
+                    "Chỉ nêu các chỉ báo cụ thể (EMA, RSI, MACD, volume, ATR, vùng giá) và mức giá. "
                     "Không giải thích, không lời mở đầu.\n\n"
                     + full_response[:2000]
                 ),
             }],
-            max_tokens=120,
+            max_tokens=LLM_SUMMARY_MAX_OUTPUT_TOKENS,
             timeout=60,
+            allow_continuation=False,
+            reasoning_effort=OPENROUTER_SUMMARY_REASONING_EFFORT,
         )
         return text.strip()
     except Exception as exc:

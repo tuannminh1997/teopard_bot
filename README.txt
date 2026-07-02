@@ -148,10 +148,11 @@ V4.9 Sonnet Analyst Mode update:
 - Nếu Claude chọn NO_TRADE, bot hiển thị phản hồi NO_TRADE của Claude cho user và lưu hidden learning record; NO_TRADE không auto-check và không hiện trong /history/stats/dashboard.
 
 
-Ghi chú bản completion guard:
-- Bot không dùng Python risk/format guard để sửa hoặc chặn lệnh Claude.
-- Nếu phản hồi Claude bị cụt rõ ràng, bot gọi Claude trả lại bản hoàn chỉnh; Python không tự viết hay sửa Entry/SL/TP.
-- Có thể chỉnh CLAUDE_MAX_TOKENS trong Railway, mặc định 5000.
+Ghi chú bản LLM/OpenRouter:
+- Bot không dùng Python risk/format guard để sửa hoặc chặn lệnh AI.
+- Phân tích chính vẫn có continuation nếu provider trả finish_reason/stop_reason=length.
+- Call tóm tắt reasoning không continuation để tránh GLM lặp length do reasoning token.
+- Có thể chỉnh LLM_MAX_OUTPUT_TOKENS trong Railway, mặc định 8000.
 
 
 ## Chuyển sang GLM 5.2 qua OpenRouter
@@ -173,6 +174,11 @@ OPENROUTER_MODEL=z-ai/glm-5.2
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 LLM_MAX_OUTPUT_TOKENS=8000
 LLM_MAX_CONTINUATIONS=2
+# Tuỳ chọn: giữ reasoning effort cho phân tích chính
+OPENROUTER_REASONING_EFFORT=high
+# Summary mặc định tắt reasoning để không đốt token ẩn
+LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
+OPENROUTER_SUMMARY_REASONING_EFFORT=off
 ```
 
 Khi dùng OpenRouter/GLM thì không cần `ANTHROPIC_API_KEY`. Bot vẫn giữ cùng flow: Python tính dữ liệu kỹ thuật, model tự phân tích LONG/SHORT/NO_TRADE, Python chỉ parse Entry/SL/TP để auto-check nếu đủ số.
@@ -191,6 +197,13 @@ OPENROUTER_MODEL=z-ai/glm-5.2
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 LLM_MAX_OUTPUT_TOKENS=8000
 LLM_MAX_CONTINUATIONS=2
+OPENROUTER_REASONING_EFFORT=high
+LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
+OPENROUTER_SUMMARY_REASONING_EFFORT=off
+
+Ghi chú:
+- OPENROUTER_REASONING_EFFORT chỉ dùng cho phân tích chính Entry/SL/TP.
+- summarize_reasoning dùng LLM_SUMMARY_MAX_OUTPUT_TOKENS và mặc định tắt reasoning/continuation để tránh log length lặp lại.
 
 Các biến Telegram/DB giữ nguyên:
 BOT_TOKEN=...
