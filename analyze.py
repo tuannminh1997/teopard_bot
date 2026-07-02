@@ -1253,6 +1253,33 @@ def _analysis_row(df: pd.DataFrame | None):
     return df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
 
 
+REGIME_LABEL_VI = {
+    "EMA_TANG": "EMA nghiêng tăng",
+    "EMA_GIAM": "EMA nghiêng giảm",
+    "EMA_DAN_XEN": "EMA đan xen",
+    "TRENDING_UP": "xu hướng tăng rõ",
+    "TRENDING_DOWN": "xu hướng giảm rõ",
+    "RANGE_CHOPPY": "đi ngang/nhiễu",
+    "MIXED_TRANSITION": "trạng thái chuyển pha",
+    "BEAR_TREND": "xu hướng giảm",
+    "BULL_TREND": "xu hướng tăng",
+    "MIXED_UNCLEAR": "chưa rõ xu hướng",
+    "HIGH_VOLATILITY": "biến động mạnh",
+    "LOW_VOLATILITY": "biến động thấp",
+    "NORMAL_VOLATILITY": "biến động bình thường",
+    "HIGH_VOLUME": "khối lượng cao",
+    "LOW_VOLUME": "khối lượng thấp",
+    "NORMAL_VOLUME": "khối lượng bình thường",
+    "LOW_LIQUIDITY_RISK": "rủi ro thanh khoản thấp",
+    "HIGH_VOLATILITY_RISK": "rủi ro biến động mạnh",
+    "LOWER_TIMEFRAME_PULLBACK_AGAINST_STRUCTURE": "khung nhỏ đang hồi ngược cấu trúc lớn",
+}
+
+
+def _label_vi(code: str) -> str:
+    return REGIME_LABEL_VI.get(code, code)
+
+
 def _ema_state_from_last(df: pd.DataFrame | None) -> str:
     if df is None or df.empty:
         return "N/A"
@@ -1266,12 +1293,26 @@ def _ema_state_from_last(df: pd.DataFrame | None) -> str:
     return "EMA_DAN_XEN"
 
 
-def _timeframe_regime(label: str, df: pd.DataFrame | None) -> str:
+def _timeframe_regime_details(label: str, df: pd.DataFrame | None) -> dict:
     if df is None or df.empty:
-        return f"{label}: N/A"
+        return {
+            "label": label,
+            "trend_tag": "N/A",
+            "vol_tag": "N/A",
+            "volume_tag": "N/A",
+            "ema_state": "N/A",
+            "text": f"{label}: không đủ dữ liệu",
+        }
     last = _analysis_row(df)
     if last is None:
-        return f"{label}: N/A"
+        return {
+            "label": label,
+            "trend_tag": "N/A",
+            "vol_tag": "N/A",
+            "volume_tag": "N/A",
+            "ema_state": "N/A",
+            "text": f"{label}: không đủ dữ liệu",
+        }
     close = float(last["close"])
     ema_state = _ema_state_from_last(df)
     rsi = _safe_float(last.get("rsi_14"), 50.0) or 50.0
@@ -1302,50 +1343,63 @@ def _timeframe_regime(label: str, df: pd.DataFrame | None) -> str:
     else:
         volume_tag = "NORMAL_VOLUME"
 
-    return (
-        f"{label}: {trend_tag}, {vol_tag}, {volume_tag}; "
-        f"EMA={ema_state}, RSI14={fmt(rsi,1)}, ATR%={fmt(atr_pct,2)}, Vol={fmt(vol_ratio,2)}x"
-    )
+    return {
+        "label": label,
+        "trend_tag": trend_tag,
+        "vol_tag": vol_tag,
+        "volume_tag": volume_tag,
+        "ema_state": ema_state,
+        "text": (
+            f"{label}: {_label_vi(trend_tag)}, {_label_vi(vol_tag)}, {_label_vi(volume_tag)}; "
+            f"EMA={_label_vi(ema_state)}, RSI14={fmt(rsi,1)}, ATR%={fmt(atr_pct,2)}, Vol={fmt(vol_ratio,2)}x"
+        ),
+    }
+
+
+def _timeframe_regime(label: str, df: pd.DataFrame | None) -> str:
+    return _timeframe_regime_details(label, df)["text"]
 
 
 def build_market_regime_block(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
     main_label, structure_label, big_label = _mode_labels(mode)
-    main_state = _timeframe_regime(main_label, timeframe_data.get(main_label))
-    structure_state = _timeframe_regime(structure_label, timeframe_data.get(structure_label))
-    big_state = _timeframe_regime(big_label, timeframe_data.get(big_label))
+    main_state = _timeframe_regime_details(main_label, timeframe_data.get(main_label))
+    structure_state = _timeframe_regime_details(structure_label, timeframe_data.get(structure_label))
+    big_state = _timeframe_regime_details(big_label, timeframe_data.get(big_label))
 
     states = [main_state, structure_state, big_state]
-    down_count = sum("TRENDING_DOWN" in s for s in states)
-    up_count = sum("TRENDING_UP" in s for s in states)
-    range_count = sum("RANGE_CHOPPY" in s for s in states)
-    low_volume_count = sum("LOW_VOLUME" in s for s in states)
-    high_vol_count = sum("HIGH_VOLATILITY" in s for s in states)
+    down_count = sum(s["trend_tag"] == "TRENDING_DOWN" for s in states)
+    up_count = sum(s["trend_tag"] == "TRENDING_UP" for s in states)
+    range_count = sum(s["trend_tag"] == "RANGE_CHOPPY" for s in states)
+    low_volume_count = sum(s["volume_tag"] == "LOW_VOLUME" for s in states)
+    high_vol_count = sum(s["vol_tag"] == "HIGH_VOLATILITY" for s in states)
 
     if down_count >= 2:
-        overall = "REGIME_CHINH: BEAR_TREND"
+        overall_code = "BEAR_TREND"
     elif up_count >= 2:
-        overall = "REGIME_CHINH: BULL_TREND"
+        overall_code = "BULL_TREND"
     elif range_count >= 2:
-        overall = "REGIME_CHINH: RANGE_CHOPPY"
+        overall_code = "RANGE_CHOPPY"
     else:
-        overall = "REGIME_CHINH: MIXED_UNCLEAR"
+        overall_code = "MIXED_UNCLEAR"
 
     modifiers = []
     if low_volume_count >= 2:
         modifiers.append("LOW_LIQUIDITY_RISK")
     if high_vol_count >= 2:
         modifiers.append("HIGH_VOLATILITY_RISK")
-    if ("TRENDING_UP" in main_state and "TRENDING_DOWN" in structure_state) or ("TRENDING_DOWN" in main_state and "TRENDING_UP" in structure_state):
+    if (main_state["trend_tag"] == "TRENDING_UP" and structure_state["trend_tag"] == "TRENDING_DOWN") or (
+        main_state["trend_tag"] == "TRENDING_DOWN" and structure_state["trend_tag"] == "TRENDING_UP"
+    ):
         modifiers.append("LOWER_TIMEFRAME_PULLBACK_AGAINST_STRUCTURE")
-    modifier_text = ", ".join(modifiers) if modifiers else "không có modifier lớn"
+    modifier_text = ", ".join(_label_vi(m) for m in modifiers) if modifiers else "không có ghi chú rủi ro lớn"
 
     return "\n".join([
-        "MARKET_REGIME_DO_PYTHON_PHAN_LOAI:",
-        f"- {overall}; modifier: {modifier_text}",
-        f"- {main_state}",
-        f"- {structure_state}",
-        f"- {big_state}",
-        "- Cách dùng: RANGE_CHOPPY/MIXED_UNCLEAR hoặc thanh khoản thấp là cảnh báo rủi ro, không phải lý do tự động NO_TRADE. Nếu có vùng Entry rõ và risk/reward đạt, vẫn có thể tạo lệnh chờ LONG/SHORT.",
+        "Phân loại thị trường do Python:",
+        f"- Xu hướng chính: {_label_vi(overall_code)}; ghi chú: {modifier_text}",
+        f"- {main_state['text']}",
+        f"- {structure_state['text']}",
+        f"- {big_state['text']}",
+        "- Cách dùng: đi ngang/nhiễu, chưa rõ xu hướng hoặc thanh khoản thấp là cảnh báo rủi ro, không phải lý do tự động NO_TRADE. Nếu có vùng Entry rõ và tỷ lệ lời/lỗ đạt, vẫn có thể tạo lệnh chờ LONG/SHORT.",
     ])
 
 
@@ -1398,7 +1452,7 @@ def build_feature_engineering_block(
     main_label, structure_label, big_label = _mode_labels(mode)
     price = current_price or _last_close_from_data(timeframe_data)
     if price is None:
-        return "FEATURE_ENGINEERING: Không đủ dữ liệu để tính cấu trúc, Fibonacci, ATR và vùng quét. Không được tự bịa các phần này."
+        return "Dữ liệu kỹ thuật: Không đủ dữ liệu để tính cấu trúc, Fibonacci, ATR và vùng quét. Không được tự bịa các phần này."
 
     main_df = timeframe_data.get(main_label)
     structure_df = timeframe_data.get(structure_label)
@@ -1417,7 +1471,7 @@ def build_feature_engineering_block(
     fib = structure.get("fib", {})
 
     lines = [
-        "FEATURE_ENGINEERING_DO_PYTHON_TINH_SAN:",
+        "Dữ liệu kỹ thuật do Python tính sẵn:",
         f"- Mode: {'SCALP' if mode == 'short' else 'SWING'} | Khung vào lệnh: {main_label} | Khung cấu trúc: {structure_label} | Khung lớn: {big_label}",
         build_market_regime_block(timeframe_data, mode),
         f"- ATR14 {main_label}: {fmt(atr_main)} | ATR14 {structure_label}: {fmt(atr_structure)} | Rủi ro tối thiểu đề xuất: {fmt(risk)} USDT",
@@ -1426,7 +1480,7 @@ def build_feature_engineering_block(
         f"- Fibonacci {structure_label}: 0.382={fmt(fib.get('0.382'))}; 0.5={fmt(fib.get('0.5'))}; 0.618={fmt(fib.get('0.618'))}",
         f"- Vùng quét Long gần: {fmt(long_near[0])}–{fmt(long_near[1])} (cụm {long_near[2]} điểm); sâu: {fmt(long_deep[0])}–{fmt(long_deep[1])}",
         f"- Vùng quét Short gần: {fmt(short_near[0])}–{fmt(short_near[1])} (cụm {short_near[2]} điểm); sâu: {fmt(short_deep[0])}–{fmt(short_deep[1])}",
-        "- Quy tắc rủi ro: Claude tự lập Entry/SL/TP, nhưng khoảng cách Entry–SL nên không nhỏ hơn rủi ro tối thiểu đề xuất; TP1 nên khoảng >= 0.8R, TP2 nên khoảng >= 1.4R.",
+        "- Quy tắc rủi ro: AI tự lập Entry/SL/TP, nhưng khoảng cách Entry–SL nên không nhỏ hơn rủi ro tối thiểu đề xuất; TP1 nên khoảng >= 0.8R, TP2 nên khoảng >= 1.4R.",
         "- Ghi chú: Vùng quét chỉ là ước lượng từ pivot/equal high/equal low và high/low nến, không phải dữ liệu thanh lý thật. Block này là bản đồ kỹ thuật, không phải lệnh giao dịch chốt sẵn.",
     ]
     return "\n".join(lines)
@@ -2015,16 +2069,40 @@ def parse_prediction_from_output(output: str) -> dict:
 
 
 def sanitize_user_output(output: str) -> str:
-    """Dọn một số wording dễ gây nhầm trước khi gửi user/lưu full_response."""
+    """Dọn wording dễ gây nhầm và nhãn kỹ thuật nội bộ trước khi gửi user/lưu full_response."""
     replacements = {
         "swing gần": "đỉnh/đáy gần",
         "Swing gần": "Đỉnh/đáy gần",
         "swing lớn": "biên lớn",
         "Swing lớn": "Biên lớn",
+        "MARKET_REGIME_DO_PYTHON_PHAN_LOAI": "phân loại thị trường do Python",
+        "FEATURE_ENGINEERING_DO_PYTHON_TINH_SAN": "dữ liệu kỹ thuật do Python tính sẵn",
+        "REGIME_CHINH": "xu hướng chính",
+        "BULL_TREND": "xu hướng tăng",
+        "BEAR_TREND": "xu hướng giảm",
+        "RANGE_CHOPPY": "đi ngang/nhiễu",
+        "MIXED_UNCLEAR": "chưa rõ xu hướng",
+        "MIXED_TRANSITION": "trạng thái chuyển pha",
+        "TRENDING_UP": "xu hướng tăng rõ",
+        "TRENDING_DOWN": "xu hướng giảm rõ",
+        "HIGH_VOLATILITY_RISK": "rủi ro biến động mạnh",
+        "LOW_LIQUIDITY_RISK": "rủi ro thanh khoản thấp",
+        "LOWER_TIMEFRAME_PULLBACK_AGAINST_STRUCTURE": "khung nhỏ đang hồi ngược cấu trúc lớn",
+        "HIGH_VOLATILITY": "biến động mạnh",
+        "LOW_VOLATILITY": "biến động thấp",
+        "NORMAL_VOLATILITY": "biến động bình thường",
+        "HIGH_VOLUME": "khối lượng cao",
+        "LOW_VOLUME": "khối lượng thấp",
+        "NORMAL_VOLUME": "khối lượng bình thường",
+        "EMA_TANG": "EMA nghiêng tăng",
+        "EMA_GIAM": "EMA nghiêng giảm",
+        "EMA_DAN_XEN": "EMA đan xen",
+        "modifier": "ghi chú",
     }
     text = output or ""
-    for old, new in replacements.items():
-        text = text.replace(old, new)
+    # Replace longer internal labels first so overlapping terms do not leave fragments.
+    for old in sorted(replacements, key=len, reverse=True):
+        text = text.replace(old, replacements[old])
     return text
 
 
