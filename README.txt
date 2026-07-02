@@ -146,3 +146,60 @@ V4.9 Sonnet Analyst Mode update:
 - Python gửi thêm `RAW_CANDLE_CONTEXT_CHON_LOC` gồm nến thô có body%, râu trên/dưới, volume và taker-buy ratio nếu có để Sonnet đọc hành vi giá tốt hơn.
 - Claude phải so sánh nội bộ LONG / SHORT / NO_TRADE trước khi quyết định, nhưng không in bảng so sánh ra user.
 - Nếu Claude chọn NO_TRADE, bot hiển thị phản hồi NO_TRADE của Claude cho user và lưu hidden learning record; NO_TRADE không auto-check và không hiện trong /history/stats/dashboard.
+
+
+Ghi chú bản completion guard:
+- Bot không dùng Python risk/format guard để sửa hoặc chặn lệnh Claude.
+- Nếu phản hồi Claude bị cụt rõ ràng, bot gọi Claude trả lại bản hoàn chỉnh; Python không tự viết hay sửa Entry/SL/TP.
+- Có thể chỉnh CLAUDE_MAX_TOKENS trong Railway, mặc định 5000.
+
+
+## Chuyển sang GLM 5.2 qua OpenRouter
+
+Bản này hỗ trợ 2 provider AI:
+
+### 1) Claude / Anthropic (mặc định)
+```text
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=...
+CLAUDE_MODEL=claude-sonnet-5
+```
+
+### 2) GLM 5.2 qua OpenRouter
+```text
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=z-ai/glm-5.2
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+LLM_MAX_OUTPUT_TOKENS=8000
+LLM_MAX_CONTINUATIONS=2
+```
+
+Khi dùng OpenRouter/GLM thì không cần `ANTHROPIC_API_KEY`. Bot vẫn giữ cùng flow: Python tính dữ liệu kỹ thuật, model tự phân tích LONG/SHORT/NO_TRADE, Python chỉ parse Entry/SL/TP để auto-check nếu đủ số.
+
+
+=== GLM 5.2 / OpenRouter setup ===
+Bản này đã tương thích GLM 5.2 qua OpenRouter. Khi AI_PROVIDER=openrouter, bot dùng Chat Completions API với:
+- messages system/user kiểu OpenAI-compatible
+- max_completion_tokens cho output token
+- finish_reason=length để gọi continuation nếu bị cắt
+
+Railway Variables để chạy GLM 5.2:
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_MODEL=z-ai/glm-5.2
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+LLM_MAX_OUTPUT_TOKENS=8000
+LLM_MAX_CONTINUATIONS=2
+
+Các biến Telegram/DB giữ nguyên:
+BOT_TOKEN=...
+ADMIN_USER_IDS=5920124635
+DB_PATH=/data/bot.db
+
+Muốn quay lại Anthropic-native:
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=...
+CLAUDE_MODEL=claude-sonnet-5
+
+Các biến provider không dùng có thể để dư trên Railway, code chỉ đọc provider tương ứng theo AI_PROVIDER.

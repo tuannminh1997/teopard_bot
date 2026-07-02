@@ -99,3 +99,15 @@ Cập nhật Sonnet Analyst Mode:
 - Bot gửi thêm market regime và raw candle context cho AI để đọc hành vi giá tốt hơn.
 - Nếu AI chọn NO_TRADE, bot hiển thị phản hồi NO_TRADE của AI cho user; NO_TRADE không auto-check.
 - NO_TRADE được lưu ẩn để học lại, không hiện trong /history, /stats, /dashboard và không auto-check.
+
+
+Ghi chú bản completion guard:
+- Bot không dùng Python risk/format guard để sửa hoặc chặn lệnh Claude.
+- Nếu phản hồi Claude bị cụt rõ ràng, bot gọi Claude trả lại bản hoàn chỉnh; Python không tự viết hay sửa Entry/SL/TP.
+- Có thể chỉnh CLAUDE_MAX_TOKENS trong Railway, mặc định 5000.
+
+
+Ghi chú model AI:
+- Admin có thể đổi provider trên Railway Variables.
+- Claude mặc định: AI_PROVIDER=anthropic.
+- Test GLM 5.2 rẻ hơn qua OpenRouter: AI_PROVIDER=openrouter, OPENROUTER_MODEL=z-ai/glm-5.2.

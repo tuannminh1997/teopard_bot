@@ -14,8 +14,29 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BINANCE_API_URL   = "https://api.binance.com/api/v3/klines"
+
+# ─── AI provider config ───────────────────────────────────────────────────────
+# Default vẫn là Anthropic/Claude để không làm vỡ config cũ.
+# Muốn test GLM 5.2 qua OpenRouter trên Railway:
+#   AI_PROVIDER=openrouter
+#   OPENROUTER_API_KEY=<key>
+#   OPENROUTER_MODEL=z-ai/glm-5.2
+AI_PROVIDER = os.getenv("AI_PROVIDER", "anthropic").strip().lower()
+
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", os.getenv("GLM_MODEL", "z-ai/glm-5.2"))
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Teopard Bot")
+
+LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", os.getenv("CLAUDE_MAX_TOKENS", "8000")))
+LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "2"))
+# Giữ tên cũ để code cũ không crash nếu còn tham chiếu.
+CLAUDE_MAX_TOKENS = LLM_MAX_OUTPUT_TOKENS
+
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
 # Ngắn hạn: scalp trong ngày — 15m timing, 1H momentum, 4H xu hướng chính
@@ -1609,19 +1630,163 @@ Yêu cầu:
 
 # ─── Tóm tắt reasoning bằng call Haiku thứ 2 (rất ngắn, rẻ) ─────────────────
 
+def get_ai_api_key() -> str | None:
+    """Trả về API key theo provider hiện tại."""
+    if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai"):
+        return OPENROUTER_API_KEY
+    return ANTHROPIC_API_KEY
+
+
+def get_ai_model_name() -> str:
+    if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai"):
+        return OPENROUTER_MODEL
+    return CLAUDE_MODEL
+
+
+def ensure_ai_config() -> None:
+    if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai"):
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("Missing OPENROUTER_API_KEY. Set AI_PROVIDER=openrouter and OPENROUTER_API_KEY in Railway variables.")
+        return
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("Missing ANTHROPIC_API_KEY in .env/Railway variables.")
+
+
+def _anthropic_create_once(system: str | None, messages: list, max_tokens: int, timeout: int) -> dict:
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    kwargs = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": max_tokens,
+        "messages": messages,
+        "timeout": timeout,
+    }
+    if system:
+        kwargs["system"] = system
+    response = client.messages.create(**kwargs)
+    return {
+        "text": "".join(b.text for b in response.content if hasattr(b, "text")),
+        "stop_reason": getattr(response, "stop_reason", None),
+        "usage": getattr(response, "usage", None),
+    }
+
+
+def _openrouter_create_once(system: str | None, messages: list, max_tokens: int, timeout: int) -> dict:
+    """Gọi GLM/OpenRouter bằng Chat Completions API, không cần thêm thư viện openai.
+    OpenRouter khuyến nghị max_completion_tokens thay cho max_tokens."""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "X-OpenRouter-Title": OPENROUTER_APP_NAME,
+    }
+    if OPENROUTER_SITE_URL:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+
+    payload_messages = []
+    if system:
+        payload_messages.append({"role": "system", "content": system})
+    payload_messages.extend(messages)
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": payload_messages,
+        "max_completion_tokens": max_tokens,
+    }
+
+    # Một số provider có hỗ trợ reasoning effort. Để trống mặc định để tránh lỗi schema.
+    reasoning_effort = os.getenv("OPENROUTER_REASONING_EFFORT", "").strip()
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
+
+    r = requests.post(
+        f"{OPENROUTER_BASE_URL}/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+    )
+    try:
+        r.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"OpenRouter API error: {r.status_code} - {r.text[:1000]}") from exc
+
+    data = r.json()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    return {
+        "text": content,
+        "stop_reason": choice.get("finish_reason"),
+        "usage": data.get("usage"),
+    }
+
+
+def llm_create_once(system: str | None, messages: list, max_tokens: int, timeout: int) -> dict:
+    ensure_ai_config()
+    if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai"):
+        return _openrouter_create_once(system, messages, max_tokens, timeout)
+    return _anthropic_create_once(system, messages, max_tokens, timeout)
+
+
+def _is_length_stop(stop_reason) -> bool:
+    if stop_reason is None:
+        return False
+    return str(stop_reason).lower() in ("max_tokens", "length", "token_limit", "output_limit")
+
+
+def create_with_continuation(
+    *,
+    system: str | None,
+    messages: list,
+    max_tokens: int = LLM_MAX_OUTPUT_TOKENS,
+    timeout: int = 300,
+) -> str:
+    """
+    Gọi model hiện tại; nếu provider báo bị cắt vì max token thì gọi tiếp để nối output.
+    Không dùng Python sửa nội dung chiến lược, chỉ yêu cầu model viết tiếp phần bị ngắt.
+    """
+    convo = list(messages)
+    full_text = ""
+    for attempt in range(LLM_MAX_CONTINUATIONS + 1):
+        result = llm_create_once(system, convo, max_tokens=max_tokens, timeout=timeout)
+        chunk = result.get("text") or ""
+        full_text += chunk
+        stop_reason = result.get("stop_reason")
+        try:
+            print(
+                f"[LLM_RESPONSE] provider={AI_PROVIDER} model={get_ai_model_name()} "
+                f"attempt={attempt + 1} stop_reason={stop_reason} usage={result.get('usage')}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        if not _is_length_stop(stop_reason):
+            break
+        print("[LLM_TRUNCATED] Output bị cắt vì max_tokens, gọi tiếp để nối phần còn lại...", flush=True)
+        convo = convo + [
+            {"role": "assistant", "content": chunk},
+            {
+                "role": "user",
+                "content": (
+                    "Tiếp tục viết nốt phần còn lại ngay từ chỗ bị ngắt, "
+                    "không lặp lại nội dung đã viết, không giải thích gì thêm."
+                ),
+            },
+        ]
+    return full_text.strip()
+
+
+# ─── Tóm tắt reasoning bằng call model thứ 2 (rất ngắn) ──────────────────────
 def summarize_reasoning(full_response: str) -> str:
     """
-    Gọi Haiku lần 2 để tóm tắt lý do ra quyết định thành ~50 từ.
-    Chi phí cực thấp (~50 input tokens + ~60 output tokens).
-    Lưu vào DB để lần sau model học được pattern thực sự.
+    Tóm tắt lý do ra quyết định thành ~50 từ.
+    Dùng cùng provider đang cấu hình: Anthropic hoặc OpenRouter/GLM.
     """
-    if not ANTHROPIC_API_KEY:
+    if not get_ai_api_key():
         return ""
     try:
-        client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=120,
+        text = create_with_continuation(
+            system=None,
             messages=[{
                 "role": "user",
                 "content": (
@@ -1629,16 +1794,16 @@ def summarize_reasoning(full_response: str) -> str:
                     "dẫn đến quyết định LONG/SHORT trong phân tích sau. "
                     "Chỉ nêu các chỉ báo cụ thể (EMA, RSI, MACD, volume) và mức giá. "
                     "Không giải thích, không lời mở đầu.\n\n"
-                    + full_response[:2000]  # chỉ cần phần đầu là đủ
+                    + full_response[:2000]
                 ),
             }],
+            max_tokens=120,
             timeout=60,
         )
-        return "".join(b.text for b in response.content if hasattr(b, "text")).strip()
+        return text.strip()
     except Exception as exc:
-        print(f"Lỗi summarize_reasoning: {exc}")
+        print(f"Lỗi summarize_reasoning: {exc}", flush=True)
         return ""
-
 
 # ─── Parse prediction từ output ──────────────────────────────────────────────
 
@@ -1886,78 +2051,16 @@ Phản hồi trước:
 """
 
 
-# Giới hạn output tối đa cho mỗi lần gọi Claude. 3500 token là quá thấp cho
-# format phân tích đầy đủ (nhiều mục, dẫn số liệu cụ thể) -> hay bị cắt cụt
-# giữa câu (stop_reason == "max_tokens"). Tăng lên và có cơ chế tự nối tiếp
-# bên dưới để không bao giờ gửi cho user một câu trả lời bị cụt.
-CLAUDE_MAX_OUTPUT_TOKENS = 8000
-CLAUDE_MAX_CONTINUATIONS = 2
-
-
-def _extract_text(response) -> str:
-    return "".join(b.text for b in response.content if hasattr(b, "text"))
-
-
-def _create_with_continuation(
-    client: "anthropic.Anthropic",
-    *,
-    system: str,
-    messages: list,
-    max_tokens: int = CLAUDE_MAX_OUTPUT_TOKENS,
-    timeout: int = 300,
-) -> str:
-    """
-    Gọi Claude; nếu bị cắt vì hết max_tokens (stop_reason == "max_tokens"),
-    tự động gọi tiếp để Claude viết nối phần còn thiếu, thay vì trả về cho
-    user một câu trả lời cụt giữa chừng.
-    """
-    convo = list(messages)
-    full_text = ""
-
-    for attempt in range(CLAUDE_MAX_CONTINUATIONS + 1):
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=max_tokens,
-            system=system,
-            messages=convo,
-            timeout=timeout,
-        )
-        chunk = _extract_text(response)
-        full_text += chunk
-
-        if response.stop_reason != "max_tokens":
-            break
-
-        print(
-            f"[TEOPARD_TRUNCATED] lần {attempt + 1}: stop_reason=max_tokens, "
-            "đang gọi tiếp để hoàn thiện câu trả lời...",
-            flush=True,
-        )
-        convo = convo + [
-            {"role": "assistant", "content": chunk},
-            {
-                "role": "user",
-                "content": (
-                    "Tiếp tục viết nốt phần còn lại ngay từ chỗ bị ngắt, "
-                    "không lặp lại nội dung đã viết, không giải thích gì thêm."
-                ),
-            },
-        ]
-
-    return full_text
-
-
 def request_claude_repair(system_prompt: str, user_prompt: str, bad_output: str, validation_errors: list[str]) -> str:
-    """Gọi Claude sửa một lần nếu Entry/SL/TP không qua validator."""
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    return _create_with_continuation(
-        client,
+    """Legacy helper. Hiện flow chính không dùng để chặn output nữa."""
+    return create_with_continuation(
         system=system_prompt,
         messages=[
             {"role": "user", "content": user_prompt},
             {"role": "assistant", "content": bad_output},
             {"role": "user", "content": build_repair_prompt(bad_output, validation_errors)},
         ],
+        timeout=300,
     )
 
 
@@ -1975,12 +2078,11 @@ def build_no_trade_summary(output: str) -> str:
     text = (output or "").strip().replace("\n", " ")
     if not text:
         return "Claude chọn NO_TRADE nhưng không có lý do rõ."
-    # Giữ ngắn để history learning không quá dài.
     return "NO_TRADE: " + text[:600]
 
 
 def log_hidden_rejection(symbol: str, mode: str, pred: dict, validation_errors: list[str], output: str) -> None:
-    """Log nội bộ để debug trên Railway khi user chỉ thấy message chung."""
+    """Log nội bộ để debug trên Railway."""
     try:
         print("[TEOPARD_REJECTED]", flush=True)
         print(f"symbol={symbol} mode={mode} direction={pred.get('direction')}", flush=True)
@@ -1991,26 +2093,9 @@ def log_hidden_rejection(symbol: str, mode: str, pred: dict, validation_errors: 
 
 
 def maybe_append_not_saved_warning(output: str, errors: list[str]) -> str:
-    """
-    Nếu phản hồi của Claude không đạt guard, KHÔNG show nguyên plan lỗi cho user.
+    """Legacy helper. Flow Sonnet/GLM trust mode không ẩn output nữa."""
+    return output
 
-    Dù lỗi là thiếu format hay Entry/SL/TP chưa đạt quản trị rủi ro, user chỉ thấy
-    một thông báo chung để tránh rối. Bản lỗi vẫn được lưu hidden dưới
-    result=REJECTED_PLAN để Claude học/debug nội bộ, nhưng không auto-check và
-    không xuất hiện trong history/stats/dashboard của user.
-    """
-    if not errors:
-        return output
-
-    return (
-        "⚠️ Teopard chưa tìm thấy setup hợp lệ để tạo tín hiệu.\n\n"
-        "Phân tích AI chưa đạt kiểm tra format hoặc quản trị rủi ro, "
-        "nên bot không hiển thị lệnh này và không đưa vào auto-check.\n\n"
-        "Bạn có thể thử phân tích lại sau khi giá thay đổi, hoặc chọn khung Scalp/Swing khác."
-    )
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def load_system_prompt() -> str:
     for p in [Path("analyze_system_prompt.txt"), Path("analysis_system_prompt.txt")]:
@@ -2025,26 +2110,23 @@ def load_timeframe_data(binance_symbol: str, interval: str, limit: int) -> pd.Da
 
 
 def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
-    """Sync helper: Anthropic SDK is synchronous, so call it via asyncio.to_thread()."""
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    return _create_with_continuation(
-        client,
+    """Sync helper: gọi model hiện tại qua Anthropic hoặc OpenRouter/GLM."""
+    return create_with_continuation(
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
+        timeout=300,
     )
-
 
 def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, chat_id: int | None = None) -> str:
     """
     Legacy synchronous entry point.
 
     Không gọi hàm này trực tiếp trong Telegram async handler, vì bên trong có
-    requests.get(), Anthropic SDK sync và SQLite. Handler phải gọi analyze_symbol(),
+    requests.get(), AI API sync và SQLite. Handler phải gọi analyze_symbol(),
     hàm đó sẽ đưa các phần blocking sang worker thread bằng asyncio.to_thread().
     """
 
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("Missing ANTHROPIC_API_KEY in .env.")
+    ensure_ai_config()
 
     init_prediction_db()
 
@@ -2085,7 +2167,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
 
     # Sonnet-trust mode:
     # - Không dùng Python risk/format validator để ẩn phản hồi của Claude nữa.
-    # - Claude trả gì thì gửi user đúng nội dung đó.
+    # - Model trả gì thì gửi user đúng nội dung đó.
     # - Python chỉ parse tối thiểu Entry/SL/TP để lưu auto-check nếu đủ số.
     direction = (pred.get("direction") or "").upper()
 
@@ -2178,11 +2260,10 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     """
     Async entry point used by Telegram handlers.
 
-    Không gọi requests.get(), Anthropic SDK sync hoặc SQLite trực tiếp trên event loop.
+    Không gọi requests.get(), AI API sync hoặc SQLite trực tiếp trên event loop.
     Các phần I/O blocking được chuyển sang worker thread bằng asyncio.to_thread().
     """
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("Missing ANTHROPIC_API_KEY in .env.")
+    ensure_ai_config()
 
     await asyncio.to_thread(init_prediction_db)
 
@@ -2225,14 +2306,14 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         feature_block=feature_block,
     )
 
-    # Anthropic SDK đang sync, nên gọi trong worker thread để không block bot.
+    # AI API đang sync, nên gọi trong worker thread để không block bot.
     output = sanitize_user_output(await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt))
 
     pred = parse_prediction_from_output(output)
 
     # Sonnet-trust mode:
     # - Không dùng Python risk/format validator để ẩn phản hồi của Claude nữa.
-    # - Claude trả gì thì gửi user đúng nội dung đó.
+    # - Model trả gì thì gửi user đúng nội dung đó.
     # - Python chỉ parse tối thiểu Entry/SL/TP để lưu auto-check nếu đủ số.
     direction = (pred.get("direction") or "").upper()
 

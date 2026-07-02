@@ -50,7 +50,7 @@ LƯU Ý FORMAT CHO USER:
 - Không in riêng mục “📌 Bối cảnh”.
 - Không in riêng mục “🏗 Cấu trúc”.
 - Vẫn phải phân tích bối cảnh đa khung và cấu trúc thị trường trong nội bộ, rồi tóm tắt ngắn vào “📊 Kịch bản chính”.
-- Phản hồi không được bị cụt; bắt buộc có đủ “📊 Kịch bản chính” và “⚠️ Rủi ro”.
+- Phản hồi không được bị cụt; không được dừng ở dòng Kích hoạt; bắt buộc viết đủ “📊 Kịch bản chính” và “⚠️ Rủi ro” trước khi kết thúc.
 
 🎯 [SYMBOL] — [SCALP/SWING]
 Xu hướng: [TĂNG/GIẢM/ĐI NGANG] | F&G: [giá trị]/100 ([diễn giải tiếng Việt])
@@ -85,7 +85,7 @@ Nếu setup không đủ rõ, hãy trả rất ngắn theo format:
 Lý do: [1-2 câu ngắn, có nhắc vùng giá hoặc regime chính khiến không nên tạo tín hiệu.]
 
 YÊU CẦU ĐỘ DÀI
-- Nếu LONG/SHORT: mục tiêu 180–320 từ.
+- Nếu LONG/SHORT: mục tiêu 230–420 từ, đủ ý nhưng không lan man.
 - Nếu NO_TRADE: tối đa 90 từ.
 - Không có mục “📌 Bối cảnh”.
 - Không có mục “🏗 Cấu trúc”.
