@@ -67,7 +67,7 @@ Lệnh quản trị:
 /resetusage <user_id> - Reset lượt dùng hôm nay
 /addsymbol BTC - Thêm symbol
 /removesymbol BTC - Xóa symbol
-/checknow - Kiểm tra prediction đến hạn ngay lập tức; chỉ cập nhật DB và báo số lượng, không gửi kết quả cho user/admin
+/checknow - Admin: ép kiểm tra toàn bộ prediction đang mở ngay lập tức; chỉ cập nhật DB và báo số lượng, không gửi kết quả cho user/admin
 /clearhistory CONFIRM - Xóa toàn bộ lịch sử prediction, giữ whitelist và symbol
 
 Telegram menu không hiện lệnh có tham số, nên các lệnh như /stats BTC, /history BTC, /adduser 123456789 phải gõ tay.

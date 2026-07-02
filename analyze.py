@@ -302,22 +302,30 @@ def _row_to_pred(row) -> dict:
     return dict(zip(keys, row))
 
 
-def get_due_predictions() -> list[dict]:
+def get_due_predictions(force: bool = False) -> list[dict]:
+    """
+    Lấy prediction đang mở để auto-check.
+
+    - force=False: chỉ lấy prediction đến hạn theo next_check_at, dùng cho job định kỳ.
+    - force=True: lấy toàn bộ PENDING_ENTRY/ENTRY_FILLED, dùng cho /checknow để ép kiểm tra ngay.
+    """
     now_s = iso(utc_now())
+    where_due = "" if force else "AND (next_check_at IS NULL OR next_check_at <= ?)"
+    params = () if force else (now_s,)
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT id, user_id, chat_id, symbol, mode, created_at,
                    entry_wait_hours, max_hold_hours, next_check_at, direction,
                    entry_low, entry_high, sl, tp1, tp2, entry_status,
                    entry_filled_at, entry_price, result
             FROM predictions
             WHERE result IN ('PENDING_ENTRY', 'ENTRY_FILLED')
-              AND (next_check_at IS NULL OR next_check_at <= ?)
+              {where_due}
             ORDER BY id ASC
-            LIMIT 100
+            LIMIT 200
             """,
-            (now_s,),
+            params,
         ).fetchall()
     return [_row_to_pred(row) for row in rows]
 
@@ -517,16 +525,56 @@ def get_binance_klines_since(
         return None
 
 
+def _interval_to_timedelta(interval: str) -> timedelta:
+    """Khoảng thời gian của nến Binance, dùng để fetch lùi 1 cây tránh miss nến overlap lúc tạo signal."""
+    m = re.fullmatch(r"(\d+)([mhdw])", interval.strip().lower())
+    if not m:
+        return timedelta(minutes=15)
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == "m":
+        return timedelta(minutes=n)
+    if unit == "h":
+        return timedelta(hours=n)
+    if unit == "d":
+        return timedelta(days=n)
+    if unit == "w":
+        return timedelta(weeks=n)
+    return timedelta(minutes=15)
+
+
+def _range_low_high(a: float | None, b: float | None) -> tuple[float | None, float | None]:
+    if a is None or b is None:
+        return None, None
+    low = min(float(a), float(b))
+    high = max(float(a), float(b))
+    return low, high
+
+
 def _entry_touched(direction: str, entry_low: float | None, entry_high: float | None, high: float, low: float) -> bool:
-    if entry_low is None or entry_high is None:
+    low_zone, high_zone = _range_low_high(entry_low, entry_high)
+    if low_zone is None or high_zone is None:
         return False
-    return low <= entry_high and high >= entry_low
+    # Một nến chạm vùng Entry khi biên [low, high] của nến giao với biên Entry.
+    return low <= high_zone and high >= low_zone
 
 
-def _entry_price(direction: str, entry_low: float | None, entry_high: float | None) -> float | None:
-    if entry_low is None or entry_high is None:
+def _price_in_entry_range(price: float | None, entry_low: float | None, entry_high: float | None) -> bool:
+    if price is None:
+        return False
+    low_zone, high_zone = _range_low_high(entry_low, entry_high)
+    if low_zone is None or high_zone is None:
+        return False
+    return low_zone <= float(price) <= high_zone
+
+
+def _entry_price(direction: str, entry_low: float | None, entry_high: float | None, fill_price: float | None = None) -> float | None:
+    if fill_price is not None:
+        return float(fill_price)
+    low_zone, high_zone = _range_low_high(entry_low, entry_high)
+    if low_zone is None or high_zone is None:
         return None
-    return (entry_low + entry_high) / 2
+    return (low_zone + high_zone) / 2
 
 
 def _tp_sl_result(pred: dict, candles: pd.DataFrame) -> tuple[str, float | None, str, datetime | None]:
@@ -563,24 +611,58 @@ def _tp_sl_result(pred: dict, candles: pd.DataFrame) -> tuple[str, float | None,
     return "RUNNING", float(candles.iloc[-1]["close"]), "Đã khớp Entry nhưng chưa chạm TP1 hoặc SL.", None
 
 
-def evaluate_prediction_lifecycle(pred: dict, candles: pd.DataFrame | None) -> dict:
+def evaluate_prediction_lifecycle(
+    pred: dict,
+    candles: pd.DataFrame | None,
+    current_price: float | None = None,
+) -> dict:
+    """
+    Chấm vòng đời prediction.
+
+    Quy tắc quan trọng:
+    - Signal tạo lúc T thì chỉ xét dữ liệu có close_time sau T.
+    - PENDING_ENTRY được fill nếu current price hiện tại nằm trong vùng Entry.
+    - Entry range được hiểu là vùng giá: entry_low <= price <= entry_high, không phụ thuộc LONG/SHORT.
+    - Sau khi Entry đã khớp, TP/SL chỉ được xét từ entry_filled_at trở đi.
+    """
     now = utc_now()
     created = parse_utc_datetime(pred.get("created_at"))
     entry_filled_at = parse_utc_datetime(pred.get("entry_filled_at"))
     if created is None:
         return {"action": "skip", "reason": "Không đọc được thời gian tạo prediction."}
-    if candles is None or candles.empty:
-        return {"action": "reschedule", "reason": "Không có dữ liệu nến."}
-
-    candles = candles[candles["close_time"] >= pd.Timestamp(entry_filled_at or created)]
-    if candles.empty:
-        return {"action": "reschedule", "reason": "Chưa có nến đóng sau thời điểm cần kiểm tra."}
 
     status = pred.get("result") or pred.get("entry_status") or "PENDING_ENTRY"
 
     if status == "PENDING_ENTRY":
         entry_deadline = created + timedelta(hours=int(pred.get("entry_wait_hours") or 24))
-        for _, row in candles.iterrows():
+
+        # Check live price trước để không bỏ lỡ trường hợp giá hiện tại đang nằm trong vùng Entry.
+        # Ví dụ Entry 50000-50500, current price 50300 => ENTRY_FILLED ngay.
+        if now <= entry_deadline and _price_in_entry_range(current_price, pred.get("entry_low"), pred.get("entry_high")):
+            return {
+                "action": "fill",
+                "price": _entry_price(pred["direction"], pred.get("entry_low"), pred.get("entry_high"), current_price),
+                "filled_at": now,
+                "reason": f"Giá hiện tại {current_price} đang nằm trong vùng Entry.",
+            }
+
+        if candles is None or candles.empty:
+            if now >= entry_deadline:
+                return {
+                    "action": "close",
+                    "result": "NOT_FILLED",
+                    "price": current_price,
+                    "reason": f"Hết thời gian chờ Entry {pred.get('entry_wait_hours')}h nhưng không có dữ liệu nến để xác nhận giá đã chạm Entry.",
+                    "closed_at": now,
+                }
+            return {"action": "reschedule", "reason": "Không có dữ liệu nến."}
+
+        # Fetch có thể đã lùi 1 cây để bắt nến overlap, nhưng chỉ xét nến đóng sau thời điểm tạo signal.
+        pending_candles = candles[candles["close_time"] > pd.Timestamp(created)]
+        # Không fill Entry bằng nến đóng sau deadline chờ Entry.
+        pending_candles = pending_candles[pending_candles["close_time"] <= pd.Timestamp(entry_deadline)]
+
+        for _, row in pending_candles.iterrows():
             high = float(row["high"])
             low = float(row["low"])
             if _entry_touched(pred["direction"], pred.get("entry_low"), pred.get("entry_high"), high, low):
@@ -590,22 +672,65 @@ def evaluate_prediction_lifecycle(pred: dict, candles: pd.DataFrame | None) -> d
                 post = candles[candles["close_time"] >= row["close_time"]]
                 result, price, reason, closed_at = _tp_sl_result({**pred, "entry_price": entry_price}, post)
                 if result in ("WIN", "LOSS", "AMBIGUOUS"):
-                    return {"action": "close", "result": result, "price": price, "reason": f"Entry khớp rồi {reason}", "closed_at": closed_at or filled_at, "entry_price": entry_price, "entry_filled_at": filled_at}
-                return {"action": "fill", "price": entry_price, "filled_at": filled_at, "reason": f"Entry đã khớp lúc {str(row['close_time'])[:16]}."}
+                    return {
+                        "action": "close",
+                        "result": result,
+                        "price": price,
+                        "reason": f"Entry khớp rồi {reason}",
+                        "closed_at": closed_at or filled_at,
+                        "entry_price": entry_price,
+                        "entry_filled_at": filled_at,
+                    }
+                return {
+                    "action": "fill",
+                    "price": entry_price,
+                    "filled_at": filled_at,
+                    "reason": f"Entry đã khớp trong nến đóng lúc {str(row['close_time'])[:16]}.",
+                }
+
         if now >= entry_deadline:
-            last_price = float(candles.iloc[-1]["close"])
-            return {"action": "close", "result": "NOT_FILLED", "price": last_price, "reason": f"Hết thời gian chờ Entry {pred.get('entry_wait_hours')}h nhưng giá chưa chạm vùng Entry.", "closed_at": now}
+            fallback_price = current_price
+            if fallback_price is None and candles is not None and not candles.empty:
+                fallback_price = float(candles.iloc[-1]["close"])
+            return {
+                "action": "close",
+                "result": "NOT_FILLED",
+                "price": fallback_price,
+                "reason": f"Hết thời gian chờ Entry {pred.get('entry_wait_hours')}h nhưng giá chưa chạm vùng Entry.",
+                "closed_at": now,
+            }
         return {"action": "reschedule", "reason": "Chưa chạm Entry, tiếp tục chờ."}
 
     if status == "ENTRY_FILLED":
         if entry_filled_at is None:
             return {"action": "reschedule", "reason": "Thiếu entry_filled_at."}
-        result, price, reason, closed_at = _tp_sl_result(pred, candles)
+        if candles is None or candles.empty:
+            return {"action": "reschedule", "reason": "Không có dữ liệu nến."}
+        filled_candles = candles[candles["close_time"] > pd.Timestamp(entry_filled_at)]
+        if filled_candles.empty:
+            return {"action": "reschedule", "reason": "Chưa có nến đóng sau thời điểm khớp Entry."}
+        result, price, reason, closed_at = _tp_sl_result(pred, filled_candles)
         if result in ("WIN", "LOSS", "AMBIGUOUS"):
-            return {"action": "close", "result": result, "price": price, "reason": reason, "closed_at": closed_at or now, "entry_price": pred.get("entry_price"), "entry_filled_at": entry_filled_at}
+            return {
+                "action": "close",
+                "result": result,
+                "price": price,
+                "reason": reason,
+                "closed_at": closed_at or now,
+                "entry_price": pred.get("entry_price"),
+                "entry_filled_at": entry_filled_at,
+            }
         hold_deadline = entry_filled_at + timedelta(hours=int(pred.get("max_hold_hours") or 72))
         if now >= hold_deadline:
-            return {"action": "close", "result": "EXPIRED", "price": price, "reason": f"Đã khớp Entry nhưng quá thời gian giữ lệnh {pred.get('max_hold_hours')}h mà chưa chạm TP1/SL.", "closed_at": now, "entry_price": pred.get("entry_price"), "entry_filled_at": entry_filled_at}
+            return {
+                "action": "close",
+                "result": "EXPIRED",
+                "price": price or current_price,
+                "reason": f"Đã khớp Entry nhưng quá thời gian giữ lệnh {pred.get('max_hold_hours')}h mà chưa chạm TP1/SL.",
+                "closed_at": now,
+                "entry_price": pred.get("entry_price"),
+                "entry_filled_at": entry_filled_at,
+            }
         return {"action": "reschedule", "reason": reason}
 
     return {"action": "skip", "reason": f"Trạng thái {status} không cần kiểm tra."}
@@ -613,20 +738,22 @@ def evaluate_prediction_lifecycle(pred: dict, candles: pd.DataFrame | None) -> d
 
 
 
-async def auto_check_pending_predictions() -> dict:
-    """Check predictions đến hạn, chỉ cập nhật DB và trả về số liệu tóm tắt.
+
+async def auto_check_pending_predictions(force: bool = False) -> dict:
+    """Check predictions đang mở, chỉ cập nhật DB và trả về số liệu tóm tắt.
 
     Hàm này cố ý không tạo notification để gửi cho user/admin nữa.
     User muốn xem kết quả thì chủ động dùng /history, /stats hoặc /dashboard.
     """
     init_prediction_db()
-    due = get_due_predictions()
+    due = get_due_predictions(force=force)
     entry_filled_count = 0
     closed_count = 0
     rescheduled_count = 0
     skipped_count = 0
 
-    print(f"[AUTO_CHECK] Due predictions: {len(due)} at {iso(utc_now())}", flush=True)
+    check_label = "all active predictions" if force else "due predictions"
+    print(f"[AUTO_CHECK] Checking {len(due)} {check_label} at {iso(utc_now())}", flush=True)
 
     for pred in due:
         start_dt = parse_utc_datetime(pred.get("entry_filled_at")) or parse_utc_datetime(pred.get("created_at"))
@@ -634,8 +761,12 @@ async def auto_check_pending_predictions() -> dict:
             skipped_count += 1
             continue
         result_interval = get_result_check_interval(pred.get("mode", "short"))
-        candles = await asyncio.to_thread(get_binance_klines_since, pred["symbol"], result_interval, start_dt)
-        decision = evaluate_prediction_lifecycle(pred, candles)
+        fetch_start = start_dt - _interval_to_timedelta(result_interval)
+        current_price = None
+        if (pred.get("result") or pred.get("entry_status")) == "PENDING_ENTRY":
+            current_price = await asyncio.to_thread(get_current_price_raw, pred["symbol"])
+        candles = await asyncio.to_thread(get_binance_klines_since, pred["symbol"], result_interval, fetch_start)
+        decision = evaluate_prediction_lifecycle(pred, candles, current_price=current_price)
         action = decision.get("action")
 
         if action == "fill":
@@ -678,6 +809,7 @@ async def auto_check_pending_predictions() -> dict:
 
     return {
         "due_count": len(due),
+        "force": force,
         "entry_filled_count": entry_filled_count,
         "closed_count": closed_count,
         "rescheduled_count": rescheduled_count,

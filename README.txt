@@ -21,7 +21,7 @@ Swing:
 - Job check mỗi 12h.
 - Chấm TP/SL bằng nến 1H.
 
-Auto-check chỉ cập nhật DB, không gửi kết quả tự động cho user/admin. User muốn xem kết quả thì dùng /history, /stats hoặc /dashboard. Admin muốn xem tổng hệ thống thì dùng /historyall, /statsall hoặc /dashboardall; muốn ép kiểm tra ngay dùng /checknow.
+Auto-check chỉ cập nhật DB, không gửi kết quả tự động cho user/admin. User muốn xem kết quả thì dùng /history, /stats hoặc /dashboard. Admin muốn xem tổng hệ thống thì dùng /historyall, /statsall hoặc /dashboardall; muốn ép kiểm tra toàn bộ prediction đang mở ngay dùng /checknow.
 
 ## Lệnh user
 

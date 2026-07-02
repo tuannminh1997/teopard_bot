@@ -331,8 +331,8 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
         return
 
-    await update.effective_message.reply_text("Đang chạy kiểm tra dự đoán ngay bây giờ...")
-    payload = await auto_check_pending_predictions()
+    await update.effective_message.reply_text("Đang ép kiểm tra toàn bộ prediction đang mở ngay bây giờ...")
+    payload = await auto_check_pending_predictions(force=True)
 
     if not isinstance(payload, dict):
         await update.effective_message.reply_text("Đã kiểm tra xong.")
@@ -344,12 +344,12 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     due_count = int(payload.get("due_count", 0))
 
     if due_count == 0:
-        await update.effective_message.reply_text("Không có prediction nào đến hạn kiểm tra.")
+        await update.effective_message.reply_text("Không có prediction đang mở để kiểm tra.")
         return
 
     await update.effective_message.reply_text(
         "Đã kiểm tra xong và cập nhật DB.\n"
-        f"Prediction đến hạn: {due_count}\n"
+        f"Prediction đang mở đã kiểm tra: {due_count}\n"
         f"Mới khớp Entry: {entry_filled_count}\n"
         f"Có kết quả cuối: {closed_count}\n"
         f"Tiếp tục chờ: {rescheduled_count}\n\n"
