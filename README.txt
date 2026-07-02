@@ -221,3 +221,11 @@ V4.10 OpenRouter/GLM logging update:
 - Khi AI_PROVIDER=openrouter và model có chữ "glm", nếu Railway chưa set OPENROUTER_REASONING_EFFORT thì bot mặc định dùng xhigh cho phân tích chính.
 - Log LLM_RESPONSE có thêm call_type=main hoặc call_type=summary để dễ phân biệt chi phí phân tích chính và chi phí tóm tắt learning.
 - PREDICTION_HISTORY_COUNT vẫn giữ 5 để Claude/GLM có đủ lịch sử học lại.
+
+
+V4.11 prediction retention update:
+- Mỗi user chỉ giữ 10 lệnh hiển thị gần nhất trong DB; lệnh thứ 11 sẽ làm bot xóa lệnh hiển thị cũ nhất của user đó.
+- `/history` và `/history BTC` vẫn hiển thị tối đa 10 lệnh gần nhất.
+- Learning prompt vẫn chỉ lấy 5 lịch sử gần nhất của chính user cho cùng symbol/mode.
+- Bản ghi học ẩn `NO_TRADE`/`REJECTED_PLAN` cũng được giới hạn riêng để DB không phình lâu dài.
+- Thêm index nhẹ cho user history, per-symbol learning và auto-check để DB chạy ổn hơn trên Railway Volume.

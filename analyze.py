@@ -84,6 +84,8 @@ def get_result_check_interval(mode: str) -> str:
     return RESULT_CHECK_INTERVAL.get(mode, "15m")
 
 PREDICTION_HISTORY_COUNT = 5
+VISIBLE_PREDICTION_RETENTION_LIMIT = 10
+HIDDEN_LEARNING_RETENTION_LIMIT = 10
 HIDDEN_LEARNING_RESULTS = ("REJECTED_PLAN", "NO_TRADE")
 VN_TZ = timezone(timedelta(hours=7))
 
@@ -164,6 +166,59 @@ def init_prediction_db() -> None:
             conn.execute("UPDATE predictions SET entry_status='PENDING_ENTRY' WHERE entry_status IS NULL OR entry_status='' ")
         except sqlite3.OperationalError:
             pass
+
+        # Index nhẹ cho history/stats/learning/auto-check khi DB lớn hơn.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_id_id ON predictions(user_id, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_symbol_mode_id ON predictions(user_id, symbol, mode, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_result_next_check ON predictions(result, next_check_at)")
+        conn.commit()
+
+
+def prune_prediction_history(user_id: int | None) -> None:
+    """Giữ DB gọn: mỗi user chỉ giữ 10 lệnh hiển thị gần nhất.
+
+    - /history chỉ dùng nhóm lệnh hiển thị, nên nhóm này được giữ đúng 10 dòng mới nhất.
+    - NO_TRADE/REJECTED_PLAN là bản ghi học ẩn, không hiện trong /history; vẫn giới hạn
+      riêng để DB không phình theo thời gian.
+    - Learning prompt vẫn chỉ lấy PREDICTION_HISTORY_COUNT = 5 dòng gần nhất theo user/symbol/mode.
+    """
+    if user_id is None:
+        return
+
+    hidden_a, hidden_b = HIDDEN_LEARNING_RESULTS
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            DELETE FROM predictions
+            WHERE user_id=?
+              AND result NOT IN (?, ?)
+              AND id NOT IN (
+                  SELECT id
+                  FROM predictions
+                  WHERE user_id=?
+                    AND result NOT IN (?, ?)
+                  ORDER BY id DESC
+                  LIMIT ?
+              )
+            """,
+            (user_id, hidden_a, hidden_b, user_id, hidden_a, hidden_b, VISIBLE_PREDICTION_RETENTION_LIMIT),
+        )
+        conn.execute(
+            """
+            DELETE FROM predictions
+            WHERE user_id=?
+              AND result IN (?, ?)
+              AND id NOT IN (
+                  SELECT id
+                  FROM predictions
+                  WHERE user_id=?
+                    AND result IN (?, ?)
+                  ORDER BY id DESC
+                  LIMIT ?
+              )
+            """,
+            (user_id, hidden_a, hidden_b, user_id, hidden_a, hidden_b, HIDDEN_LEARNING_RETENTION_LIMIT),
+        )
         conn.commit()
 
 
@@ -201,8 +256,10 @@ def save_prediction(
              iso(next_check), direction, entry_low, entry_high, sl, tp1, tp2,
              market_snapshot, feature_snapshot, reasoning_summary, full_response),
         )
+        prediction_id = cursor.lastrowid
         conn.commit()
-        return cursor.lastrowid
+    prune_prediction_history(user_id)
+    return prediction_id
 
 
 def save_rejected_prediction(
@@ -251,8 +308,10 @@ def save_rejected_prediction(
              safe_direction, entry_low, entry_high, sl, tp1, tp2,
              market_snapshot, feature_snapshot, reasoning_summary, full_response, reason, iso(now)),
         )
+        prediction_id = cursor.lastrowid
         conn.commit()
-        return cursor.lastrowid
+    prune_prediction_history(user_id)
+    return prediction_id
 
 
 def save_no_trade_prediction(
@@ -288,8 +347,10 @@ def save_no_trade_prediction(
              market_snapshot, feature_snapshot, reasoning_summary or "Claude chọn NO_TRADE.", full_response,
              "Claude chọn NO_TRADE vì chưa có setup đủ rõ hoặc risk/reward chưa đáng để tạo tín hiệu.", iso(now)),
         )
+        prediction_id = cursor.lastrowid
         conn.commit()
-        return cursor.lastrowid
+    prune_prediction_history(user_id)
+    return prediction_id
 
 
 def _row_to_pred(row) -> dict:

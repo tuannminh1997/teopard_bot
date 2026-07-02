@@ -76,7 +76,9 @@ Ghi chú admin: Admin dùng /historyall hoặc /historyall BTC sẽ thấy thêm
 
 Ghi chú học lại: Khi bạn phân tích coin, Claude chỉ dùng lịch sử phân tích của chính tài khoản bạn cho cùng coin/mode. Lịch sử của user khác không được đưa vào prompt học lại. Admin vẫn xem được thống kê/lịch sử toàn hệ thống khi dùng /statsall, /historyall, /dashboardall.
 
-Ghi chú học lại nâng cao: Lịch sử đưa cho Claude học gồm 5 phân tích gần nhất của chính bạn cho cùng coin/mode. Mỗi lịch sử có Entry/SL/TP, kết quả WIN/LOSS, lý do kết quả, reasoning cũ, market snapshot và feature snapshot gồm cấu trúc, Fibonacci, vùng quét, ATR/risk, EMA/RSI/MACD/volume.
+Ghi chú học lại nâng cao: Lịch sử đưa cho Claude/GLM học gồm 5 phân tích gần nhất của chính bạn cho cùng coin/mode. Mỗi lịch sử có Entry/SL/TP, kết quả WIN/LOSS, lý do kết quả, reasoning cũ, market snapshot và feature snapshot gồm cấu trúc, Fibonacci, vùng quét, ATR/risk, EMA/RSI/MACD/volume.
+
+Ghi chú lưu lịch sử: Bot chỉ giữ 10 lệnh hiển thị gần nhất cho mỗi user để DB không phình lâu dài. /history show tối đa 10 lệnh đó; lệnh thứ 11 sẽ làm lệnh hiển thị cũ nhất của user bị xóa khỏi DB. Bản ghi học ẩn NO_TRADE/REJECTED_PLAN được giới hạn riêng và không hiện trong /history.
 
 
 Cập nhật format phản hồi:
