@@ -99,8 +99,6 @@ def is_account_activated(user_id: int) -> bool:
     return is_user_whitelisted(user_id)
 
 
-def is_user_authorized(user_id: int) -> bool:
-    return is_admin(user_id) or is_account_activated(user_id)
 
 
 def add_whitelist_user(user_id: int) -> None:

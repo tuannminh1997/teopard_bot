@@ -611,31 +611,6 @@ def evaluate_prediction_lifecycle(pred: dict, candles: pd.DataFrame | None) -> d
     return {"action": "skip", "reason": f"Trạng thái {status} không cần kiểm tra."}
 
 
-def format_prediction_result_message(pred: dict, result: str, price: float | None, reason: str, entry_price: float | None = None, hold_hours: float | None = None) -> str:
-    emoji = {"WIN": "✅", "LOSS": "❌", "NOT_FILLED": "⏱", "EXPIRED": "⌛", "AMBIGUOUS": "⚠️"}.get(result, "📌")
-    mode_label = "SCALP" if pred.get("mode") == "short" else "SWING"
-    lines = [
-        "🎯 Kết quả tự động kiểm tra dự đoán",
-        "",
-        f"{emoji} {pred.get('symbol')} — {mode_label} — {result}",
-        f"Thời gian phân tích: {format_vn_datetime(pred.get('created_at'))}",
-        f"Hướng: {pred.get('direction')}",
-        f"Entry: {fmt(pred.get('entry_low'))}–{fmt(pred.get('entry_high'))}",
-        f"SL: {fmt(pred.get('sl'))}",
-        f"TP1: {fmt(pred.get('tp1'))}",
-        f"TP2: {fmt(pred.get('tp2'))}",
-    ]
-    if entry_price is not None:
-        lines.append(f"Giá khớp Entry: {fmt(entry_price)}")
-    if price is not None:
-        lines.append(f"Giá check: {fmt(price)}")
-    if hold_hours is not None:
-        lines.append(f"Thời gian giữ lệnh: {hold_hours:.1f}h")
-    lines.extend([
-        f"Lý do: {reason}",
-        f"ID: #{pred.get('id')}",
-    ])
-    return "\n".join(lines)
 
 
 async def auto_check_pending_predictions() -> dict:
@@ -1131,29 +1106,6 @@ def _risk_floor(timeframe_data: dict[str, pd.DataFrame | None], mode: str, curre
     return max(atr_main * 2.2, atr_confirm * 0.7, current_price * 0.025)
 
 
-def _reference_plans(current_price: float, zones: dict, risk: float) -> dict:
-    long_low, long_high, _ = zones.get("long_near", (None, None, 0))
-    short_low, short_high, _ = zones.get("short_near", (None, None, 0))
-    plans = {}
-    if long_low is not None and long_high is not None:
-        entry_mid = (long_low + long_high) / 2
-        sl = min(entry_mid - risk, (zones.get("long_deep", (None, None))[0] or entry_mid - risk))
-        real_risk = max(entry_mid - sl, risk)
-        plans["LONG"] = {
-            "entry_low": long_low, "entry_high": long_high, "sl": sl,
-            "tp1": entry_mid + real_risk, "tp2": entry_mid + real_risk * 2,
-            "risk": real_risk,
-        }
-    if short_low is not None and short_high is not None:
-        entry_mid = (short_low + short_high) / 2
-        sl = max(entry_mid + risk, (zones.get("short_deep", (None, None))[1] or entry_mid + risk))
-        real_risk = max(sl - entry_mid, risk)
-        plans["SHORT"] = {
-            "entry_low": short_low, "entry_high": short_high, "sl": sl,
-            "tp1": entry_mid - real_risk, "tp2": entry_mid - real_risk * 2,
-            "risk": real_risk,
-        }
-    return plans
 
 
 def _analysis_row(df: pd.DataFrame | None):
@@ -1703,10 +1655,13 @@ def _openrouter_create_once(
     }
 
     # Một số provider có hỗ trợ reasoning effort.
-    # - Phân tích chính: dùng OPENROUTER_REASONING_EFFORT nếu có set, ví dụ high/xhigh.
+    # - Phân tích chính: dùng OPENROUTER_REASONING_EFFORT nếu có set.
+    # - Nếu đang dùng GLM qua OpenRouter mà Railway chưa set biến này, mặc định dùng xhigh
+    #   để GLM có ngân sách suy luận sâu hơn cho Entry/SL/TP.
     # - Summary: truyền reasoning_effort="off" để không đốt hết 120-600 token vào reasoning ẩn.
     if reasoning_effort is None:
-        effective_reasoning_effort = os.getenv("OPENROUTER_REASONING_EFFORT", "").strip()
+        default_effort = "xhigh" if "glm" in (OPENROUTER_MODEL or "").lower() else ""
+        effective_reasoning_effort = os.getenv("OPENROUTER_REASONING_EFFORT", default_effort).strip()
     else:
         effective_reasoning_effort = (reasoning_effort or "").strip()
 
@@ -1764,6 +1719,7 @@ def create_with_continuation(
     timeout: int = 300,
     allow_continuation: bool = True,
     reasoning_effort: str | None = None,
+    call_type: str = "main",
 ) -> str:
     """
     Gọi model hiện tại; nếu provider báo bị cắt vì max token thì gọi tiếp để nối output.
@@ -1785,7 +1741,7 @@ def create_with_continuation(
         stop_reason = result.get("stop_reason")
         try:
             print(
-                f"[LLM_RESPONSE] provider={AI_PROVIDER} model={get_ai_model_name()} "
+                f"[LLM_RESPONSE] call_type={call_type} provider={AI_PROVIDER} model={get_ai_model_name()} "
                 f"attempt={attempt + 1} stop_reason={stop_reason} usage={result.get('usage')}",
                 flush=True,
             )
@@ -1838,6 +1794,7 @@ def summarize_reasoning(full_response: str) -> str:
             timeout=60,
             allow_continuation=False,
             reasoning_effort=OPENROUTER_SUMMARY_REASONING_EFFORT,
+            call_type="summary",
         )
         return text.strip()
     except Exception as exc:
@@ -1918,141 +1875,11 @@ def parse_prediction_from_output(output: str) -> dict:
 
 # ─── Hybrid AI validator ─────────────────────────────────────────────────────
 
-def validate_prediction_plan(
-    pred: dict,
-    mode: str,
-    timeframe_data: dict[str, pd.DataFrame | None],
-    current_price: float | None,
-) -> list[str]:
-    """
-    Python không chọn lệnh thay Claude. Hàm này chỉ đóng vai trò kiểm tra an toàn:
-    - LONG/SHORT đúng chiều Entry/SL/TP.
-    - Có đủ số để bot auto-check.
-    - SL không quá sát Entry so với rủi ro tối thiểu Python đã tính.
-    - TP1/TP2 có tỷ lệ lợi nhuận/rủi ro tối thiểu.
-    """
-    errors: list[str] = []
-    direction = (pred.get("direction") or "").upper()
-    entry_low = pred.get("entry_low")
-    entry_high = pred.get("entry_high")
-    sl = pred.get("sl")
-    tp1 = pred.get("tp1")
-    tp2 = pred.get("tp2")
-
-    if direction == "NO_TRADE":
-        return errors
-    if direction not in ("LONG", "SHORT"):
-        errors.append("QUYẾT ĐỊNH phải là LONG, SHORT hoặc NO_TRADE.")
-        return errors
-
-    required = {
-        "Entry thấp": entry_low,
-        "Entry cao": entry_high,
-        "SL": sl,
-        "TP1": tp1,
-        "TP2": tp2,
-    }
-    for name, value in required.items():
-        if value is None:
-            errors.append(f"Thiếu {name} dạng số cụ thể.")
-        elif not isinstance(value, (int, float)) or not np.isfinite(float(value)) or float(value) <= 0:
-            errors.append(f"{name} không hợp lệ: {value}.")
-    if errors:
-        return errors
-
-    entry_low = float(entry_low)
-    entry_high = float(entry_high)
-    if entry_low > entry_high:
-        entry_low, entry_high = entry_high, entry_low
-        pred["entry_low"], pred["entry_high"] = entry_low, entry_high
-
-    entry_mid = (entry_low + entry_high) / 2
-    sl = float(sl)
-    tp1 = float(tp1)
-    tp2 = float(tp2)
-
-    if direction == "LONG":
-        if not sl < entry_low:
-            errors.append("LONG phải có SL thấp hơn vùng Entry.")
-        if not tp1 > entry_high:
-            errors.append("LONG phải có TP1 cao hơn vùng Entry.")
-        if not tp2 > tp1:
-            errors.append("LONG phải có TP2 cao hơn TP1.")
-        risk = entry_mid - sl
-        reward1 = tp1 - entry_mid
-        reward2 = tp2 - entry_mid
-    else:
-        if not sl > entry_high:
-            errors.append("SHORT phải có SL cao hơn vùng Entry.")
-        if not tp1 < entry_low:
-            errors.append("SHORT phải có TP1 thấp hơn vùng Entry.")
-        if not tp2 < tp1:
-            errors.append("SHORT phải có TP2 thấp hơn TP1.")
-        risk = sl - entry_mid
-        reward1 = entry_mid - tp1
-        reward2 = entry_mid - tp2
-
-    if risk <= 0:
-        errors.append("Khoảng cách Entry–SL không hợp lệ.")
-        return errors
-
-    price = current_price or _last_close_from_data(timeframe_data) or entry_mid
-    min_risk = _risk_floor(timeframe_data, mode, float(price))
-    # Cho Claude linh hoạt một chút, nhưng không để SL quá sát như trước.
-    if min_risk and risk < min_risk * 0.70:
-        errors.append(
-            f"SL quá sát Entry: rủi ro {fmt(risk)} nhỏ hơn 70% rủi ro tối thiểu đề xuất {fmt(min_risk)}."
-        )
-    if reward1 <= 0 or reward1 < risk * 0.80:
-        errors.append(f"TP1 chưa đủ lợi nhuận so với rủi ro: reward1={fmt(reward1)}, risk={fmt(risk)}.")
-    if reward2 <= 0 or reward2 < risk * 1.40:
-        errors.append(f"TP2 chưa đủ lợi nhuận mở rộng: reward2={fmt(reward2)}, risk={fmt(risk)}.")
-
-    # Chặn số bịa quá xa giá hiện tại, nhưng không quá chặt để Swing vẫn có không gian.
-    max_distance_pct = 0.08 if mode == "short" else 0.20
-    if price and abs(entry_mid - float(price)) / float(price) > max_distance_pct:
-        errors.append(
-            f"Entry quá xa giá hiện tại {fmt(price)} so với mode {'SCALP' if mode == 'short' else 'SWING'}."
-        )
-
-    return errors
 
 
 
-REQUIRED_OUTPUT_PATTERNS = [
-    ("Thanh khoản", r"thanh\s*khoản"),
-    ("QUYẾT ĐỊNH", r"quyết\s*định\s*:\s*(LONG|SHORT|NO[_\s-]?TRADE)"),
-    ("Entry", r"\bEntry\s*:"),
-    ("SL", r"\bSL\s*:"),
-    ("TP1", r"\bTP1\s*:"),
-    ("TP2", r"\bTP2\s*:"),
-    ("Kịch bản chính", r"kịch\s*bản\s*chính"),
-    ("Rủi ro", r"rủi\s*ro"),
-]
 
 
-def validate_output_format(output: str) -> list[str]:
-    """
-    Kiểm tra format theo kiểu mềm, không phụ thuộc emoji/viết hoa-thường.
-
-    Bản trước dùng exact string như “📊 Kịch bản chính”, nên chỉ cần Claude
-    bỏ emoji hoặc đổi hoa-thường là bị reject dù nội dung đủ.
-    """
-    errors: list[str] = []
-    text = output or ""
-    for label, pattern in REQUIRED_OUTPUT_PATTERNS:
-        if not re.search(pattern, text, re.IGNORECASE):
-            errors.append(f"Thiếu mục bắt buộc trong phản hồi: {label}")
-    # Không hiển thị các mục dài mà user đã yêu cầu ẩn; Claude vẫn phân tích nội bộ và tóm tắt ở Kịch bản chính.
-    if re.search(r"bối\s*cảnh", text, re.IGNORECASE) or re.search(r"cấu\s*trúc", text, re.IGNORECASE):
-        # Chỉ chặn nếu nó là tiêu đề riêng, không chặn khi nhắc gọn trong câu.
-        if re.search(r"(?m)^\s*(?:📌\s*)?Bối\s*cảnh\s*:", text, re.IGNORECASE) or re.search(r"(?m)^\s*(?:🏗\s*)?Cấu\s*trúc\s*:", text, re.IGNORECASE):
-            errors.append("Không hiển thị mục 'Bối cảnh' hoặc 'Cấu trúc' riêng; hãy tóm tắt ngắn vào 'Kịch bản chính'.")
-    # Tránh nhầm chữ swing trong phân tích kỹ thuật với mode SWING.
-    lowered = text.lower()
-    if "swing gần" in lowered or "swing lớn" in lowered:
-        errors.append("Không dùng chữ 'swing gần/swing lớn' trong phản hồi cho user; hãy đổi thành 'đỉnh/đáy gần' và 'biên lớn'.")
-    return errors
 
 
 def sanitize_user_output(output: str) -> str:
@@ -2069,48 +1896,10 @@ def sanitize_user_output(output: str) -> str:
     return text
 
 
-def build_repair_prompt(bad_output: str, validation_errors: list[str]) -> str:
-    errors = "\n".join(f"- {e}" for e in validation_errors)
-    return f"""Phản hồi trước chưa đạt kiểm tra logic của Python validator.
-
-Lỗi cần sửa:
-{errors}
-
-Yêu cầu sửa:
-- Giữ nguyên dữ liệu thị trường trong prompt gốc.
-- Không tự tạo Fibonacci/vùng quét/ATR ngoài block Python.
-- Tự điều chỉnh lại QUYẾT ĐỊNH, Entry, SL, TP1, TP2 sao cho hợp logic.
-- Trả lại TOÀN BỘ phân tích theo đúng format bắt buộc rút gọn cho user.
-- Không thêm mục “📌 Bối cảnh” hoặc “🏗 Cấu trúc”; chỉ tóm tắt vào “📊 Kịch bản chính”.
-- Bắt buộc có đủ “📊 Kịch bản chính” và “⚠️ Rủi ro”.
-- Không giải thích rằng bạn đang sửa lỗi.
-
-Phản hồi trước:
-{bad_output}
-"""
 
 
-def request_claude_repair(system_prompt: str, user_prompt: str, bad_output: str, validation_errors: list[str]) -> str:
-    """Legacy helper. Hiện flow chính không dùng để chặn output nữa."""
-    return create_with_continuation(
-        system=system_prompt,
-        messages=[
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": bad_output},
-            {"role": "user", "content": build_repair_prompt(bad_output, validation_errors)},
-        ],
-        timeout=300,
-    )
 
 
-def _has_format_or_content_errors(errors: list[str]) -> bool:
-    """True nếu lỗi đến từ phản hồi thiếu form/nội dung, không phải lỗi risk plan."""
-    markers = (
-        "Thiếu mục bắt buộc trong phản hồi",
-        "Không hiển thị mục",
-        "Không dùng chữ",
-    )
-    return any(any(marker in err for marker in markers) for err in (errors or []))
 
 
 def build_no_trade_summary(output: str) -> str:
@@ -2131,9 +1920,6 @@ def log_hidden_rejection(symbol: str, mode: str, pred: dict, validation_errors: 
         pass
 
 
-def maybe_append_not_saved_warning(output: str, errors: list[str]) -> str:
-    """Legacy helper. Flow Sonnet/GLM trust mode không ẩn output nữa."""
-    return output
 
 
 def load_system_prompt() -> str:
@@ -2154,6 +1940,7 @@ def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
         timeout=300,
+        call_type="main",
     )
 
 def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, chat_id: int | None = None) -> str:

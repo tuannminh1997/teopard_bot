@@ -174,8 +174,8 @@ OPENROUTER_MODEL=z-ai/glm-5.2
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 LLM_MAX_OUTPUT_TOKENS=8000
 LLM_MAX_CONTINUATIONS=2
-# Tuỳ chọn: giữ reasoning effort cho phân tích chính
-OPENROUTER_REASONING_EFFORT=high
+# Tuỳ chọn: reasoning effort cho phân tích chính. Nếu dùng GLM và không khai báo biến này, code mặc định xhigh.
+OPENROUTER_REASONING_EFFORT=xhigh
 # Summary mặc định tắt reasoning để không đốt token ẩn
 LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
 OPENROUTER_SUMMARY_REASONING_EFFORT=off
@@ -197,7 +197,7 @@ OPENROUTER_MODEL=z-ai/glm-5.2
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 LLM_MAX_OUTPUT_TOKENS=8000
 LLM_MAX_CONTINUATIONS=2
-OPENROUTER_REASONING_EFFORT=high
+OPENROUTER_REASONING_EFFORT=xhigh
 LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
 OPENROUTER_SUMMARY_REASONING_EFFORT=off
 
@@ -216,3 +216,8 @@ ANTHROPIC_API_KEY=...
 CLAUDE_MODEL=claude-sonnet-5
 
 Các biến provider không dùng có thể để dư trên Railway, code chỉ đọc provider tương ứng theo AI_PROVIDER.
+
+V4.10 OpenRouter/GLM logging update:
+- Khi AI_PROVIDER=openrouter và model có chữ "glm", nếu Railway chưa set OPENROUTER_REASONING_EFFORT thì bot mặc định dùng xhigh cho phân tích chính.
+- Log LLM_RESPONSE có thêm call_type=main hoặc call_type=summary để dễ phân biệt chi phí phân tích chính và chi phí tóm tắt learning.
+- PREDICTION_HISTORY_COUNT vẫn giữ 5 để Claude/GLM có đủ lịch sử học lại.

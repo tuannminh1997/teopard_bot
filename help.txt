@@ -111,5 +111,10 @@ Ghi chú model AI:
 - Admin có thể đổi provider trên Railway Variables.
 - Claude mặc định: AI_PROVIDER=anthropic.
 - Test GLM 5.2 rẻ hơn qua OpenRouter: AI_PROVIDER=openrouter, OPENROUTER_MODEL=z-ai/glm-5.2.
-- Phân tích chính có thể bật OPENROUTER_REASONING_EFFORT=high.
+- Phân tích chính dùng OPENROUTER_REASONING_EFFORT=xhigh; nếu dùng GLM mà không khai báo biến này, code mặc định xhigh.
 - Summary mặc định tắt reasoning: OPENROUTER_SUMMARY_REASONING_EFFORT=off, LLM_SUMMARY_MAX_OUTPUT_TOKENS=600.
+
+Ghi chú OpenRouter/GLM:
+- Nếu dùng GLM 5.2 qua OpenRouter, bot mặc định dùng reasoning xhigh cho phân tích chính nếu bạn không set OPENROUTER_REASONING_EFFORT.
+- Railway log sẽ hiện call_type=main cho phân tích chính và call_type=summary cho tóm tắt learning để dễ đọc chi phí.
+- Lịch sử học lại vẫn giữ 5 phân tích gần nhất của chính user cho cùng coin/mode.
