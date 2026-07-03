@@ -164,6 +164,12 @@ Bản này hỗ trợ 2 provider AI:
 AI_PROVIDER=anthropic
 ANTHROPIC_API_KEY=...
 CLAUDE_MODEL=claude-sonnet-5
+LLM_MAX_OUTPUT_TOKENS=8000
+LLM_MAX_CONTINUATIONS=2
+# Effort cho phân tích chính. Bot mặc định max nếu không khai báo.
+ANTHROPIC_EFFORT=max
+# Effort riêng cho call summary learning. Không ảnh hưởng Entry/SL/TP.
+ANTHROPIC_SUMMARY_EFFORT=high
 ```
 
 ### 2) GLM 5.2 qua OpenRouter
@@ -210,16 +216,24 @@ BOT_TOKEN=...
 ADMIN_USER_IDS=5920124635
 DB_PATH=/data/bot.db
 
-Muốn quay lại Anthropic-native:
+Muốn quay lại Anthropic-native / Claude Sonnet 5:
 AI_PROVIDER=anthropic
 ANTHROPIC_API_KEY=...
 CLAUDE_MODEL=claude-sonnet-5
+LLM_MAX_OUTPUT_TOKENS=8000
+LLM_MAX_CONTINUATIONS=2
+ANTHROPIC_EFFORT=max
+ANTHROPIC_SUMMARY_EFFORT=high
 
 Các biến provider không dùng có thể để dư trên Railway, code chỉ đọc provider tương ứng theo AI_PROVIDER.
 
-V4.10 OpenRouter/GLM logging update:
+V4.11 Claude effort + OpenRouter/GLM logging update:
+- Khi AI_PROVIDER=anthropic, bot dùng Claude native Messages API.
+- CLAUDE_MODEL mặc định là claude-sonnet-5.
+- ANTHROPIC_EFFORT mặc định max cho phân tích chính Entry/SL/TP. Có thể đổi high/xhigh/max trên Railway.
+- ANTHROPIC_SUMMARY_EFFORT mặc định high cho call tóm tắt learning.
 - Khi AI_PROVIDER=openrouter và model có chữ "glm", nếu Railway chưa set OPENROUTER_REASONING_EFFORT thì bot mặc định dùng xhigh cho phân tích chính.
-- Log LLM_RESPONSE có thêm call_type=main hoặc call_type=summary để dễ phân biệt chi phí phân tích chính và chi phí tóm tắt learning.
+- Log LLM_RESPONSE có thêm call_type=main hoặc call_type=summary và effort=... để dễ phân biệt chi phí phân tích chính/tóm tắt learning.
 - PREDICTION_HISTORY_COUNT vẫn giữ 5 để Claude/GLM có đủ lịch sử học lại.
 
 

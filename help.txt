@@ -106,17 +106,19 @@ Cập nhật Sonnet Analyst Mode:
 Ghi chú bản completion guard:
 - Bot không dùng Python risk/format guard để sửa hoặc chặn lệnh Claude.
 - Nếu phản hồi Claude bị cụt rõ ràng, bot gọi Claude trả lại bản hoàn chỉnh; Python không tự viết hay sửa Entry/SL/TP.
-- Có thể chỉnh CLAUDE_MAX_TOKENS trong Railway, mặc định 5000.
+- Có thể chỉnh LLM_MAX_OUTPUT_TOKENS trong Railway, mặc định 8000.
 
 
 Ghi chú model AI:
 - Admin có thể đổi provider trên Railway Variables.
-- Claude mặc định: AI_PROVIDER=anthropic.
-- Test GLM 5.2 rẻ hơn qua OpenRouter: AI_PROVIDER=openrouter, OPENROUTER_MODEL=z-ai/glm-5.2.
-- Phân tích chính dùng OPENROUTER_REASONING_EFFORT=xhigh; nếu dùng GLM mà không khai báo biến này, code mặc định xhigh.
-- Summary mặc định tắt reasoning: OPENROUTER_SUMMARY_REASONING_EFFORT=off, LLM_SUMMARY_MAX_OUTPUT_TOKENS=600.
+- Claude mặc định: AI_PROVIDER=anthropic, CLAUDE_MODEL=claude-sonnet-5.
+- Claude phân tích chính dùng ANTHROPIC_EFFORT=max mặc định. Có thể đổi high/xhigh/max trên Railway.
+- Claude summary dùng ANTHROPIC_SUMMARY_EFFORT=high mặc định.
+- Test GLM 5.2 qua OpenRouter: AI_PROVIDER=openrouter, OPENROUTER_MODEL=z-ai/glm-5.2.
+- GLM phân tích chính dùng OPENROUTER_REASONING_EFFORT=xhigh; nếu dùng GLM mà không khai báo biến này, code mặc định xhigh.
+- Summary GLM mặc định tắt reasoning: OPENROUTER_SUMMARY_REASONING_EFFORT=off, LLM_SUMMARY_MAX_OUTPUT_TOKENS=600.
 
 Ghi chú OpenRouter/GLM:
 - Nếu dùng GLM 5.2 qua OpenRouter, bot mặc định dùng reasoning xhigh cho phân tích chính nếu bạn không set OPENROUTER_REASONING_EFFORT.
-- Railway log sẽ hiện call_type=main cho phân tích chính và call_type=summary cho tóm tắt learning để dễ đọc chi phí.
+- Railway log sẽ hiện call_type=main/summary và effort=... để dễ đọc chi phí.
 - Lịch sử học lại vẫn giữ 5 phân tích gần nhất của chính user cho cùng coin/mode.

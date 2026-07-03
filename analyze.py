@@ -24,7 +24,10 @@ BINANCE_API_URL   = "https://api.binance.com/api/v3/klines"
 AI_PROVIDER = os.getenv("AI_PROVIDER", "anthropic").strip().lower()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
+# Claude Sonnet 5 mặc định high; Teopard default max để phân tích Entry/SL/TP sâu nhất khi dùng Anthropic.
+ANTHROPIC_EFFORT  = os.getenv("ANTHROPIC_EFFORT", "max").strip()
+ANTHROPIC_SUMMARY_EFFORT = os.getenv("ANTHROPIC_SUMMARY_EFFORT", "high").strip()
 
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", os.getenv("GLM_MODEL", "z-ai/glm-5.2"))
@@ -1855,7 +1858,13 @@ def ensure_ai_config() -> None:
         raise RuntimeError("Missing ANTHROPIC_API_KEY in .env/Railway variables.")
 
 
-def _anthropic_create_once(system: str | None, messages: list, max_tokens: int, timeout: int) -> dict:
+def _anthropic_create_once(
+    system: str | None,
+    messages: list,
+    max_tokens: int,
+    timeout: int,
+    reasoning_effort: str | None = None,
+) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     kwargs = {
         "model": CLAUDE_MODEL,
@@ -1865,11 +1874,23 @@ def _anthropic_create_once(system: str | None, messages: list, max_tokens: int, 
     }
     if system:
         kwargs["system"] = system
+
+    # Claude Sonnet 5 / Opus 4.x dùng output_config.effort để điều khiển mức suy luận.
+    # high là mặc định của API; max là mức sâu nhất, phù hợp phân tích chính của Teopard.
+    if reasoning_effort is None:
+        effective_effort = (ANTHROPIC_EFFORT or "").strip().lower()
+    else:
+        effective_effort = (reasoning_effort or "").strip().lower()
+
+    if effective_effort in {"max", "xhigh", "high", "medium", "low"}:
+        kwargs["output_config"] = {"effort": effective_effort}
+
     response = client.messages.create(**kwargs)
     return {
         "text": "".join(b.text for b in response.content if hasattr(b, "text")),
         "stop_reason": getattr(response, "stop_reason", None),
         "usage": getattr(response, "usage", None),
+        "effort": effective_effort or None,
     }
 
 
@@ -1936,6 +1957,7 @@ def _openrouter_create_once(
         "text": content,
         "stop_reason": choice.get("finish_reason"),
         "usage": data.get("usage"),
+        "effort": effective_reasoning_effort or None,
     }
 
 
@@ -1949,7 +1971,7 @@ def llm_create_once(
     ensure_ai_config()
     if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai"):
         return _openrouter_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
-    return _anthropic_create_once(system, messages, max_tokens, timeout)
+    return _anthropic_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
 
 
 def _is_length_stop(stop_reason) -> bool:
@@ -1989,7 +2011,7 @@ def create_with_continuation(
         try:
             print(
                 f"[LLM_RESPONSE] call_type={call_type} provider={AI_PROVIDER} model={get_ai_model_name()} "
-                f"attempt={attempt + 1} stop_reason={stop_reason} usage={result.get('usage')}",
+                f"effort={result.get('effort')} attempt={attempt + 1} stop_reason={stop_reason} usage={result.get('usage')}",
                 flush=True,
             )
         except Exception:
@@ -2025,6 +2047,11 @@ def summarize_reasoning(full_response: str) -> str:
     if not get_ai_api_key():
         return ""
     try:
+        summary_effort = (
+            OPENROUTER_SUMMARY_REASONING_EFFORT
+            if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai")
+            else ANTHROPIC_SUMMARY_EFFORT
+        )
         text = create_with_continuation(
             system=None,
             messages=[{
@@ -2040,7 +2067,7 @@ def summarize_reasoning(full_response: str) -> str:
             max_tokens=LLM_SUMMARY_MAX_OUTPUT_TOKENS,
             timeout=60,
             allow_continuation=False,
-            reasoning_effort=OPENROUTER_SUMMARY_REASONING_EFFORT,
+            reasoning_effort=summary_effort,
             call_type="summary",
         )
         return text.strip()
