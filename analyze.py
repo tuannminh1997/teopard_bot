@@ -1463,7 +1463,7 @@ def build_market_regime_block(timeframe_data: dict[str, pd.DataFrame | None], mo
         f"- {main_state['text']}",
         f"- {structure_state['text']}",
         f"- {big_state['text']}",
-        "- Cách dùng: đi ngang/nhiễu, chưa rõ xu hướng hoặc thanh khoản thấp là cảnh báo rủi ro, không phải lý do tự động NO_TRADE. Nếu có vùng Entry rõ và tỷ lệ lời/lỗ đạt, vẫn có thể tạo lệnh chờ LONG/SHORT.",
+        "- Cách dùng: đi ngang/nhiễu, chưa rõ xu hướng hoặc thanh khoản thấp là cảnh báo rủi ro, không phải lý do tự động NO_TRADE. Nếu giá hiện tại nằm trong vùng Entry hợp lý và đã có xác nhận, có thể vào ngay; nếu vùng Entry đẹp nằm xa giá hiện tại thì dùng lệnh chờ LONG/SHORT.",
     ])
 
 
@@ -1825,12 +1825,14 @@ Yêu cầu:
 1. Python chỉ cung cấp dữ liệu cứng: EMA/RSI/MACD/ATR, market regime, cấu trúc, Fibonacci, vùng quét, raw candle context, rủi ro tối thiểu. Không có kế hoạch LONG/SHORT chốt sẵn.
 2. Claude phải tự phân tích và tự lập Entry/SL/TP dựa trên dữ liệu cứng đó. Không được tự tạo thêm Fibonacci/vùng quét nếu block Python ghi N/A hoặc không đủ dữ liệu.
 3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO_TRADE theo xu hướng đa khung, vị trí giá, vùng quét, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user.
-4. Chỉ chọn LONG hoặc SHORT khi setup đủ rõ, Entry hợp lý và risk/reward đạt yêu cầu. Nếu thị trường nhiễu, vùng vào lệnh không rõ, hoặc LONG/SHORT đều kém → chọn NO_TRADE. Không dùng NO_TRADE chỉ vì giá chưa chạm Entry; hãy dùng lệnh chờ nếu vùng Entry rõ.
-5. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tôn trọng rủi ro tối thiểu đề xuất theo ATR/giá.
-6. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Chỉ chọn NO_TRADE khi không thể tạo tín hiệu hợp lệ.
-7. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
-8. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
-9. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO_TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
+4. Chỉ chọn LONG hoặc SHORT khi setup đủ rõ, Entry hợp lý và risk/reward đạt yêu cầu. Nếu thị trường nhiễu, vùng vào lệnh không rõ, hoặc LONG/SHORT đều kém → chọn NO_TRADE. Không dùng NO_TRADE chỉ vì giá chưa chạm Entry; nếu vùng Entry rõ nhưng nằm xa giá hiện tại thì dùng lệnh chờ.
+5. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”.
+6. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
+7. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tôn trọng rủi ro tối thiểu đề xuất theo ATR/giá.
+8. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Chỉ chọn NO_TRADE khi không thể tạo tín hiệu hợp lệ.
+9. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
+10. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
+11. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO_TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
 """
 
 
