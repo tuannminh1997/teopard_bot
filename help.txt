@@ -122,3 +122,8 @@ Ghi chú OpenRouter/GLM:
 - Nếu dùng GLM 5.2 qua OpenRouter, bot mặc định dùng reasoning xhigh cho phân tích chính nếu bạn không set OPENROUTER_REASONING_EFFORT.
 - Railway log sẽ hiện call_type=main/summary và effort=... để dễ đọc chi phí.
 - Lịch sử học lại vẫn giữ 5 phân tích gần nhất của chính user cho cùng coin/mode.
+
+Ghi chú kế hoạch đang mở:
+- Khi phân tích lại cùng coin/mode, bot gửi thêm kế hoạch cũ đang chờ/đã khớp cho AI để tránh hiểu nhầm.
+- LONG chờ hồi không phải tín hiệu SHORT về vùng Entry; SHORT chờ hồi không phải tín hiệu LONG về vùng Entry.
+- Nếu giá đã chạy xa khỏi Entry cũ, AI phải nêu giữ/hủy/thay thế kế hoạch, không được đuổi giá nếu chưa có vùng vào mới rõ.

@@ -243,3 +243,9 @@ V4.11 prediction retention update:
 - Learning prompt vẫn chỉ lấy 5 lịch sử gần nhất của chính user cho cùng symbol/mode.
 - Bản ghi học ẩn `NO_TRADE`/`REJECTED_PLAN` cũng được giới hạn riêng để DB không phình lâu dài.
 - Thêm index nhẹ cho user history, per-symbol learning và auto-check để DB chạy ổn hơn trên Railway Volume.
+
+V4.12 pending-plan awareness update:
+- Khi user phân tích lại cùng coin/mode, prompt nhận thêm KẾ HOẠCH ĐANG MỞ nếu đang có PENDING_ENTRY hoặc ENTRY_FILLED.
+- Model phải đánh giá kế hoạch cũ còn hiệu lực / bị hủy / cần thay thế trước khi ra kế hoạch mới.
+- Entry của lệnh chờ LONG không được hiểu là TP cho lệnh SHORT ngược lại; Entry của lệnh chờ SHORT không được hiểu là TP cho lệnh LONG ngược lại.
+- Nếu giá chạy theo hướng dự báo nhưng không hồi về Entry cũ, model không được đuổi giá trừ khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu không thì ưu tiên NO_TRADE hoặc chờ kiểm tra lại.

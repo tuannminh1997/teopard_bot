@@ -516,6 +516,101 @@ def get_recent_predictions(
     ]
 
 
+
+def get_open_signal_predictions(
+    symbol: str,
+    mode: str,
+    user_id: int | None = None,
+    limit: int = 2,
+) -> list[dict]:
+    """Lấy kế hoạch đang mở để model không hiểu nhầm lệnh chờ thành lệnh ngược.
+
+    Chỉ lấy theo đúng user + symbol + mode để không lộ dữ liệu user khác và không làm
+    prompt dài. Dùng cho awareness khi user phân tích lại cùng coin/mode trong lúc
+    tín hiệu cũ vẫn PENDING_ENTRY hoặc ENTRY_FILLED.
+    """
+    if user_id is None:
+        return []
+
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, created_at, direction, entry_low, entry_high, sl, tp1, tp2,
+                   result, entry_status, entry_filled_at, entry_price, result_reason
+            FROM predictions
+            WHERE symbol=? AND mode=? AND user_id=?
+              AND result IN ('PENDING_ENTRY', 'ENTRY_FILLED')
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (symbol, mode, user_id, limit),
+        ).fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "created_at": row[1],
+            "direction": row[2],
+            "entry_low": row[3],
+            "entry_high": row[4],
+            "sl": row[5],
+            "tp1": row[6],
+            "tp2": row[7],
+            "result": row[8],
+            "entry_status": row[9],
+            "entry_filled_at": row[10],
+            "entry_price": row[11],
+            "result_reason": row[12],
+        }
+        for row in rows
+    ]
+
+
+def _price_vs_entry_text(current_price: float | None, entry_low: float | None, entry_high: float | None) -> str:
+    if current_price is None or entry_low is None or entry_high is None:
+        return "không đủ dữ liệu để so với giá hiện tại"
+    low = min(float(entry_low), float(entry_high))
+    high = max(float(entry_low), float(entry_high))
+    if low <= current_price <= high:
+        return "giá hiện tại đang nằm trong vùng Entry cũ"
+    if current_price < low:
+        return "giá hiện tại đang thấp hơn vùng Entry cũ"
+    return "giá hiện tại đang cao hơn vùng Entry cũ"
+
+
+def format_open_signal_context(open_signals: list[dict], current_price: float | None) -> str:
+    """Tạo block awareness ngắn gọn cho các kế hoạch đang mở.
+
+    Mục tiêu chính: tránh tình huống model đưa LONG chờ hồi, user phân tích lại rồi
+    model đuổi giá hoặc user hiểu Entry LONG là TP cho lệnh SHORT.
+    """
+    if not open_signals:
+        return "KẾ HOẠCH ĐANG MỞ: Không có kế hoạch đang chờ/đã khớp cho user này ở cùng coin và mode."
+
+    lines = ["KẾ HOẠCH ĐANG MỞ CÙNG USER/COIN/MODE:"]
+    for p in open_signals:
+        entry = f"{fmt(p.get('entry_low'))}-{fmt(p.get('entry_high'))}" if p.get("entry_low") is not None and p.get("entry_high") is not None else "N/A"
+        status = p.get("result") or p.get("entry_status") or "N/A"
+        relation = _price_vs_entry_text(current_price, p.get("entry_low"), p.get("entry_high"))
+        extra = ""
+        if status == "ENTRY_FILLED":
+            extra = f"; đã khớp lúc {str(p.get('entry_filled_at') or '')[:16]}, giá khớp {fmt(p.get('entry_price'))}"
+        elif status == "PENDING_ENTRY":
+            extra = "; chưa khớp Entry"
+        lines.append(
+            f"- #{p.get('id')} {str(p.get('created_at') or '')[:16]} {p.get('direction')} {status}{extra}; "
+            f"Entry {entry}, SL {fmt(p.get('sl'))}, TP1 {fmt(p.get('tp1'))}, TP2 {fmt(p.get('tp2'))}; {relation}."
+        )
+
+    lines.extend([
+        "Cách dùng kế hoạch đang mở:",
+        "- Nếu kế hoạch cũ là LONG chờ hồi, vùng Entry LONG KHÔNG phải TP cho lệnh SHORT ngược lại. Nếu kế hoạch cũ là SHORT chờ hồi, vùng Entry SHORT KHÔNG phải TP cho lệnh LONG ngược lại.",
+        "- Khi phân tích lại, phải xem kế hoạch cũ là còn hiệu lực, bị hủy, hay cần thay bằng kế hoạch mới. Nếu thay kế hoạch, nêu ngắn lý do trong Kịch bản chính.",
+        "- Nếu giá không hồi về Entry cũ mà đã chạy theo hướng dự báo, không được đuổi giá chỉ vì giá đang chạy. Chỉ cho vào ngay khi giá hiện tại nằm trong vùng Entry mới hợp lý và đã có xác nhận rõ; nếu không, ưu tiên NO_TRADE hoặc chờ kiểm tra lại.",
+    ])
+    return "\n".join(lines)
+
+
 # ─── Auto WIN/LOSS check ──────────────────────────────────────────────────────
 
 def get_current_price_raw(symbol: str) -> float | None:
@@ -1795,6 +1890,7 @@ def build_user_prompt(
     current_price_str: str,
     history: list[dict],
     feature_block: str | None = None,
+    open_signal_context: str | None = None,
 ) -> str:
     mode_label = "SCALP (ngắn hạn)" if mode == "short" else "SWING (dài hạn)"
     focus      = (
@@ -1804,6 +1900,7 @@ def build_user_prompt(
     )
 
     history_block = format_prediction_history(history)
+    open_signal_context = open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có kế hoạch đang chờ/đã khớp cho user này ở cùng coin và mode."
     tf_blocks     = "".join(summarize_timeframe(lbl, df) for lbl, df in timeframe_data.items())
     raw_candle_block = build_raw_candle_context(timeframe_data, mode)
     feature_block = feature_block or build_feature_engineering_block(timeframe_data, mode, None)
@@ -1818,6 +1915,8 @@ Phương pháp: {focus}
 {feature_block}
 ═══════════════════════════════
 {history_block}
+═══════════════════════════════
+{open_signal_context}
 ═══════════════════════════════
 {raw_candle_block}
 ═══════════════════════════════
@@ -1834,8 +1933,11 @@ Yêu cầu:
 7. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát, nhưng cũng không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
 8. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Được chọn NO_TRADE khi lợi thế chưa đủ rõ, kể cả khi vẫn có thể vẽ ra một vùng Entry hợp lệ nhưng kèo không đáng vào.
 9. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
-10. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
-11. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO_TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
+10. Đọc kỹ KẾ HOẠCH ĐANG MỞ nếu có. Không được hiểu vùng Entry của một lệnh chờ LONG là mục tiêu TP cho lệnh SHORT ngược lại, hoặc vùng Entry của lệnh chờ SHORT là mục tiêu TP cho lệnh LONG ngược lại.
+11. Nếu đang có kế hoạch cũ PENDING_ENTRY mà giá đã chạy xa khỏi Entry theo đúng hướng dự báo, không được đuổi giá chỉ vì giá chạy. Chỉ cho vào ngay khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu không thì NO_TRADE hoặc chờ kiểm tra lại.
+12. Nếu kế hoạch mới thay thế kế hoạch cũ, ghi ngắn trong “📊 Kịch bản chính” lý do kế hoạch cũ bị hủy/thay thế.
+13. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
+14. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO_TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
 """
 
 
@@ -2280,6 +2382,8 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         current_price_str,
     )
     history                          = get_recent_predictions(binance_symbol, mode, user_id=user_id)
+    open_signals                     = get_open_signal_predictions(binance_symbol, mode, user_id=user_id)
+    open_signal_context              = format_open_signal_context(open_signals, current_price)
     user_prompt                      = build_user_prompt(
         symbol=binance_symbol,
         mode=mode,
@@ -2288,6 +2392,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         current_price_str=current_price_str,
         history=history,
         feature_block=feature_block,
+        open_signal_context=open_signal_context,
     )
 
     output = sanitize_user_output(request_claude_analysis(system_prompt, user_prompt))
@@ -2409,12 +2514,14 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     fear_greed_task = asyncio.to_thread(get_fear_greed_index)
     current_price_task = asyncio.to_thread(get_current_price_str, binance_symbol)
     history_task = asyncio.to_thread(get_recent_predictions, binance_symbol, mode, user_id)
+    open_signal_task = asyncio.to_thread(get_open_signal_predictions, binance_symbol, mode, user_id)
 
-    system_prompt, fear_greed_info, price_tuple, history = await asyncio.gather(
+    system_prompt, fear_greed_info, price_tuple, history, open_signals = await asyncio.gather(
         system_prompt_task,
         fear_greed_task,
         current_price_task,
         history_task,
+        open_signal_task,
     )
     current_price_str, current_price = price_tuple
 
@@ -2425,6 +2532,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         fear_greed_info,
         current_price_str,
     )
+    open_signal_context = format_open_signal_context(open_signals, current_price)
     user_prompt = build_user_prompt(
         symbol=binance_symbol,
         mode=mode,
@@ -2433,6 +2541,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         current_price_str=current_price_str,
         history=history,
         feature_block=feature_block,
+        open_signal_context=open_signal_context,
     )
 
     # AI API đang sync, nên gọi trong worker thread để không block bot.
