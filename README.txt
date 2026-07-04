@@ -71,7 +71,7 @@ Bot tính sẵn bằng Python trước khi gửi Claude:
 - Market structure, đỉnh/đáy gần/biên lớn.
 - Fibonacci 0.382/0.5/0.618 từ swing đã tính.
 - Vùng quét Long/Short gần và sâu từ pivot/equal high/equal low.
-- Rủi ro tối thiểu đề xuất theo ATR/giá.
+- Rủi ro tham chiếu theo ATR/giá.
 
 Cấu trúc Hybrid AI Engine:
 - Python chỉ tính dữ liệu cứng và bản đồ kỹ thuật.

@@ -1296,10 +1296,13 @@ def _risk_floor(timeframe_data: dict[str, pd.DataFrame | None], mode: str, curre
     if mode == "short":
         atr_main = _current_atr(timeframe_data.get("15M")) or 0
         atr_confirm = _current_atr(timeframe_data.get("1H")) or 0
-        return max(atr_main * 2.5, atr_confirm * 1.2, current_price * 0.006)
+        # Risk floor chỉ là mốc chống nhiễu để AI không đặt SL quá sát.
+        # Bản cũ dùng 2.5 ATR 15M / 1.2 ATR 1H / 0.6% giá nên Entry-SL/TP dễ bị quá rộng.
+        return max(atr_main * 1.6, atr_confirm * 0.7, current_price * 0.0035)
     atr_main = _current_atr(timeframe_data.get("4H")) or 0
     atr_confirm = _current_atr(timeframe_data.get("1D")) or 0
-    return max(atr_main * 2.2, atr_confirm * 0.7, current_price * 0.025)
+    # Swing cần rộng hơn scalp, nhưng vẫn tránh ép SL/TP quá xa.
+    return max(atr_main * 1.6, atr_confirm * 0.45, current_price * 0.015)
 
 
 
@@ -1463,7 +1466,7 @@ def build_market_regime_block(timeframe_data: dict[str, pd.DataFrame | None], mo
         f"- {main_state['text']}",
         f"- {structure_state['text']}",
         f"- {big_state['text']}",
-        "- Cách dùng: đi ngang/nhiễu, chưa rõ xu hướng hoặc thanh khoản thấp là cảnh báo rủi ro, không phải lý do tự động NO_TRADE. Nếu giá hiện tại nằm trong vùng Entry hợp lý và đã có xác nhận, có thể vào ngay; nếu vùng Entry đẹp nằm xa giá hiện tại thì dùng lệnh chờ LONG/SHORT.",
+        "- Cách dùng: đi ngang/nhiễu, chưa rõ xu hướng hoặc thanh khoản thấp là cảnh báo rủi ro. Không cố tạo LONG/SHORT nếu lợi thế không rõ; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.",
     ])
 
 
@@ -1538,14 +1541,14 @@ def build_feature_engineering_block(
         "Dữ liệu kỹ thuật do Python tính sẵn:",
         f"- Mode: {'SCALP' if mode == 'short' else 'SWING'} | Khung vào lệnh: {main_label} | Khung cấu trúc: {structure_label} | Khung lớn: {big_label}",
         build_market_regime_block(timeframe_data, mode),
-        f"- ATR14 {main_label}: {fmt(atr_main)} | ATR14 {structure_label}: {fmt(atr_structure)} | Rủi ro tối thiểu đề xuất: {fmt(risk)} USDT",
+        f"- ATR14 {main_label}: {fmt(atr_main)} | ATR14 {structure_label}: {fmt(atr_structure)} | Rủi ro tham chiếu: {fmt(risk)} USDT",
         f"- Chuỗi nến {main_label}: {_consecutive_candles(main_df)} | Nến cuối: {_wick_body_info(main_df)}",
         f"- Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}–{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}–{fmt(structure.get('major_high'))}",
         f"- Fibonacci {structure_label}: 0.382={fmt(fib.get('0.382'))}; 0.5={fmt(fib.get('0.5'))}; 0.618={fmt(fib.get('0.618'))}",
-        f"- Vùng quét Long gần: {fmt(long_near[0])}–{fmt(long_near[1])} (cụm {long_near[2]} điểm); sâu: {fmt(long_deep[0])}–{fmt(long_deep[1])}",
-        f"- Vùng quét Short gần: {fmt(short_near[0])}–{fmt(short_near[1])} (cụm {short_near[2]} điểm); sâu: {fmt(short_deep[0])}–{fmt(short_deep[1])}",
-        "- Quy tắc rủi ro: AI tự lập Entry/SL/TP, nhưng khoảng cách Entry–SL nên không nhỏ hơn rủi ro tối thiểu đề xuất; TP1 nên khoảng >= 0.8R, TP2 nên khoảng >= 1.4R.",
-        "- Ghi chú: Vùng quét chỉ là ước lượng từ pivot/equal high/equal low và high/low nến, không phải dữ liệu thanh lý thật. Block này là bản đồ kỹ thuật, không phải lệnh giao dịch chốt sẵn.",
+        f"- Vùng quét Long ước lượng gần: {fmt(long_near[0])}–{fmt(long_near[1])} (cụm {long_near[2]} điểm); sâu: {fmt(long_deep[0])}–{fmt(long_deep[1])}",
+        f"- Vùng quét Short ước lượng gần: {fmt(short_near[0])}–{fmt(short_near[1])} (cụm {short_near[2]} điểm); sâu: {fmt(short_deep[0])}–{fmt(short_deep[1])}",
+        "- Quy tắc rủi ro: AI tự lập Entry/SL/TP. Rủi ro tham chiếu là mốc chống nhiễu chống nhiễu, không phải lệnh bắt buộc; Entry–SL có thể thấp hơn một chút nếu có đỉnh/đáy vô hiệu rõ. TP1 nên khoảng >= 0.8R, TP2 nên khoảng >= 1.3R, không kéo TP quá xa chỉ để đẹp tỷ lệ.",
+        "- Ghi chú: Vùng quét là vùng thanh khoản ước lượng từ pivot/equal high/equal low và high/low nến, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật, không phải lệnh giao dịch chốt sẵn.",
     ]
     return "\n".join(lines)
 
@@ -1609,8 +1612,8 @@ def build_feature_snapshot(
         compact_tf(big_label, big_df),
         f"Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}-{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}-{fmt(structure.get('major_high'))}",
         f"Fib {structure_label}: 0.382 {fmt(fib.get('0.382'))}, 0.5 {fmt(fib.get('0.5'))}, 0.618 {fmt(fib.get('0.618'))}",
-        f"Liquidity Long gần {fmt(long_near[0])}-{fmt(long_near[1])} / sâu {fmt(long_deep[0])}-{fmt(long_deep[1])}; Short gần {fmt(short_near[0])}-{fmt(short_near[1])} / sâu {fmt(short_deep[0])}-{fmt(short_deep[1])}",
-        f"ATR/risk: ATR {main_label} {fmt(atr_main)}, ATR {structure_label} {fmt(atr_structure)}, risk_floor {fmt(risk)}",
+        f"Vùng quét Long ước lượng gần {fmt(long_near[0])}-{fmt(long_near[1])} / sâu {fmt(long_deep[0])}-{fmt(long_deep[1])}; Short gần {fmt(short_near[0])}-{fmt(short_near[1])} / sâu {fmt(short_deep[0])}-{fmt(short_deep[1])}",
+        f"ATR/risk: ATR {main_label} {fmt(atr_main)}, ATR {structure_label} {fmt(atr_structure)}, rủi ro tham chiếu {fmt(risk)}",
         f"Nến {main_label}: {_consecutive_candles(main_df)}; {_wick_body_info(main_df)}",
     ]
     return " | ".join(parts)
@@ -1822,14 +1825,14 @@ Phương pháp: {focus}
 ═══════════════════════════════
 
 Yêu cầu:
-1. Python chỉ cung cấp dữ liệu cứng: EMA/RSI/MACD/ATR, market regime, cấu trúc, Fibonacci, vùng quét, raw candle context, rủi ro tối thiểu. Không có kế hoạch LONG/SHORT chốt sẵn.
-2. Claude phải tự phân tích và tự lập Entry/SL/TP dựa trên dữ liệu cứng đó. Không được tự tạo thêm Fibonacci/vùng quét nếu block Python ghi N/A hoặc không đủ dữ liệu.
-3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO_TRADE theo xu hướng đa khung, vị trí giá, vùng quét, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user.
-4. Chỉ chọn LONG hoặc SHORT khi setup đủ rõ, Entry hợp lý và risk/reward đạt yêu cầu. Nếu thị trường nhiễu, vùng vào lệnh không rõ, hoặc LONG/SHORT đều kém → chọn NO_TRADE. Không dùng NO_TRADE chỉ vì giá chưa chạm Entry; nếu vùng Entry rõ nhưng nằm xa giá hiện tại thì dùng lệnh chờ.
+1. Python chỉ cung cấp dữ liệu cứng: EMA/RSI/MACD/ATR, market regime, cấu trúc, Fibonacci, vùng quét thanh khoản ước lượng, raw candle context, rủi ro tham chiếu. Không có kế hoạch LONG/SHORT chốt sẵn.
+2. Model phải tự phân tích và tự lập Entry/SL/TP dựa trên dữ liệu cứng đó. Không được tự tạo thêm Fibonacci/vùng quét nếu block Python ghi N/A hoặc không đủ dữ liệu.
+3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO_TRADE theo xu hướng đa khung, vị trí giá, vùng quét ước lượng, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user.
+4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và risk/reward đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO_TRADE. Không dùng NO_TRADE chỉ vì giá chưa chạm Entry; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.
 5. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”.
 6. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
-7. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tôn trọng rủi ro tối thiểu đề xuất theo ATR/giá.
-8. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Chỉ chọn NO_TRADE khi không thể tạo tín hiệu hợp lệ.
+7. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát, nhưng cũng không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
+8. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Được chọn NO_TRADE khi lợi thế chưa đủ rõ, kể cả khi vẫn có thể vẽ ra một vùng Entry hợp lệ nhưng kèo không đáng vào.
 9. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
 10. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
 11. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO_TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
