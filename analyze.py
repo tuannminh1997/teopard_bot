@@ -1241,6 +1241,7 @@ def _window_tail(df: pd.DataFrame | None, hours: int | None = None, max_candles:
     return data.reset_index(drop=True)
 
 
+
 def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int | None = 100, left: int = 2, right: int = 2) -> list[dict]:
     if df is None or df.empty:
         return []
@@ -1253,9 +1254,9 @@ def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int | None = 100,
         val = float(data.loc[i, col])
         window = data.loc[i - left:i + right, col]
         if side == "high" and val >= float(window.max()):
-            pivots.append({"price": val, "time": data.loc[i, "timestamp"]})
+            pivots.append({"price": val, "time": data.loc[i, "timestamp"], "index": i, "kind": "pivot", "weight": 1.0})
         elif side == "low" and val <= float(window.min()):
-            pivots.append({"price": val, "time": data.loc[i, "timestamp"]})
+            pivots.append({"price": val, "time": data.loc[i, "timestamp"], "index": i, "kind": "pivot", "weight": 1.0})
     return pivots
 
 
@@ -1290,24 +1291,152 @@ def _cluster_zone(prices: list[float], current_price: float, side: str, atr: flo
     return low, high, len(best)
 
 
+def _liquidity_ref_atr(current_price: float, atr: float | None) -> float:
+    """ATR tham chiếu để gom vùng. Fallback theo % giá để tránh vùng quá mỏng khi ATR rỗng."""
+    return max(float(atr or 0), current_price * 0.0018)
+
+
+def _liquidity_tolerance(current_price: float, atr: float | None, role: str = "main") -> float:
+    ref_atr = _liquidity_ref_atr(current_price, atr)
+    role_mult = {"near": 0.20, "main": 0.24, "deep": 0.28}.get(role, 0.24)
+    return max(ref_atr * role_mult, current_price * 0.00065)
+
+
+def _liquidity_buffer(current_price: float, atr: float | None, role: str = "main") -> float:
+    ref_atr = _liquidity_ref_atr(current_price, atr)
+    role_mult = {"near": 0.12, "main": 0.14, "deep": 0.16}.get(role, 0.14)
+    return max(ref_atr * role_mult, current_price * 0.00035)
+
+
+def _candle_wick_stats(row) -> tuple[float, float, float, float]:
+    open_ = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
+    rng = max(high - low, 1e-12)
+    upper = max(high - max(open_, close), 0.0) / rng
+    lower = max(min(open_, close) - low, 0.0) / rng
+    body = abs(close - open_) / rng
+    return upper, lower, body, rng
+
+
+def _collect_liquidity_points(
+    window_df: pd.DataFrame | None,
+    side: str,
+    current_price: float,
+    atr: float | None,
+    role: str = "main",
+) -> list[dict]:
+    """Thu thập điểm thanh khoản ước lượng từ pivot, equal high/low và nến quét râu.
+
+    Mục tiêu là chọn vùng có ý nghĩa giao dịch nhất, không phải ép near/main/deep
+    phải cách xa nhau. Nếu cùng một cụm được chạm nhiều lần trong nhiều cửa sổ,
+    vùng đó có thể xuất hiện lại, nhưng sẽ có thống kê chạm/quét/vol để AI hiểu
+    đúng chất lượng vùng.
+    """
+    if window_df is None or window_df.empty:
+        return []
+
+    data = window_df.reset_index(drop=True)
+    left_right = 1 if len(data) < 12 else 2
+    points = _find_pivots(data, side, lookback=None, left=left_right, right=left_right)
+    tol = _liquidity_tolerance(current_price, atr, role)
+
+    col = "high" if side == "high" else "low"
+
+    # Thêm các cú rút râu/quét đỉnh-đáy. Đây thường là nơi stop/liq bị quét.
+    for i, row in data.iterrows():
+        upper_wick, lower_wick, body_pct, _rng = _candle_wick_stats(row)
+        price = float(row[col])
+        if side == "high":
+            is_sweep_like = upper_wick >= 0.32 and upper_wick >= body_pct * 0.8
+        else:
+            is_sweep_like = lower_wick >= 0.32 and lower_wick >= body_pct * 0.8
+        if is_sweep_like:
+            points.append({
+                "price": price,
+                "time": row.get("timestamp"),
+                "index": int(i),
+                "kind": "wick_sweep",
+                "weight": 1.25,
+            })
+
+    # Thêm các cụm equal high/equal low: 2 lần chạm gần nhau trong phạm vi tol.
+    # Không thêm mọi nến để tránh biến thành volume profile giả.
+    values = [float(v) for v in data[col].tail(min(len(data), 80)).tolist()]
+    offset = len(data) - len(values)
+    for i in range(1, len(values)):
+        prev = values[i - 1]
+        cur = values[i]
+        if abs(cur - prev) <= tol:
+            row = data.iloc[offset + i]
+            points.append({
+                "price": cur,
+                "time": row.get("timestamp"),
+                "index": int(offset + i),
+                "kind": "equal_touch",
+                "weight": 0.85,
+            })
+
+    # Luôn thêm cực trị của cửa sổ để không bỏ sót high/low quan trọng khi pivot rỗng.
+    if not data.empty:
+        if side == "high":
+            idx = int(data["high"].idxmax())
+            price = float(data.loc[idx, "high"])
+        else:
+            idx = int(data["low"].idxmin())
+            price = float(data.loc[idx, "low"])
+        points.append({
+            "price": price,
+            "time": data.loc[idx, "timestamp"],
+            "index": idx,
+            "kind": "window_extreme",
+            "weight": 0.9,
+        })
+
+    return points
+
+
+def _zone_side_state(zone: tuple | None, current_price: float | None) -> str:
+    if not zone or current_price is None:
+        return "unknown"
+    low = zone[0] if len(zone) > 0 else None
+    high = zone[1] if len(zone) > 1 else None
+    if low is None or high is None:
+        return "unknown"
+    if float(low) <= current_price <= float(high):
+        return "touching"
+    if float(high) < current_price:
+        return "below"
+    if float(low) > current_price:
+        return "above"
+    return "overlap"
+
+
+def _zone_meta_default(role: str = "main") -> dict:
+    return {"role": role, "touches": 0, "sweeps": 0, "vol_ratio": None, "score": 0.0}
+
+
 def _cluster_zone_from_pivots(
     pivots: list[dict],
     current_price: float,
     side: str,
     atr: float | None,
     window_df: pd.DataFrame | None,
-) -> tuple[float | None, float | None, int]:
-    """Gom pivot/equal high-low thành vùng và chấm điểm vùng tốt nhất.
+    role: str = "main",
+) -> tuple[float | None, float | None, int, dict]:
+    """Gom điểm thanh khoản thành vùng và chọn vùng có chất lượng cao nhất.
 
-    Không chỉ chọn vùng gần nhất nữa. Vùng được ưu tiên khi có nhiều lần chạm,
-    còn mới, và không quá xa giá hiện tại. Đây vẫn là vùng quét kỹ thuật, không
-    phải liquidation heatmap thật.
+    Điểm số ưu tiên vùng có nhiều lần chạm, có quét râu, volume tốt, còn mới và
+    khoảng cách hợp vai trò. Không ép vùng phải tách xa nhau; nếu thị trường thật
+    sự đang giao dịch quanh cùng một cụm thanh khoản thì vùng gần/chính/sâu có
+    thể gần nhau, nhưng metadata sẽ báo rõ đang chạm giá/trùng vai trò.
     """
     if not pivots:
-        return None, None, 0
+        return None, None, 0, _zone_meta_default(role)
 
-    tol = max((atr or 0) * 0.22, current_price * 0.0009)
-    buf = max((atr or 0) * 0.16, current_price * 0.00055)
+    tol = _liquidity_tolerance(current_price, atr, role)
+    buf = _liquidity_buffer(current_price, atr, role)
     sorted_pivots = sorted(pivots, key=lambda p: float(p["price"]))
 
     clusters: list[list[dict]] = []
@@ -1327,46 +1456,162 @@ def _cluster_zone_from_pivots(
         candidates = [c for c in clusters if (sum(float(p["price"]) for p in c) / len(c)) >= current_price]
 
     if not candidates:
-        return None, None, 0
+        return None, None, 0, _zone_meta_default(role)
 
-    ref_time = None
-    if window_df is not None and not window_df.empty:
-        ref_time = window_df["timestamp"].max()
+    data = window_df.reset_index(drop=True) if window_df is not None and not window_df.empty else None
+    ref_time = data["timestamp"].max() if data is not None and "timestamp" in data.columns else None
+    ref_atr = _liquidity_ref_atr(current_price, atr)
 
-    def score(cluster: list[dict]) -> float:
+    def cluster_stats(cluster: list[dict]) -> dict:
         prices = [float(p["price"]) for p in cluster]
+        raw_low, raw_high = min(prices), max(prices)
+        low, high = raw_low - buf, raw_high + buf
         center = sum(prices) / len(prices)
-        hits_score = min(len(cluster), 5) * 2.0
-        distance_pct = abs(center - current_price) / max(current_price, 1e-12)
-        # 0.0 -> 2.5 điểm nếu sát giá; mất điểm dần khi quá xa khoảng 8%.
-        distance_score = max(0.0, 1.0 - distance_pct / 0.08) * 2.5
+        touch_count = 0
+        sweep_count = 0
+        vol_values: list[float] = []
+        recent_touch_age_hours = None
+
+        if data is not None:
+            for _, row in data.iterrows():
+                high_v = float(row["high"])
+                low_v = float(row["low"])
+                close_v = float(row["close"])
+                open_v = float(row["open"])
+                upper_wick, lower_wick, body_pct, _rng = _candle_wick_stats(row)
+                price_v = high_v if side == "high" else low_v
+                touched = (low - tol) <= price_v <= (high + tol)
+                if touched:
+                    touch_count += 1
+                    vol_ratio = _safe_float(row.get("vol_ratio"))
+                    if vol_ratio is not None and np.isfinite(vol_ratio):
+                        vol_values.append(float(vol_ratio))
+                    if ref_time is not None:
+                        try:
+                            age = max((pd.Timestamp(ref_time) - pd.Timestamp(row["timestamp"])).total_seconds() / 3600.0, 0.0)
+                            recent_touch_age_hours = age if recent_touch_age_hours is None else min(recent_touch_age_hours, age)
+                        except Exception:
+                            pass
+
+                if side == "high":
+                    # Quét lên: chọc qua vùng high/liquidity rồi đóng thấp lại với râu trên rõ.
+                    swept = high_v >= low and close_v < center and upper_wick >= 0.25 and high_v > max(open_v, close_v)
+                else:
+                    # Quét xuống: chọc xuống vùng low/liquidity rồi đóng cao lại với râu dưới rõ.
+                    swept = low_v <= high and close_v > center and lower_wick >= 0.25 and low_v < min(open_v, close_v)
+                if swept:
+                    sweep_count += 1
+
+        if touch_count == 0:
+            touch_count = len(cluster)
+
+        avg_vol = float(np.mean(vol_values)) if vol_values else None
+        point_weight = sum(float(p.get("weight", 1.0)) for p in cluster)
+        pivot_hits = sum(1 for p in cluster if p.get("kind") == "pivot")
+        equal_hits = sum(1 for p in cluster if p.get("kind") == "equal_touch")
+        wick_hits = sum(1 for p in cluster if p.get("kind") == "wick_sweep")
+
+        distance_atr = abs(center - current_price) / max(ref_atr, 1e-12)
+        if role == "near":
+            distance_score = max(0.0, 1.0 - distance_atr / 4.0) * 1.8
+        elif role == "deep":
+            # Deep không bị ép xa, nhưng không thưởng quá mạnh cho vùng đang sát giá.
+            distance_score = max(0.0, min(distance_atr / 3.0, 1.0)) * 0.8
+        else:
+            distance_score = max(0.0, 1.0 - abs(distance_atr - 1.6) / 5.0) * 1.1
+
         recency_score = 0.0
-        if ref_time is not None:
+        if recent_touch_age_hours is not None:
+            recency_score = 1.2 / (1.0 + recent_touch_age_hours / 18.0)
+        elif ref_time is not None:
             try:
-                last_touch = max(pd.Timestamp(p["time"]) for p in cluster)
+                last_touch = max(pd.Timestamp(p["time"]) for p in cluster if p.get("time") is not None)
                 age_hours = max((pd.Timestamp(ref_time) - last_touch).total_seconds() / 3600.0, 0.0)
-                recency_score = 1.5 / (1.0 + age_hours / 24.0)
+                recency_score = 0.9 / (1.0 + age_hours / 24.0)
             except Exception:
                 recency_score = 0.0
-        return hits_score + distance_score + recency_score
 
-    best = max(candidates, key=score)
-    prices = [float(p["price"]) for p in best]
-    return min(prices) - buf, max(prices) + buf, len(best)
+        vol_score = 0.0
+        if avg_vol is not None:
+            # Volume cao là tốt, nhưng không để một cây volume dị thường áp đảo mọi thứ.
+            vol_score = min(max(avg_vol - 0.8, 0.0), 1.8) * 0.8
+
+        score = (
+            min(point_weight, 8.0) * 1.1
+            + min(touch_count, 8) * 0.9
+            + min(sweep_count, 5) * 1.25
+            + min(pivot_hits, 5) * 0.35
+            + min(equal_hits, 5) * 0.25
+            + min(wick_hits, 5) * 0.35
+            + vol_score
+            + recency_score
+            + distance_score
+        )
+
+        return {
+            "low": low,
+            "high": high,
+            "center": center,
+            "hits": max(len(cluster), touch_count),
+            "touches": touch_count,
+            "sweeps": sweep_count,
+            "vol_ratio": avg_vol,
+            "score": score,
+            "distance_atr": distance_atr,
+            "pivot_hits": pivot_hits,
+            "equal_hits": equal_hits,
+            "wick_hits": wick_hits,
+            "role": role,
+        }
+
+    scored = [cluster_stats(c) for c in candidates]
+    best = max(scored, key=lambda m: m["score"])
+    meta = {
+        "role": role,
+        "touches": int(best["touches"]),
+        "sweeps": int(best["sweeps"]),
+        "vol_ratio": best["vol_ratio"],
+        "score": round(float(best["score"]), 2),
+        "distance_atr": round(float(best["distance_atr"]), 2),
+        "pivot_hits": int(best["pivot_hits"]),
+        "equal_hits": int(best["equal_hits"]),
+        "wick_hits": int(best["wick_hits"]),
+    }
+    return best["low"], best["high"], int(best["hits"]), meta
 
 
-def _fallback_zone(df: pd.DataFrame | None, side: str, current_price: float, atr: float | None, window: int | None = None) -> tuple[float | None, float | None]:
+def _fallback_zone(
+    df: pd.DataFrame | None,
+    side: str,
+    current_price: float,
+    atr: float | None,
+    window: int | None = None,
+    role: str = "main",
+) -> tuple[float | None, float | None, dict]:
     if df is None or df.empty:
-        return None, None
+        return None, None, _zone_meta_default(role)
     data = df.tail(window) if window else df
     if data.empty:
-        return None, None
-    buf = max((atr or 0) * 0.16, current_price * 0.00055)
+        return None, None, _zone_meta_default(role)
+    buf = _liquidity_buffer(current_price, atr, role)
     if side == "low":
-        price = float(data["low"].min())
+        idx = data["low"].idxmin()
+        price = float(data.loc[idx, "low"])
     else:
-        price = float(data["high"].max())
-    return price - buf, price + buf
+        idx = data["high"].idxmax()
+        price = float(data.loc[idx, "high"])
+
+    low, high = price - buf, price + buf
+    # Nếu toàn bộ cực trị fallback đã nằm sai phía so với giá hiện tại thì báo N/A.
+    # Ví dụ giá vừa phá đỉnh 48h, không nên lấy đỉnh cũ dưới giá làm “vùng trên”.
+    if side == "high" and high < current_price:
+        return None, None, _zone_meta_default(role)
+    if side == "low" and low > current_price:
+        return None, None, _zone_meta_default(role)
+
+    meta = _zone_meta_default(role)
+    meta.update({"touches": 1, "score": 1.0, "fallback": True})
+    return low, high, meta
 
 
 def _zone_for_window(
@@ -1376,18 +1621,20 @@ def _zone_for_window(
     side: str,
     hours: int,
     max_candles: int | None = None,
-) -> tuple[float | None, float | None, int]:
+    role: str = "main",
+) -> tuple[float | None, float | None, int, dict]:
     data = _window_tail(df, hours=hours, max_candles=max_candles)
     if data is None or data.empty:
-        return None, None, 0
-    # Cửa sổ nhỏ vẫn cần pivot. Nếu quá ít nến thì giảm left/right để không rỗng hết.
-    left_right = 1 if len(data) < 12 else 2
-    pivots = _find_pivots(data, side, lookback=None, left=left_right, right=left_right)
-    low, high, hits = _cluster_zone_from_pivots(pivots, current_price, side, atr, data)
+        return None, None, 0, _zone_meta_default(role)
+
+    points = _collect_liquidity_points(data, side, current_price, atr, role)
+    low, high, hits, meta = _cluster_zone_from_pivots(points, current_price, side, atr, data, role)
     if low is None or high is None:
-        low, high = _fallback_zone(data, side, current_price, atr)
+        low, high, meta = _fallback_zone(data, side, current_price, atr, role=role)
         hits = 1 if low is not None else 0
-    return low, high, hits
+    meta = dict(meta or _zone_meta_default(role))
+    meta["side_state"] = _zone_side_state((low, high, hits, meta), current_price)
+    return low, high, hits, meta
 
 
 def _liquidity_zones_by_windows(
@@ -1395,10 +1642,14 @@ def _liquidity_zones_by_windows(
     mode: str,
     current_price: float,
 ) -> dict:
-    """Vùng quét kỹ thuật theo cửa sổ thời gian.
+    """Vùng quét kỹ thuật theo cửa sổ thời gian và chất lượng hành vi giá.
 
     SCALP dùng tinh thần 12h/24h/48h: nến nhỏ giữ độ phân giải, cửa sổ thời gian
     giữ phạm vi giống cách xem heatmap hơn. SWING dùng 24h/3D/7D.
+
+    near/main/deep là vai trò + cửa sổ dữ liệu, không phải lệnh ép các vùng phải
+    cách xa nhau. Nếu vùng gần/chính/sâu trùng nhau vì cùng một cụm thanh khoản
+    đang chi phối thị trường, output sẽ giữ vùng đó và ghi metadata chạm/quét/vol.
     """
     if mode == "short":
         near_df = timeframe_data.get("15M")
@@ -1433,8 +1684,8 @@ def _liquidity_zones_by_windows(
 
     result: dict = {"meta": [label for _, label, *_ in windows]}
     for key, label, df, atr, hours, max_candles in windows:
-        lower = _zone_for_window(df, current_price, atr, "low", hours, max_candles)
-        upper = _zone_for_window(df, current_price, atr, "high", hours, max_candles)
+        lower = _zone_for_window(df, current_price, atr, "low", hours, max_candles, role=key)
+        upper = _zone_for_window(df, current_price, atr, "high", hours, max_candles, role=key)
         result[f"lower_{key}"] = lower
         result[f"upper_{key}"] = upper
         result[f"label_{key}"] = label
@@ -1449,14 +1700,14 @@ def _liquidity_zones(df: pd.DataFrame | None, current_price: float, atr: float |
     short_low, short_high, short_hits = _cluster_zone(high_pivots, current_price, "high", atr)
 
     if long_low is None or long_high is None:
-        long_low, long_high = _fallback_zone(df, "low", current_price, atr, 80)
+        long_low, long_high, _meta = _fallback_zone(df, "low", current_price, atr, 80, role="near")
         long_hits = 1 if long_low is not None else 0
     if short_low is None or short_high is None:
-        short_low, short_high = _fallback_zone(df, "high", current_price, atr, 80)
+        short_low, short_high, _meta = _fallback_zone(df, "high", current_price, atr, 80, role="near")
         short_hits = 1 if short_low is not None else 0
 
-    deep_long_low, deep_long_high = _fallback_zone(df, "low", current_price, atr, 150)
-    deep_short_low, deep_short_high = _fallback_zone(df, "high", current_price, atr, 150)
+    deep_long_low, deep_long_high, _meta = _fallback_zone(df, "low", current_price, atr, 150, role="deep")
+    deep_short_low, deep_short_high, _meta = _fallback_zone(df, "high", current_price, atr, 150, role="deep")
     return {
         "long_near": (long_low, long_high, long_hits),
         "short_near": (short_low, short_high, short_hits),
@@ -1465,23 +1716,73 @@ def _liquidity_zones(df: pd.DataFrame | None, current_price: float, atr: float |
     }
 
 
-def _fmt_zone_tuple(zone: tuple | None) -> str:
+def _fmt_zone_tuple(zone: tuple | None, current_price: float | None = None) -> str:
     if not zone:
         return "N/A"
     low = zone[0] if len(zone) > 0 else None
     high = zone[1] if len(zone) > 1 else None
     hits = zone[2] if len(zone) > 2 else 0
-    hit_text = f", {hits} điểm" if hits else ""
-    return f"{fmt(low)}–{fmt(high)}{hit_text}"
+    meta = zone[3] if len(zone) > 3 and isinstance(zone[3], dict) else {}
+    if low is None or high is None:
+        return "N/A"
+
+    details: list[str] = []
+    touches = meta.get("touches")
+    sweeps = meta.get("sweeps")
+    vol_ratio = meta.get("vol_ratio")
+    distance_atr = meta.get("distance_atr")
+
+    if touches:
+        details.append(f"{int(touches)} chạm")
+    elif hits:
+        details.append(f"{int(hits)} điểm")
+    if sweeps:
+        details.append(f"quét {int(sweeps)}")
+    if vol_ratio is not None and np.isfinite(vol_ratio):
+        details.append(f"vol {float(vol_ratio):.2f}x")
+    if distance_atr is not None and np.isfinite(distance_atr):
+        details.append(f"~{float(distance_atr):.1f}ATR")
+    if current_price is not None and float(low) <= current_price <= float(high):
+        details.append("đang chạm giá")
+    if meta.get("fallback"):
+        details.append("fallback cực trị")
+
+    detail_text = f" ({', '.join(details)})" if details else ""
+    return f"{fmt(low)}–{fmt(high)}{detail_text}"
 
 
-def _format_liquidity_window_line(prefix: str, zones: dict, side: str) -> str:
+def _zones_have_meaningful_overlap(a: tuple | None, b: tuple | None) -> bool:
+    if not a or not b:
+        return False
+    a_low, a_high = a[0], a[1]
+    b_low, b_high = b[0], b[1]
+    if a_low is None or a_high is None or b_low is None or b_high is None:
+        return False
+    overlap = max(0.0, min(float(a_high), float(b_high)) - max(float(a_low), float(b_low)))
+    width = max(min(float(a_high) - float(a_low), float(b_high) - float(b_low)), 1e-12)
+    return overlap / width >= 0.55
+
+
+def _liquidity_overlap_note(zones: dict, side: str) -> str:
+    pairs = [
+        ("gần", "chính", zones.get(f"{side}_near"), zones.get(f"{side}_main")),
+        ("chính", "sâu", zones.get(f"{side}_main"), zones.get(f"{side}_deep")),
+        ("gần", "sâu", zones.get(f"{side}_near"), zones.get(f"{side}_deep")),
+    ]
+    overlapped = [f"{a}/{b}" for a, b, za, zb in pairs if _zones_have_meaningful_overlap(za, zb)]
+    if not overlapped:
+        return ""
+    return f" | Lưu ý: vùng {', '.join(overlapped)} đang trùng mạnh, xem là cùng một cụm thanh khoản thay vì 3 mục tiêu riêng."
+
+
+def _format_liquidity_window_line(prefix: str, zones: dict, side: str, current_price: float | None = None) -> str:
     # side = lower hoặc upper
     return (
         f"- {prefix}: "
-        f"{zones.get('label_near', 'gần')} {_fmt_zone_tuple(zones.get(f'{side}_near'))}; "
-        f"{zones.get('label_main', 'chính')} {_fmt_zone_tuple(zones.get(f'{side}_main'))}; "
-        f"{zones.get('label_deep', 'sâu')} {_fmt_zone_tuple(zones.get(f'{side}_deep'))}"
+        f"{zones.get('label_near', 'gần')} {_fmt_zone_tuple(zones.get(f'{side}_near'), current_price)}; "
+        f"{zones.get('label_main', 'chính')} {_fmt_zone_tuple(zones.get(f'{side}_main'), current_price)}; "
+        f"{zones.get('label_deep', 'sâu')} {_fmt_zone_tuple(zones.get(f'{side}_deep'), current_price)}"
+        f"{_liquidity_overlap_note(zones, side)}"
     )
 
 def _structure_info(df: pd.DataFrame | None, current_price: float | None) -> dict:
@@ -1812,8 +2113,8 @@ def build_feature_engineering_block(
         f"- Chuỗi nến {main_label}: {_consecutive_candles(main_df)} | Nến cuối: {_wick_body_info(main_df)}",
         f"- Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}–{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}–{fmt(structure.get('major_high'))}",
         f"- Fibonacci {structure_label}: 0.382={fmt(fib.get('0.382'))}; 0.5={fmt(fib.get('0.5'))}; 0.618={fmt(fib.get('0.618'))}",
-        _format_liquidity_window_line("Vùng thanh khoản dưới giá ước lượng", zones, "lower"),
-        _format_liquidity_window_line("Vùng thanh khoản trên giá ước lượng", zones, "upper"),
+        _format_liquidity_window_line("Vùng thanh khoản dưới giá ước lượng", zones, "lower", price),
+        _format_liquidity_window_line("Vùng thanh khoản trên giá ước lượng", zones, "upper", price),
         "- Vai trò vùng quét: Entry ưu tiên dùng vùng gần/chính nếu hợp xu hướng và có xác nhận; không dùng vùng sâu làm Entry scalp mặc định. TP dùng vùng đối diện: TP1 ưu tiên vùng đối diện gần/chính, TP2 có thể dùng vùng đối diện chính/sâu. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay trong vùng quét.",
         "- Quy tắc rủi ro: AI tự lập Entry/SL/TP. Rủi ro tham chiếu là mốc chống nhiễu, không phải lệnh bắt buộc; Entry–SL có thể thấp hơn một chút nếu có đỉnh/đáy vô hiệu rõ. TP1 nên khoảng >= 0.8R, TP2 nên khoảng >= 1.3R, không kéo TP quá xa chỉ để đẹp tỷ lệ.",
         "- Ghi chú: Vùng quét là vùng thanh khoản kỹ thuật ước lượng theo cửa sổ thời gian, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật, không phải lệnh giao dịch chốt sẵn.",
@@ -1875,8 +2176,8 @@ def build_feature_snapshot(
         compact_tf(big_label, big_df),
         f"Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}-{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}-{fmt(structure.get('major_high'))}",
         f"Fib {structure_label}: 0.382 {fmt(fib.get('0.382'))}, 0.5 {fmt(fib.get('0.5'))}, 0.618 {fmt(fib.get('0.618'))}",
-        f"Vùng dưới: {zones.get('label_near')} {_fmt_zone_tuple(zones.get('lower_near'))}; {zones.get('label_main')} {_fmt_zone_tuple(zones.get('lower_main'))}; {zones.get('label_deep')} {_fmt_zone_tuple(zones.get('lower_deep'))}",
-        f"Vùng trên: {zones.get('label_near')} {_fmt_zone_tuple(zones.get('upper_near'))}; {zones.get('label_main')} {_fmt_zone_tuple(zones.get('upper_main'))}; {zones.get('label_deep')} {_fmt_zone_tuple(zones.get('upper_deep'))}",
+        f"Vùng dưới: {zones.get('label_near')} {_fmt_zone_tuple(zones.get('lower_near'), price)}; {zones.get('label_main')} {_fmt_zone_tuple(zones.get('lower_main'), price)}; {zones.get('label_deep')} {_fmt_zone_tuple(zones.get('lower_deep'), price)}",
+        f"Vùng trên: {zones.get('label_near')} {_fmt_zone_tuple(zones.get('upper_near'), price)}; {zones.get('label_main')} {_fmt_zone_tuple(zones.get('upper_main'), price)}; {zones.get('label_deep')} {_fmt_zone_tuple(zones.get('upper_deep'), price)}",
         f"ATR/risk: ATR {main_label} {fmt(atr_main)}, ATR {structure_label} {fmt(atr_structure)}, rủi ro tham chiếu {fmt(risk)}",
         f"Nến {main_label}: {_consecutive_candles(main_df)}; {_wick_body_info(main_df)}",
     ]
