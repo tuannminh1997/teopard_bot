@@ -53,11 +53,13 @@ SHORT_TERM_TIMEFRAMES = {
     "4H":  ("4h",  180),
 }
 
-# Dài hạn: swing/position — 4H entry, 1D xu hướng, 1W big picture
+# Dài hạn: swing/position — 1H kiểm tra sweep, 4H entry, 1D xu hướng, 1W big picture
+# 1H chỉ dùng làm dữ liệu xác nhận rút râu/quét thanh khoản; khung lập lệnh SWING vẫn là 4H/1D/1W.
 LONG_TERM_TIMEFRAMES = {
-    "4H": ("4h",  150),
+    "1H": ("1h",  240),
+    "4H": ("4h",  180),
     "1D": ("1d",  150),
-    "1W": ("1w",  100),
+    "1W": ("1w",  120),
 }
 
 # V4 lifecycle
@@ -1709,10 +1711,13 @@ def _liq_role_params(role: str, mode: str = "short") -> dict:
             "deep": {"tol_pct": 0.00045, "box_pct": 0.00135, "min_box_pct": 0.00045, "max_box_pct": 0.00190, "atr_mult": 0.20, "target_atr": 2.6},
         }
     else:
+        # SWING dùng H4/D1/W1 nên box được phép rộng hơn scalp, nhưng vẫn là stop-pool
+        # nằm ngoài swing high/low, không phải một dải sideway quanh giá hiện tại.
+        # near H4: vùng quanh swing gần để canh Entry; main D1: vùng TP/SL chính; deep W1/D1: vùng xa.
         params = {
-            "near": {"tol_pct": 0.00045, "box_pct": 0.00120, "min_box_pct": 0.00045, "max_box_pct": 0.00220, "atr_mult": 0.14, "target_atr": 1.0},
-            "main": {"tol_pct": 0.00060, "box_pct": 0.00180, "min_box_pct": 0.00060, "max_box_pct": 0.00320, "atr_mult": 0.18, "target_atr": 2.0},
-            "deep": {"tol_pct": 0.00080, "box_pct": 0.00280, "min_box_pct": 0.00080, "max_box_pct": 0.00480, "atr_mult": 0.22, "target_atr": 3.2},
+            "near": {"tol_pct": 0.00055, "box_pct": 0.00180, "min_box_pct": 0.00070, "max_box_pct": 0.00320, "atr_mult": 0.16, "target_atr": 1.2},
+            "main": {"tol_pct": 0.00085, "box_pct": 0.00350, "min_box_pct": 0.00110, "max_box_pct": 0.00650, "atr_mult": 0.22, "target_atr": 2.5},
+            "deep": {"tol_pct": 0.00120, "box_pct": 0.00550, "min_box_pct": 0.00160, "max_box_pct": 0.01000, "atr_mult": 0.28, "target_atr": 4.0},
         }
     return params.get(role, params["main"])
 
@@ -2009,7 +2014,7 @@ def _liquidity_zones_by_windows(
 
     Theo gợi ý OHLCV-only: khung lớn xác định level, khung nhỏ xác nhận sweep.
     SCALP: 1H cho vùng gần, 4H cho vùng chính/sâu, 15M chỉ kiểm tra sweep.
-    SWING: 4H cho vùng gần, 1D cho vùng chính/sâu.
+    SWING: H4 cho vùng gần, D1 cho vùng chính, W1/D1 cho vùng sâu, 1H/4H chỉ kiểm tra sweep.
     """
     if mode == "short":
         sweep_df = timeframe_data.get("15M")
@@ -2023,14 +2028,16 @@ def _liquidity_zones_by_windows(
         ]
         calc_mode = "short"
     else:
-        sweep_df = timeframe_data.get("4H")
+        # SWING: level lấy từ H4/D1/W1, sweep lấy từ 1H trước rồi fallback 4H.
+        # Không dùng 1H để tạo liquidity box vì sẽ khiến vùng swing bị nhiễu như scalp.
+        sweep_df = _first_valid_df(timeframe_data.get("1H"), timeframe_data.get("4H"))
         near_df = timeframe_data.get("4H")
         main_df = _first_valid_df(timeframe_data.get("1D"), timeframe_data.get("4H"))
-        deep_df = _first_valid_df(timeframe_data.get("1D"), timeframe_data.get("1W"), timeframe_data.get("4H"))
+        deep_df = _first_valid_df(timeframe_data.get("1W"), timeframe_data.get("1D"), timeframe_data.get("4H"))
         windows = [
-            ("near", "gần H4", near_df, _current_atr(near_df), 90, 2),
-            ("main", "chính D1", main_df, _current_atr(main_df) or _current_atr(near_df), 60, 2),
-            ("deep", "sâu D1", deep_df, _current_atr(deep_df) or _current_atr(main_df), 90, 3),
+            ("near", "gần H4", near_df, _current_atr(near_df) or _current_atr(sweep_df), 120, 2),
+            ("main", "chính D1", main_df, _current_atr(main_df) or _current_atr(near_df), 90, 2),
+            ("deep", "sâu W1/D1", deep_df, _current_atr(deep_df) or _current_atr(main_df), 120, 3),
         ]
         calc_mode = "long"
 
@@ -2474,7 +2481,7 @@ def build_feature_engineering_block(
         f"- Fibonacci {structure_label}: 0.382={fmt(fib.get('0.382'))}; 0.5={fmt(fib.get('0.5'))}; 0.618={fmt(fib.get('0.618'))}",
         _format_liquidity_window_line("Vùng thanh khoản dưới giá ước lượng", zones, "lower", price),
         _format_liquidity_window_line("Vùng thanh khoản trên giá ước lượng", zones, "upper", price),
-        "- Vai trò vùng quét: Entry ưu tiên dùng vùng gần/chính nếu hợp xu hướng và có xác nhận; không dùng vùng sâu làm Entry scalp mặc định. TP dùng vùng đối diện: TP1 ưu tiên vùng đối diện gần/chính, TP2 có thể dùng vùng đối diện chính/sâu. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay trong vùng quét.",
+        "- Vai trò vùng quét: Entry ưu tiên dùng vùng gần/chính nếu hợp xu hướng và có xác nhận. Với SCALP không dùng vùng sâu làm Entry mặc định; với SWING, vùng sâu chỉ dùng khi đó là pullback lớn có xác nhận H4/1H rõ. TP dùng vùng đối diện: TP1 ưu tiên vùng đối diện gần/chính, TP2 có thể dùng vùng đối diện chính/sâu. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay trong vùng quét.",
         "- Quy tắc rủi ro: AI tự lập Entry/SL/TP. Rủi ro tham chiếu là mốc chống nhiễu, không phải lệnh bắt buộc; Entry–SL có thể thấp hơn một chút nếu có đỉnh/đáy vô hiệu rõ. TP1 nên khoảng >= 0.8R, TP2 nên khoảng >= 1.3R, không kéo TP quá xa chỉ để đẹp tỷ lệ.",
         "- Ghi chú: Vùng quét là vùng thanh khoản kỹ thuật ước lượng theo cửa sổ thời gian, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật, không phải lệnh giao dịch chốt sẵn.",
     ]
@@ -2523,7 +2530,7 @@ def build_feature_snapshot(
             ema = "EMA đan xen"
         return (
             f"{label}: close {fmt(last['close'])}, {ema}, "
-            f"RSI14 {fmt(last['rsi_14'], 1)}, MACD_hist {fmt(last['macd_hist'], 4)}, "
+            f"RSI14 {fmt(last['rsi_14'], 1)}, {macd_momentum_text(last['macd_hist'])}, "
             f"ATR14 {fmt(last.get('atr_14'))}, vol {fmt(last['vol_ratio'], 2)}x"
         )
 
@@ -2553,6 +2560,18 @@ def fmt(v, decimals: int = 2) -> str:
     if abs(v) >= 1:
         return f"{v:,.4f}"
     return f"{v:,.8f}"
+
+
+def macd_momentum_text(macd_hist: float | None, decimals: int = 4) -> str:
+    """Diễn giải MACD histogram bằng tiếng Việt để không lộ jargon `Hist` ra output."""
+    if macd_hist is None or (isinstance(macd_hist, float) and np.isnan(macd_hist)):
+        return "động lượng MACD N/A"
+    value = fmt(macd_hist, decimals)
+    if macd_hist > 0:
+        return f"động lượng MACD dương {value}"
+    if macd_hist < 0:
+        return f"động lượng MACD âm {value}"
+    return "động lượng MACD trung tính 0"
 
 
 def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
@@ -2598,7 +2617,7 @@ def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
         f"  Giá: {fmt(last['close'])} | Nến trước: {fmt(prev['close'])}",
         f"  EMA7={fmt(ema7)} EMA25={fmt(ema25)} EMA50={fmt(ema50)} → {ema_align}",
         f"  RSI(6)={fmt(last['rsi_6'],1)} RSI(14)={fmt(last['rsi_14'],1)}",
-        f"  MACD={fmt(last['macd_line'],4)} Signal={fmt(last['macd_signal'],4)} Hist={fmt(last['macd_hist'],4)} → {macd_dir}{macd_cross}",
+        f"  MACD={fmt(last['macd_line'],4)} Signal={fmt(last['macd_signal'],4)}; {macd_momentum_text(last['macd_hist'])} → {macd_dir}{macd_cross}",
         f"  ATR14={fmt(last.get('atr_14'))} ({fmt(last.get('atr_pct'),2)}%)",
         f"  Volume={fmt(last['vol_ratio'],2)}x → {vol_lbl}",
         f"  Nến hiện tại: {_consecutive_candles(df)} | {_wick_body_info(df)}",
@@ -2634,7 +2653,7 @@ def build_market_snapshot(
         lines.append(
             f"{label}: close={fmt(last['close'])}, EMA={ema_align} "
             f"(7={fmt(last['ema_7'])},25={fmt(last['ema_25'])},50={fmt(last['ema_50'])}), "
-            f"RSI14={fmt(last['rsi_14'], 1)}, MACD_hist={fmt(last['macd_hist'], 4)}, "
+            f"RSI14={fmt(last['rsi_14'], 1)}, {macd_momentum_text(last['macd_hist'])}, "
             f"ATR14={fmt(last.get('atr_14'))}, vol={fmt(last['vol_ratio'], 2)}x"
         )
 
@@ -2998,6 +3017,7 @@ def summarize_reasoning(full_response: str) -> str:
                     "Tóm tắt trong 1-2 câu (tối đa 60 từ) lý do kỹ thuật chính "
                     "dẫn đến quyết định LONG/SHORT/NO_TRADE trong phân tích sau. "
                     "Chỉ nêu các chỉ báo cụ thể (EMA, RSI, MACD, volume, ATR, vùng giá) và mức giá. "
+                    "Không dùng chữ Hist, MACD_hist, Histogram; hãy viết động lượng MACD âm/dương hoặc MACD còn âm/dương. "
                     "Không giải thích, không lời mở đầu.\n\n"
                     + full_response[:2000]
                 ),
@@ -3008,7 +3028,7 @@ def summarize_reasoning(full_response: str) -> str:
             reasoning_effort=summary_effort,
             call_type="summary",
         )
-        return text.strip()
+        return sanitize_user_output(text.strip())
     except Exception as exc:
         print(f"Lỗi summarize_reasoning: {exc}", flush=True)
         return ""
@@ -3129,6 +3149,10 @@ def sanitize_user_output(output: str) -> str:
     # Replace longer internal labels first so overlapping terms do not leave fragments.
     for old in sorted(replacements, key=len, reverse=True):
         text = text.replace(old, replacements[old])
+
+    # Dọn riêng các nhãn MACD histogram bằng regex để không làm hỏng chữ như "history".
+    text = re.sub(r"\bMACD[_\s-]*hist(?:ogram)?\b", "động lượng MACD", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bhist(?:ogram)?\b", "động lượng MACD", text, flags=re.IGNORECASE)
     return text
 
 

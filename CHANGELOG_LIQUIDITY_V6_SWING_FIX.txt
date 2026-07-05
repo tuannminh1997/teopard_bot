@@ -1,0 +1,9 @@
+# Liquidity V6 - SWING calibration
+
+- Bổ sung dữ liệu 1H cho mode SWING để kiểm tra sweep/rút râu, nhưng không dùng 1H để tạo liquidity box.
+- SWING liquidity roles:
+  - near: H4 swing pool, dùng cho vùng entry/pullback gần.
+  - main: D1 swing pool, dùng cho vùng TP/SL/chờ phản ứng chính.
+  - deep: W1/D1 swing pool, dùng cho vùng xa/TP2/cảnh báo rủi ro.
+- Tách tham số SWING khỏi SCALP: box rộng hơn scalp theo bản chất H4/D1/W1 nhưng vẫn nằm ngoài swing high/low.
+- Prompt được cập nhật để AI không dùng vùng sâu làm entry swing nếu thiếu xác nhận H4/1H rõ.
