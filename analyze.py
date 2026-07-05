@@ -50,7 +50,7 @@ DB_PATH           = os.getenv("DB_PATH", "bot.db")
 SHORT_TERM_TIMEFRAMES = {
     "15M": ("15m", 200),
     "1H":  ("1h",  150),
-    "4H":  ("4h",  100),
+    "4H":  ("4h",  180),
 }
 
 # Dài hạn: swing/position — 4H entry, 1D xu hướng, 1W big picture
@@ -1692,6 +1692,357 @@ def _liquidity_zones_by_windows(
     return result
 
 
+
+# ─── Liquidity V5: fractal swing pools, not broad support/resistance bands ────
+# Ghi chú: các hàm bên dưới cố ý override bộ liquidity V4 ở trên.
+# Mục tiêu là ước lượng stop/liquidation pool từ OHLCV:
+# - Lấy swing/fractal high-low làm level thanh khoản.
+# - Box nằm NGOÀI swing: dưới đáy cho long liquidation, trên đỉnh cho short liquidation.
+# - M15/khung nhỏ chỉ dùng để đánh dấu đã có sweep, không dùng để tạo box rộng quanh giá.
+# - Không gom các level cách nhau xa thành một “cụm thanh khoản” rộng.
+
+def _liq_role_params(role: str, mode: str = "short") -> dict:
+    if mode == "short":
+        params = {
+            "near": {"tol_pct": 0.00028, "box_pct": 0.00075, "min_box_pct": 0.00028, "max_box_pct": 0.00105, "atr_mult": 0.12, "target_atr": 0.8},
+            "main": {"tol_pct": 0.00036, "box_pct": 0.00105, "min_box_pct": 0.00035, "max_box_pct": 0.00145, "atr_mult": 0.16, "target_atr": 1.6},
+            "deep": {"tol_pct": 0.00045, "box_pct": 0.00135, "min_box_pct": 0.00045, "max_box_pct": 0.00190, "atr_mult": 0.20, "target_atr": 2.6},
+        }
+    else:
+        params = {
+            "near": {"tol_pct": 0.00045, "box_pct": 0.00120, "min_box_pct": 0.00045, "max_box_pct": 0.00220, "atr_mult": 0.14, "target_atr": 1.0},
+            "main": {"tol_pct": 0.00060, "box_pct": 0.00180, "min_box_pct": 0.00060, "max_box_pct": 0.00320, "atr_mult": 0.18, "target_atr": 2.0},
+            "deep": {"tol_pct": 0.00080, "box_pct": 0.00280, "min_box_pct": 0.00080, "max_box_pct": 0.00480, "atr_mult": 0.22, "target_atr": 3.2},
+        }
+    return params.get(role, params["main"])
+
+
+def _liquidity_ref_atr(current_price: float, atr: float | None) -> float:
+    # Fallback thấp hơn bản cũ để scalp không gom vùng quá rộng khi ATR rỗng/lớn.
+    return max(float(atr or 0), current_price * 0.0012)
+
+
+def _liquidity_tolerance(current_price: float, atr: float | None, role: str = "main", mode: str = "short") -> float:
+    params = _liq_role_params(role, mode)
+    ref_atr = _liquidity_ref_atr(current_price, atr)
+    tol = max(current_price * params["tol_pct"], ref_atr * 0.055)
+    # Đây là tolerance để nhận equal high/equal low, không phải width của vùng.
+    return min(tol, current_price * params["max_box_pct"] * 0.45)
+
+
+def _liquidity_buffer(current_price: float, atr: float | None, role: str = "main", mode: str = "short") -> float:
+    # Giữ wrapper cũ cho fallback/legacy, nhưng V5 chủ yếu dùng _liq_box_width.
+    return _liq_box_width(current_price, atr, role, mode) * 0.50
+
+
+def _liq_box_width(current_price: float, atr: float | None, role: str, mode: str = "short") -> float:
+    params = _liq_role_params(role, mode)
+    ref_atr = _liquidity_ref_atr(current_price, atr)
+    raw = max(current_price * params["box_pct"], ref_atr * params["atr_mult"])
+    return min(max(raw, current_price * params["min_box_pct"]), current_price * params["max_box_pct"])
+
+
+def _fractal_swing_points(
+    df: pd.DataFrame | None,
+    side: str,
+    lookback: int | None = None,
+    m: int = 2,
+) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    data = df.tail(lookback).reset_index(drop=True) if lookback else df.reset_index(drop=True)
+    if len(data) < m * 2 + 1:
+        return []
+    col = "high" if side == "high" else "low"
+    points: list[dict] = []
+    for i in range(m, len(data) - m):
+        price = float(data.loc[i, col])
+        left = data.loc[i - m:i - 1, col]
+        right = data.loc[i + 1:i + m, col]
+        if side == "high":
+            is_swing = price > float(left.max()) and price >= float(right.max())
+        else:
+            is_swing = price < float(left.min()) and price <= float(right.min())
+        if not is_swing:
+            continue
+        vol_ratio = _safe_float(data.loc[i].get("vol_ratio"), 1.0) or 1.0
+        points.append({
+            "price": price,
+            "index": int(i),
+            "time": data.loc[i].get("timestamp"),
+            "volume_ratio": float(vol_ratio) if np.isfinite(vol_ratio) else 1.0,
+            "kind": "fractal",
+        })
+    return points
+
+
+def _equal_touch_score(data: pd.DataFrame | None, side: str, level: float, tol: float) -> int:
+    if data is None or data.empty:
+        return 0
+    col = "high" if side == "high" else "low"
+    vals = data[col].astype(float)
+    return int(((vals - level).abs() <= tol).sum())
+
+
+def _sweep_stats_against_level(
+    sweep_df: pd.DataFrame | None,
+    side: str,
+    level: float,
+    tol: float,
+) -> tuple[int, float | None]:
+    if sweep_df is None or sweep_df.empty:
+        return 0, None
+    sweeps = 0
+    vols: list[float] = []
+    data = sweep_df.tail(120).reset_index(drop=True)
+    for _, row in data.iterrows():
+        high = float(row["high"])
+        low = float(row["low"])
+        close = float(row["close"])
+        upper_wick, lower_wick, body_pct, _rng = _candle_wick_stats(row)
+        vol_ratio = _safe_float(row.get("vol_ratio"), 1.0) or 1.0
+        if side == "high":
+            # Quét short-liq: chọc lên trên swing high rồi đóng lại dưới level.
+            swept = high >= level + tol * 0.25 and close < level and upper_wick >= 0.28 and upper_wick >= body_pct * 0.7
+        else:
+            # Quét long-liq: chọc xuống dưới swing low rồi đóng lại trên level.
+            swept = low <= level - tol * 0.25 and close > level and lower_wick >= 0.28 and lower_wick >= body_pct * 0.7
+        if swept:
+            sweeps += 1
+            if np.isfinite(vol_ratio):
+                vols.append(float(vol_ratio))
+    return sweeps, (float(np.mean(vols)) if vols else None)
+
+
+def _cluster_liq_levels(points: list[dict], current_price: float, atr: float | None, role: str, mode: str) -> list[list[dict]]:
+    if not points:
+        return []
+    tol = _liquidity_tolerance(current_price, atr, role, mode)
+    clusters: list[list[dict]] = []
+    for point in sorted(points, key=lambda p: float(p["price"])):
+        if not clusters:
+            clusters.append([point])
+            continue
+        cur = clusters[-1]
+        center = sum(float(p["price"]) for p in cur) / len(cur)
+        if abs(float(point["price"]) - center) <= tol:
+            cur.append(point)
+        else:
+            clusters.append([point])
+    return clusters
+
+
+def _liq_zone_from_level(level_low: float, level_high: float, side: str, width: float) -> tuple[float, float]:
+    # Vùng thanh khoản nằm NGOÀI level, không bao quanh current price như support/resistance.
+    if side == "low":
+        top = level_high
+        return top - width, top
+    bottom = level_low
+    return bottom, bottom + width
+
+
+def _score_liq_cluster(
+    cluster: list[dict],
+    data: pd.DataFrame | None,
+    sweep_df: pd.DataFrame | None,
+    current_price: float,
+    atr: float | None,
+    side: str,
+    role: str,
+    mode: str,
+) -> dict:
+    prices = [float(p["price"]) for p in cluster]
+    level_low, level_high = min(prices), max(prices)
+    level = sum(prices) / len(prices)
+    tol = _liquidity_tolerance(current_price, atr, role, mode)
+    width = _liq_box_width(current_price, atr, role, mode)
+
+    # Nếu cluster bị rộng bất thường thì không biến nguyên cụm thành zone rộng.
+    # Chỉ lấy cạnh ngoài gần stop-pool nhất để tránh output kiểu 62,620–62,820.
+    max_level_span = max(tol * 1.65, current_price * _liq_role_params(role, mode)["max_box_pct"] * 0.35)
+    if (level_high - level_low) > max_level_span:
+        if side == "low":
+            level_low = level_high = max(prices)  # đáy cao nhất gần giá hơn là stop-pool gần nhất bên dưới
+        else:
+            level_low = level_high = min(prices)  # đỉnh thấp nhất gần giá hơn là stop-pool gần nhất bên trên
+        level = level_low
+
+    zone_low, zone_high = _liq_zone_from_level(level_low, level_high, side, width)
+    center = (zone_low + zone_high) / 2.0
+    ref_atr = _liquidity_ref_atr(current_price, atr)
+    distance_atr = abs(level - current_price) / max(ref_atr, 1e-12)
+
+    touches = _equal_touch_score(data, side, level, tol)
+    sweep_count, sweep_vol = _sweep_stats_against_level(sweep_df, side, level, tol)
+    vol_values = [float(p.get("volume_ratio", 1.0)) for p in cluster if np.isfinite(float(p.get("volume_ratio", 1.0)))]
+    avg_vol = float(np.mean(vol_values)) if vol_values else None
+    if sweep_vol is not None:
+        avg_vol = max(avg_vol or 0.0, sweep_vol)
+
+    latest_idx = max(int(p.get("index", 0)) for p in cluster)
+    total_len = len(data) if data is not None and not data.empty else latest_idx + 1
+    age_ratio = max((total_len - 1 - latest_idx) / max(total_len, 1), 0.0)
+    recency_score = 1.25 * (1.0 - min(age_ratio, 1.0))
+
+    params = _liq_role_params(role, mode)
+    target = params["target_atr"]
+    if role == "near":
+        distance_score = max(0.0, 1.0 - distance_atr / 3.5) * 1.6
+    elif role == "deep":
+        distance_score = min(distance_atr / max(target, 0.1), 1.4) * 0.9
+    else:
+        distance_score = max(0.0, 1.0 - abs(distance_atr - target) / 3.5) * 1.1
+
+    side_ok = level <= current_price if side == "low" else level >= current_price
+    if not side_ok:
+        distance_score -= 3.0
+
+    vol_score = 0.0
+    if avg_vol is not None:
+        vol_score = min(max(avg_vol - 0.8, 0.0), 2.2) * 0.7
+
+    score = (
+        min(len(cluster), 4) * 0.90
+        + min(touches, 6) * 0.55
+        + min(sweep_count, 4) * 1.15
+        + vol_score
+        + recency_score
+        + distance_score
+    )
+
+    strength = "mạnh" if (avg_vol or 0) >= 1.5 or sweep_count >= 2 or touches >= 4 else "vừa"
+    if touches <= 1 and sweep_count == 0 and (avg_vol or 1.0) < 1.1:
+        strength = "yếu"
+
+    return {
+        "low": zone_low,
+        "high": zone_high,
+        "center": center,
+        "level": level,
+        "score": score,
+        "hits": max(len(cluster), touches),
+        "touches": touches,
+        "sweeps": sweep_count,
+        "vol_ratio": avg_vol,
+        "distance_atr": distance_atr,
+        "strength": strength,
+        "role": role,
+        "level_span": level_high - level_low,
+        "width": zone_high - zone_low,
+    }
+
+
+def _zone_for_liq_pools(
+    level_df: pd.DataFrame | None,
+    sweep_df: pd.DataFrame | None,
+    current_price: float,
+    atr: float | None,
+    side: str,
+    role: str,
+    mode: str,
+    lookback: int | None,
+    m: int = 2,
+) -> tuple[float | None, float | None, int, dict]:
+    data = level_df.tail(lookback).reset_index(drop=True) if level_df is not None and not level_df.empty else None
+    if data is None or data.empty:
+        return None, None, 0, _zone_meta_default(role)
+
+    points = _fractal_swing_points(data, side, lookback=None, m=m)
+    if not points:
+        # Fallback chỉ lấy một cực trị còn đúng phía, vẫn tạo box ngoài cực trị.
+        col = "low" if side == "low" else "high"
+        idx = int(data[col].idxmin() if side == "low" else data[col].idxmax())
+        points = [{
+            "price": float(data.loc[idx, col]),
+            "index": idx,
+            "time": data.loc[idx].get("timestamp"),
+            "volume_ratio": _safe_float(data.loc[idx].get("vol_ratio"), 1.0) or 1.0,
+            "kind": "extreme_fallback",
+        }]
+
+    # Chỉ giữ level đúng phía. Vùng dưới là stop pool dưới swing low; vùng trên là stop pool trên swing high.
+    if side == "low":
+        points = [p for p in points if float(p["price"]) <= current_price]
+    else:
+        points = [p for p in points if float(p["price"]) >= current_price]
+    if not points:
+        return None, None, 0, _zone_meta_default(role)
+
+    clusters = _cluster_liq_levels(points, current_price, atr, role, mode)
+    scored = [_score_liq_cluster(c, data, sweep_df, current_price, atr, side, role, mode) for c in clusters]
+    # Loại zone cực rộng còn sót lại vì dữ liệu nhiễu. Với BTC scalp width > cap là không dùng.
+    max_width = current_price * _liq_role_params(role, mode)["max_box_pct"] * 1.10
+    scored = [s for s in scored if (s["high"] - s["low"]) <= max_width]
+    if not scored:
+        return None, None, 0, _zone_meta_default(role)
+
+    best = max(scored, key=lambda x: x["score"])
+    meta = {
+        "role": role,
+        "touches": int(best["touches"]),
+        "sweeps": int(best["sweeps"]),
+        "vol_ratio": best["vol_ratio"],
+        "score": round(float(best["score"]), 2),
+        "distance_atr": round(float(best["distance_atr"]), 2),
+        "strength": best["strength"],
+        "swing_level": round(float(best["level"]), 2),
+        "zone_width": round(float(best["width"]), 2),
+        "method": "fractal_swing_pool",
+    }
+    meta["side_state"] = _zone_side_state((best["low"], best["high"], int(best["hits"]), meta), current_price)
+    return best["low"], best["high"], int(best["hits"]), meta
+
+
+def _first_valid_df(*dfs: pd.DataFrame | None) -> pd.DataFrame | None:
+    for df in dfs:
+        if df is not None and not df.empty:
+            return df
+    return None
+
+
+def _liquidity_zones_by_windows(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float,
+) -> dict:
+    """Vùng thanh khoản V5: stop-pool ngoài swing, không phải band giá đang kẹt.
+
+    Theo gợi ý OHLCV-only: khung lớn xác định level, khung nhỏ xác nhận sweep.
+    SCALP: 1H cho vùng gần, 4H cho vùng chính/sâu, 15M chỉ kiểm tra sweep.
+    SWING: 4H cho vùng gần, 1D cho vùng chính/sâu.
+    """
+    if mode == "short":
+        sweep_df = timeframe_data.get("15M")
+        near_df = _first_valid_df(timeframe_data.get("1H"), timeframe_data.get("15M"))
+        main_df = _first_valid_df(timeframe_data.get("4H"), timeframe_data.get("1H"))
+        deep_df = _first_valid_df(timeframe_data.get("4H"), timeframe_data.get("1H"))
+        windows = [
+            ("near", "gần 1H", near_df, _current_atr(near_df) or _current_atr(sweep_df), 72, 2),
+            ("main", "chính H4", main_df, _current_atr(main_df) or _current_atr(near_df), 90, 2),
+            ("deep", "sâu H4", deep_df, _current_atr(deep_df) or _current_atr(main_df), 120, 3),
+        ]
+        calc_mode = "short"
+    else:
+        sweep_df = timeframe_data.get("4H")
+        near_df = timeframe_data.get("4H")
+        main_df = _first_valid_df(timeframe_data.get("1D"), timeframe_data.get("4H"))
+        deep_df = _first_valid_df(timeframe_data.get("1D"), timeframe_data.get("1W"), timeframe_data.get("4H"))
+        windows = [
+            ("near", "gần H4", near_df, _current_atr(near_df), 90, 2),
+            ("main", "chính D1", main_df, _current_atr(main_df) or _current_atr(near_df), 60, 2),
+            ("deep", "sâu D1", deep_df, _current_atr(deep_df) or _current_atr(main_df), 90, 3),
+        ]
+        calc_mode = "long"
+
+    result: dict = {"meta": [label for _, label, *_ in windows], "liquidity_method": "fractal_swing_pool_v5"}
+    for key, label, df, atr, lookback, m in windows:
+        lower = _zone_for_liq_pools(df, sweep_df, current_price, atr, "low", key, calc_mode, lookback, m=m)
+        upper = _zone_for_liq_pools(df, sweep_df, current_price, atr, "high", key, calc_mode, lookback, m=m)
+        result[f"lower_{key}"] = lower
+        result[f"upper_{key}"] = upper
+        result[f"label_{key}"] = label
+    return result
+
 def _liquidity_zones(df: pd.DataFrame | None, current_price: float, atr: float | None) -> dict:
     """Legacy wrapper: giữ lại để tránh lỗi nếu còn đoạn code cũ gọi."""
     low_pivots = [p["price"] for p in _find_pivots(df, "low", 100)]
@@ -1731,7 +2082,14 @@ def _fmt_zone_tuple(zone: tuple | None, current_price: float | None = None) -> s
     sweeps = meta.get("sweeps")
     vol_ratio = meta.get("vol_ratio")
     distance_atr = meta.get("distance_atr")
+    strength = meta.get("strength")
+    swing_level = meta.get("swing_level")
+    zone_width = meta.get("zone_width")
 
+    if strength:
+        details.append(f"{strength}")
+    if swing_level is not None:
+        details.append(f"level {fmt(swing_level)}")
     if touches:
         details.append(f"{int(touches)} chạm")
     elif hits:
@@ -1742,6 +2100,8 @@ def _fmt_zone_tuple(zone: tuple | None, current_price: float | None = None) -> s
         details.append(f"vol {float(vol_ratio):.2f}x")
     if distance_atr is not None and np.isfinite(distance_atr):
         details.append(f"~{float(distance_atr):.1f}ATR")
+    if zone_width is not None and np.isfinite(zone_width):
+        details.append(f"rộng {fmt(zone_width)}")
     if current_price is not None and float(low) <= current_price <= float(high):
         details.append("đang chạm giá")
     if meta.get("fallback"):
@@ -1749,7 +2109,6 @@ def _fmt_zone_tuple(zone: tuple | None, current_price: float | None = None) -> s
 
     detail_text = f" ({', '.join(details)})" if details else ""
     return f"{fmt(low)}–{fmt(high)}{detail_text}"
-
 
 def _zones_have_meaningful_overlap(a: tuple | None, b: tuple | None) -> bool:
     if not a or not b:
