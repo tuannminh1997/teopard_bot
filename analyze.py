@@ -1221,10 +1221,30 @@ def _current_atr(df: pd.DataFrame | None) -> float | None:
     return _safe_float(df.iloc[-1].get("atr_14"))
 
 
-def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int = 100, left: int = 2, right: int = 2) -> list[dict]:
+def _window_tail(df: pd.DataFrame | None, hours: int | None = None, max_candles: int | None = None) -> pd.DataFrame | None:
+    """Lấy dữ liệu theo cửa sổ thời gian thay vì số cây cố định.
+
+    Coinglass dùng 12h/24h/48h như một *lookback window*; không phải nghĩa là
+    phải dùng nến 12H/24H. Với Teopard, ta vẫn dùng nến nhỏ hơn để giữ độ phân giải,
+    nhưng chỉ xét các cây nằm trong cửa sổ thời gian đó.
+    """
+    if df is None or df.empty:
+        return None
+    data = df.copy()
+    if hours is not None:
+        time_col = "close_time" if "close_time" in data.columns else "timestamp"
+        ref_time = data[time_col].max()
+        start_time = ref_time - pd.Timedelta(hours=hours)
+        data = data[data[time_col] >= start_time]
+    if max_candles is not None and len(data) > max_candles:
+        data = data.tail(max_candles)
+    return data.reset_index(drop=True)
+
+
+def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int | None = 100, left: int = 2, right: int = 2) -> list[dict]:
     if df is None or df.empty:
         return []
-    data = df.tail(lookback).reset_index(drop=True)
+    data = df.tail(lookback).reset_index(drop=True) if lookback else df.reset_index(drop=True)
     col = "high" if side == "high" else "low"
     pivots: list[dict] = []
     if len(data) < left + right + 1:
@@ -1240,6 +1260,7 @@ def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int = 100, left: 
 
 
 def _cluster_zone(prices: list[float], current_price: float, side: str, atr: float | None) -> tuple[float | None, float | None, int]:
+    """Legacy helper giữ lại cho một vài fallback cũ nếu cần."""
     if not prices:
         return None, None, 0
     tol = max((atr or 0) * 0.25, current_price * 0.0012)
@@ -1257,26 +1278,90 @@ def _cluster_zone(prices: list[float], current_price: float, side: str, atr: flo
 
     if side == "low":
         candidates = [c for c in clusters if sum(c) / len(c) <= current_price]
-        candidates.sort(key=lambda c: (len(c), sum(c) / len(c)), reverse=True)
-        candidates.sort(key=lambda c: abs(current_price - sum(c) / len(c)))
     else:
         candidates = [c for c in clusters if sum(c) / len(c) >= current_price]
-        candidates.sort(key=lambda c: (len(c), -sum(c) / len(c)), reverse=True)
-        candidates.sort(key=lambda c: abs(sum(c) / len(c) - current_price))
 
     if not candidates:
         return None, None, 0
+    candidates.sort(key=lambda c: (len(c), -abs(current_price - sum(c) / len(c))), reverse=True)
     best = candidates[0]
     low = min(best) - buf
     high = max(best) + buf
     return low, high, len(best)
 
 
-def _fallback_zone(df: pd.DataFrame | None, side: str, current_price: float, atr: float | None, window: int = 80) -> tuple[float | None, float | None]:
+def _cluster_zone_from_pivots(
+    pivots: list[dict],
+    current_price: float,
+    side: str,
+    atr: float | None,
+    window_df: pd.DataFrame | None,
+) -> tuple[float | None, float | None, int]:
+    """Gom pivot/equal high-low thành vùng và chấm điểm vùng tốt nhất.
+
+    Không chỉ chọn vùng gần nhất nữa. Vùng được ưu tiên khi có nhiều lần chạm,
+    còn mới, và không quá xa giá hiện tại. Đây vẫn là vùng quét kỹ thuật, không
+    phải liquidation heatmap thật.
+    """
+    if not pivots:
+        return None, None, 0
+
+    tol = max((atr or 0) * 0.22, current_price * 0.0009)
+    buf = max((atr or 0) * 0.16, current_price * 0.00055)
+    sorted_pivots = sorted(pivots, key=lambda p: float(p["price"]))
+
+    clusters: list[list[dict]] = []
+    cur = [sorted_pivots[0]]
+    for pivot in sorted_pivots[1:]:
+        center = sum(float(p["price"]) for p in cur) / len(cur)
+        if abs(float(pivot["price"]) - center) <= tol:
+            cur.append(pivot)
+        else:
+            clusters.append(cur)
+            cur = [pivot]
+    clusters.append(cur)
+
+    if side == "low":
+        candidates = [c for c in clusters if (sum(float(p["price"]) for p in c) / len(c)) <= current_price]
+    else:
+        candidates = [c for c in clusters if (sum(float(p["price"]) for p in c) / len(c)) >= current_price]
+
+    if not candidates:
+        return None, None, 0
+
+    ref_time = None
+    if window_df is not None and not window_df.empty:
+        ref_time = window_df["timestamp"].max()
+
+    def score(cluster: list[dict]) -> float:
+        prices = [float(p["price"]) for p in cluster]
+        center = sum(prices) / len(prices)
+        hits_score = min(len(cluster), 5) * 2.0
+        distance_pct = abs(center - current_price) / max(current_price, 1e-12)
+        # 0.0 -> 2.5 điểm nếu sát giá; mất điểm dần khi quá xa khoảng 8%.
+        distance_score = max(0.0, 1.0 - distance_pct / 0.08) * 2.5
+        recency_score = 0.0
+        if ref_time is not None:
+            try:
+                last_touch = max(pd.Timestamp(p["time"]) for p in cluster)
+                age_hours = max((pd.Timestamp(ref_time) - last_touch).total_seconds() / 3600.0, 0.0)
+                recency_score = 1.5 / (1.0 + age_hours / 24.0)
+            except Exception:
+                recency_score = 0.0
+        return hits_score + distance_score + recency_score
+
+    best = max(candidates, key=score)
+    prices = [float(p["price"]) for p in best]
+    return min(prices) - buf, max(prices) + buf, len(best)
+
+
+def _fallback_zone(df: pd.DataFrame | None, side: str, current_price: float, atr: float | None, window: int | None = None) -> tuple[float | None, float | None]:
     if df is None or df.empty:
         return None, None
-    data = df.tail(window)
-    buf = max((atr or 0) * 0.20, current_price * 0.0008)
+    data = df.tail(window) if window else df
+    if data.empty:
+        return None, None
+    buf = max((atr or 0) * 0.16, current_price * 0.00055)
     if side == "low":
         price = float(data["low"].min())
     else:
@@ -1284,7 +1369,80 @@ def _fallback_zone(df: pd.DataFrame | None, side: str, current_price: float, atr
     return price - buf, price + buf
 
 
+def _zone_for_window(
+    df: pd.DataFrame | None,
+    current_price: float,
+    atr: float | None,
+    side: str,
+    hours: int,
+    max_candles: int | None = None,
+) -> tuple[float | None, float | None, int]:
+    data = _window_tail(df, hours=hours, max_candles=max_candles)
+    if data is None or data.empty:
+        return None, None, 0
+    # Cửa sổ nhỏ vẫn cần pivot. Nếu quá ít nến thì giảm left/right để không rỗng hết.
+    left_right = 1 if len(data) < 12 else 2
+    pivots = _find_pivots(data, side, lookback=None, left=left_right, right=left_right)
+    low, high, hits = _cluster_zone_from_pivots(pivots, current_price, side, atr, data)
+    if low is None or high is None:
+        low, high = _fallback_zone(data, side, current_price, atr)
+        hits = 1 if low is not None else 0
+    return low, high, hits
+
+
+def _liquidity_zones_by_windows(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float,
+) -> dict:
+    """Vùng quét kỹ thuật theo cửa sổ thời gian.
+
+    SCALP dùng tinh thần 12h/24h/48h: nến nhỏ giữ độ phân giải, cửa sổ thời gian
+    giữ phạm vi giống cách xem heatmap hơn. SWING dùng 24h/3D/7D.
+    """
+    if mode == "short":
+        near_df = timeframe_data.get("15M")
+        main_df = timeframe_data.get("1H")
+        deep_df = timeframe_data.get("1H")
+        if deep_df is None or deep_df.empty:
+            deep_df = timeframe_data.get("4H")
+        near_atr = _current_atr(near_df) or _current_atr(main_df)
+        main_atr = _current_atr(main_df) or near_atr
+        deep_atr = main_atr or _current_atr(timeframe_data.get("4H"))
+        windows = [
+            ("near", "gần 12h", near_df, near_atr, 12, 64),
+            ("main", "chính 24h", main_df, main_atr, 24, 36),
+            ("deep", "sâu 48h", deep_df, deep_atr, 48, 60),
+        ]
+    else:
+        near_df = timeframe_data.get("4H")
+        main_df = timeframe_data.get("4H")
+        if main_df is None or main_df.empty:
+            main_df = timeframe_data.get("1D")
+        deep_df = timeframe_data.get("1D")
+        if deep_df is None or deep_df.empty:
+            deep_df = timeframe_data.get("4H")
+        near_atr = _current_atr(near_df) or _current_atr(timeframe_data.get("1D"))
+        main_atr = near_atr or _current_atr(timeframe_data.get("1D"))
+        deep_atr = _current_atr(deep_df) or main_atr
+        windows = [
+            ("near", "gần 24h", near_df, near_atr, 24, 12),
+            ("main", "chính 3D", main_df, main_atr, 72, 24),
+            ("deep", "sâu 7D", deep_df, deep_atr, 24 * 7, 14),
+        ]
+
+    result: dict = {"meta": [label for _, label, *_ in windows]}
+    for key, label, df, atr, hours, max_candles in windows:
+        lower = _zone_for_window(df, current_price, atr, "low", hours, max_candles)
+        upper = _zone_for_window(df, current_price, atr, "high", hours, max_candles)
+        result[f"lower_{key}"] = lower
+        result[f"upper_{key}"] = upper
+        result[f"label_{key}"] = label
+    return result
+
+
 def _liquidity_zones(df: pd.DataFrame | None, current_price: float, atr: float | None) -> dict:
+    """Legacy wrapper: giữ lại để tránh lỗi nếu còn đoạn code cũ gọi."""
     low_pivots = [p["price"] for p in _find_pivots(df, "low", 100)]
     high_pivots = [p["price"] for p in _find_pivots(df, "high", 100)]
     long_low, long_high, long_hits = _cluster_zone(low_pivots, current_price, "low", atr)
@@ -1297,7 +1455,6 @@ def _liquidity_zones(df: pd.DataFrame | None, current_price: float, atr: float |
         short_low, short_high = _fallback_zone(df, "high", current_price, atr, 80)
         short_hits = 1 if short_low is not None else 0
 
-    # Deep zones dùng cực trị rộng hơn để tránh SL/TP quá sát vùng gần.
     deep_long_low, deep_long_high = _fallback_zone(df, "low", current_price, atr, 150)
     deep_short_low, deep_short_high = _fallback_zone(df, "high", current_price, atr, 150)
     return {
@@ -1307,6 +1464,25 @@ def _liquidity_zones(df: pd.DataFrame | None, current_price: float, atr: float |
         "short_deep": (deep_short_low, deep_short_high),
     }
 
+
+def _fmt_zone_tuple(zone: tuple | None) -> str:
+    if not zone:
+        return "N/A"
+    low = zone[0] if len(zone) > 0 else None
+    high = zone[1] if len(zone) > 1 else None
+    hits = zone[2] if len(zone) > 2 else 0
+    hit_text = f", {hits} điểm" if hits else ""
+    return f"{fmt(low)}–{fmt(high)}{hit_text}"
+
+
+def _format_liquidity_window_line(prefix: str, zones: dict, side: str) -> str:
+    # side = lower hoặc upper
+    return (
+        f"- {prefix}: "
+        f"{zones.get('label_near', 'gần')} {_fmt_zone_tuple(zones.get(f'{side}_near'))}; "
+        f"{zones.get('label_main', 'chính')} {_fmt_zone_tuple(zones.get(f'{side}_main'))}; "
+        f"{zones.get('label_deep', 'sâu')} {_fmt_zone_tuple(zones.get(f'{side}_deep'))}"
+    )
 
 def _structure_info(df: pd.DataFrame | None, current_price: float | None) -> dict:
     if df is None or df.empty:
@@ -1622,14 +1798,10 @@ def build_feature_engineering_block(
         structure_df = main_df
     atr_main = _current_atr(main_df)
     atr_structure = _current_atr(structure_df)
-    zones = _liquidity_zones(structure_df, price, atr_structure or atr_main)
+    zones = _liquidity_zones_by_windows(timeframe_data, mode, price)
     structure = _structure_info(structure_df, price)
     risk = _risk_floor(timeframe_data, mode, price)
 
-    long_near = zones.get("long_near", (None, None, 0))
-    short_near = zones.get("short_near", (None, None, 0))
-    long_deep = zones.get("long_deep", (None, None))
-    short_deep = zones.get("short_deep", (None, None))
     fib = structure.get("fib", {})
 
     lines = [
@@ -1640,10 +1812,11 @@ def build_feature_engineering_block(
         f"- Chuỗi nến {main_label}: {_consecutive_candles(main_df)} | Nến cuối: {_wick_body_info(main_df)}",
         f"- Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}–{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}–{fmt(structure.get('major_high'))}",
         f"- Fibonacci {structure_label}: 0.382={fmt(fib.get('0.382'))}; 0.5={fmt(fib.get('0.5'))}; 0.618={fmt(fib.get('0.618'))}",
-        f"- Vùng quét Long ước lượng gần: {fmt(long_near[0])}–{fmt(long_near[1])} (cụm {long_near[2]} điểm); sâu: {fmt(long_deep[0])}–{fmt(long_deep[1])}",
-        f"- Vùng quét Short ước lượng gần: {fmt(short_near[0])}–{fmt(short_near[1])} (cụm {short_near[2]} điểm); sâu: {fmt(short_deep[0])}–{fmt(short_deep[1])}",
-        "- Quy tắc rủi ro: AI tự lập Entry/SL/TP. Rủi ro tham chiếu là mốc chống nhiễu chống nhiễu, không phải lệnh bắt buộc; Entry–SL có thể thấp hơn một chút nếu có đỉnh/đáy vô hiệu rõ. TP1 nên khoảng >= 0.8R, TP2 nên khoảng >= 1.3R, không kéo TP quá xa chỉ để đẹp tỷ lệ.",
-        "- Ghi chú: Vùng quét là vùng thanh khoản ước lượng từ pivot/equal high/equal low và high/low nến, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật, không phải lệnh giao dịch chốt sẵn.",
+        _format_liquidity_window_line("Vùng thanh khoản dưới giá ước lượng", zones, "lower"),
+        _format_liquidity_window_line("Vùng thanh khoản trên giá ước lượng", zones, "upper"),
+        "- Vai trò vùng quét: Entry ưu tiên dùng vùng gần/chính nếu hợp xu hướng và có xác nhận; không dùng vùng sâu làm Entry scalp mặc định. TP dùng vùng đối diện: TP1 ưu tiên vùng đối diện gần/chính, TP2 có thể dùng vùng đối diện chính/sâu. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay trong vùng quét.",
+        "- Quy tắc rủi ro: AI tự lập Entry/SL/TP. Rủi ro tham chiếu là mốc chống nhiễu, không phải lệnh bắt buộc; Entry–SL có thể thấp hơn một chút nếu có đỉnh/đáy vô hiệu rõ. TP1 nên khoảng >= 0.8R, TP2 nên khoảng >= 1.3R, không kéo TP quá xa chỉ để đẹp tỷ lệ.",
+        "- Ghi chú: Vùng quét là vùng thanh khoản kỹ thuật ước lượng theo cửa sổ thời gian, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật, không phải lệnh giao dịch chốt sẵn.",
     ]
     return "\n".join(lines)
 
@@ -1673,15 +1846,10 @@ def build_feature_snapshot(
 
     atr_main = _current_atr(main_df)
     atr_structure = _current_atr(structure_df)
-    zones = _liquidity_zones(structure_df, price, atr_structure or atr_main)
+    zones = _liquidity_zones_by_windows(timeframe_data, mode, price)
     structure = _structure_info(structure_df, price)
     risk = _risk_floor(timeframe_data, mode, price)
     fib = structure.get("fib", {})
-
-    long_near = zones.get("long_near", (None, None, 0))
-    short_near = zones.get("short_near", (None, None, 0))
-    long_deep = zones.get("long_deep", (None, None))
-    short_deep = zones.get("short_deep", (None, None))
 
     def compact_tf(label: str, df: pd.DataFrame | None) -> str:
         if df is None or df.empty:
@@ -1707,7 +1875,8 @@ def build_feature_snapshot(
         compact_tf(big_label, big_df),
         f"Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}-{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}-{fmt(structure.get('major_high'))}",
         f"Fib {structure_label}: 0.382 {fmt(fib.get('0.382'))}, 0.5 {fmt(fib.get('0.5'))}, 0.618 {fmt(fib.get('0.618'))}",
-        f"Vùng quét Long ước lượng gần {fmt(long_near[0])}-{fmt(long_near[1])} / sâu {fmt(long_deep[0])}-{fmt(long_deep[1])}; Short gần {fmt(short_near[0])}-{fmt(short_near[1])} / sâu {fmt(short_deep[0])}-{fmt(short_deep[1])}",
+        f"Vùng dưới: {zones.get('label_near')} {_fmt_zone_tuple(zones.get('lower_near'))}; {zones.get('label_main')} {_fmt_zone_tuple(zones.get('lower_main'))}; {zones.get('label_deep')} {_fmt_zone_tuple(zones.get('lower_deep'))}",
+        f"Vùng trên: {zones.get('label_near')} {_fmt_zone_tuple(zones.get('upper_near'))}; {zones.get('label_main')} {_fmt_zone_tuple(zones.get('upper_main'))}; {zones.get('label_deep')} {_fmt_zone_tuple(zones.get('upper_deep'))}",
         f"ATR/risk: ATR {main_label} {fmt(atr_main)}, ATR {structure_label} {fmt(atr_structure)}, rủi ro tham chiếu {fmt(risk)}",
         f"Nến {main_label}: {_consecutive_candles(main_df)}; {_wick_body_info(main_df)}",
     ]
@@ -1926,18 +2095,20 @@ Phương pháp: {focus}
 Yêu cầu:
 1. Python chỉ cung cấp dữ liệu cứng: EMA/RSI/MACD/ATR, market regime, cấu trúc, Fibonacci, vùng quét thanh khoản ước lượng, raw candle context, rủi ro tham chiếu. Không có kế hoạch LONG/SHORT chốt sẵn.
 2. Model phải tự phân tích và tự lập Entry/SL/TP dựa trên dữ liệu cứng đó. Không được tự tạo thêm Fibonacci/vùng quét nếu block Python ghi N/A hoặc không đủ dữ liệu.
-3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO_TRADE theo xu hướng đa khung, vị trí giá, vùng quét ước lượng, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user.
+3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO_TRADE theo xu hướng đa khung, vị trí giá, vùng quét ước lượng theo cửa sổ thời gian, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user.
 4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và risk/reward đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO_TRADE. Không dùng NO_TRADE chỉ vì giá chưa chạm Entry; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.
-5. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”.
-6. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
-7. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát, nhưng cũng không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
-8. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Được chọn NO_TRADE khi lợi thế chưa đủ rõ, kể cả khi vẫn có thể vẽ ra một vùng Entry hợp lệ nhưng kèo không đáng vào.
-9. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
-10. Đọc kỹ KẾ HOẠCH ĐANG MỞ nếu có. Không được hiểu vùng Entry của một lệnh chờ LONG là mục tiêu TP cho lệnh SHORT ngược lại, hoặc vùng Entry của lệnh chờ SHORT là mục tiêu TP cho lệnh LONG ngược lại.
-11. Nếu đang có kế hoạch cũ PENDING_ENTRY mà giá đã chạy xa khỏi Entry theo đúng hướng dự báo, không được đuổi giá chỉ vì giá chạy. Chỉ cho vào ngay khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu không thì NO_TRADE hoặc chờ kiểm tra lại.
-12. Nếu kế hoạch mới thay thế kế hoạch cũ, ghi ngắn trong “📊 Kịch bản chính” lý do kế hoạch cũ bị hủy/thay thế.
-13. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
-14. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO_TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
+5. Cách dùng vùng quét: Entry ưu tiên vùng gần/chính nếu hợp hướng setup và có xác nhận. Vùng sâu chủ yếu dùng cho TP2, SL, hoặc cảnh báo vùng nguy hiểm; không dùng vùng sâu làm Entry scalp mặc định trừ khi có cú quét sâu rất rõ.
+6. TP dùng vùng đối diện: với LONG nhìn vùng thanh khoản trên, với SHORT nhìn vùng thanh khoản dưới. TP1 ưu tiên vùng đối diện gần/chính; TP2 có thể dùng vùng đối diện chính/sâu. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay trong vùng quét.
+7. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”.
+8. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
+9. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát, nhưng cũng không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
+10. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Được chọn NO_TRADE khi lợi thế chưa đủ rõ, kể cả khi vẫn có thể vẽ ra một vùng Entry hợp lệ nhưng kèo không đáng vào.
+11. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
+12. Đọc kỹ KẾ HOẠCH ĐANG MỞ nếu có. Không được hiểu vùng Entry của một lệnh chờ LONG là mục tiêu TP cho lệnh SHORT ngược lại, hoặc vùng Entry của lệnh chờ SHORT là mục tiêu TP cho lệnh LONG ngược lại.
+13. Nếu đang có kế hoạch cũ PENDING_ENTRY mà giá đã chạy xa khỏi Entry theo đúng hướng dự báo, không được đuổi giá chỉ vì giá chạy. Chỉ cho vào ngay khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu không thì NO_TRADE hoặc chờ kiểm tra lại.
+14. Nếu kế hoạch mới thay thế kế hoạch cũ, ghi ngắn trong “📊 Kịch bản chính” lý do kế hoạch cũ bị hủy/thay thế.
+15. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
+16. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO_TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
 """
 
 
