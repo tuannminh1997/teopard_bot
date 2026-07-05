@@ -1639,6 +1639,212 @@ def _zone_for_window(
     return low, high, hits, meta
 
 
+
+def _zone_gap_to_price(zone: tuple | None, current_price: float, side: str) -> float:
+    """Khoảng cách từ giá hiện tại tới mép trong của zone.
+
+    side="lower": zone nằm dưới giá, gap = current - high.
+    side="upper": zone nằm trên giá, gap = low - current.
+    Nếu zone đang ôm/chạm giá thì gap = 0.
+    """
+    if not zone or len(zone) < 2 or zone[0] is None or zone[1] is None:
+        return float("inf")
+    low, high = float(zone[0]), float(zone[1])
+    if low <= current_price <= high:
+        return 0.0
+    if side == "lower":
+        return max(current_price - high, 0.0)
+    return max(low - current_price, 0.0)
+
+
+def _liq_zone_overlap_ratio(a: tuple | None, b: tuple | None) -> float:
+    if not a or not b or a[0] is None or a[1] is None or b[0] is None or b[1] is None:
+        return 0.0
+    a_low, a_high = float(a[0]), float(a[1])
+    b_low, b_high = float(b[0]), float(b[1])
+    overlap = max(0.0, min(a_high, b_high) - max(a_low, b_low))
+    smaller = max(min(a_high - a_low, b_high - b_low), 1e-12)
+    return overlap / smaller
+
+
+def _liq_zone_external_gap(a: tuple | None, b: tuple | None) -> float:
+    """Khoảng cách rỗng giữa 2 liquidity box; overlap/chạm nhau thì bằng 0."""
+    if not a or not b or a[0] is None or a[1] is None or b[0] is None or b[1] is None:
+        return float("inf")
+    a_low, a_high = float(a[0]), float(a[1])
+    b_low, b_high = float(b[0]), float(b[1])
+    if a_high < b_low:
+        return b_low - a_high
+    if b_high < a_low:
+        return a_low - b_high
+    return 0.0
+
+
+def _liq_zone_width(zone: tuple | None) -> float:
+    if not zone or zone[0] is None or zone[1] is None:
+        return 0.0
+    return max(float(zone[1]) - float(zone[0]), 0.0)
+
+
+def _mark_zone_merged_pool(zone: tuple, merged_with: str | None = None) -> tuple:
+    """Đánh dấu nội bộ khi near/main/deep bị gộp vì cùng cụm thanh khoản."""
+    if not zone or len(zone) < 4 or not isinstance(zone[3], dict):
+        return zone
+    meta = dict(zone[3])
+    meta["merged_pool"] = True
+    if merged_with:
+        roles = set(str(meta.get("merged_roles", "")).split("/")) if meta.get("merged_roles") else set()
+        roles.add(str(meta.get("role", "")))
+        roles.add(str(merged_with))
+        roles = {r for r in roles if r}
+        meta["merged_roles"] = "/".join(sorted(roles))
+    return (zone[0], zone[1], zone[2], meta)
+
+
+def _liq_zones_same_pool(a: tuple | None, b: tuple | None, current_price: float, mode: str) -> bool:
+    """Tránh in cùng một pool thành gần/chính/sâu.
+
+    Đây là lỗi chính ở các bản trước: 2 box không overlap nhiều nhưng chỉ cách nhau
+    rất ít vẫn bị gán thành near/main/deep khác nhau. Với scalp, nếu 2 vùng chỉ
+    cách nhau dưới khoảng 0.10% giá hoặc dưới ~1 box-width thì xem là cùng cụm
+    stop/liquidity pool, không in thành nhiều mục tiêu riêng.
+    """
+    if not a or not b:
+        return False
+
+    if _liq_zone_overlap_ratio(a, b) >= 0.20:
+        return True
+
+    gap = _liq_zone_external_gap(a, b)
+    width_a = _liq_zone_width(a)
+    width_b = _liq_zone_width(b)
+    max_width = max(width_a, width_b, 1e-12)
+    avg_width = max((width_a + width_b) / 2.0, 1e-12)
+
+    # Ngưỡng này là để gộp các role gần nhau, KHÔNG phải ép vùng cách xa nhau.
+    # Scalp cần gộp chặt để tránh output kiểu gần/chính/sâu chỉ lệch vài USDT.
+    gap_pct = 0.0010 if mode == "short" else 0.0022
+    close_gap_threshold = max(current_price * gap_pct, avg_width * 0.85)
+    if gap <= close_gap_threshold:
+        return True
+
+    ma = a[3] if len(a) > 3 and isinstance(a[3], dict) else {}
+    mb = b[3] if len(b) > 3 and isinstance(b[3], dict) else {}
+    la = ma.get("swing_level")
+    lb = mb.get("swing_level")
+    if la is None or lb is None:
+        return False
+
+    level_pct = 0.0013 if mode == "short" else 0.0028
+    level_threshold = max(current_price * level_pct, max_width * 1.35)
+    return abs(float(la) - float(lb)) <= level_threshold
+
+
+def _copy_zone_with_assigned_role(zone: tuple, role: str) -> tuple:
+    if not zone or len(zone) < 4 or not isinstance(zone[3], dict):
+        return zone
+    meta = dict(zone[3])
+    meta["assigned_role"] = role
+    meta["role"] = role
+    return (zone[0], zone[1], zone[2], meta)
+
+
+def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str) -> None:
+    """Chuẩn hóa near/main/deep sau khi tính candidate độc lập.
+
+    Lý do: cùng một H4/D1 có thể sinh ra nhiều candidate, nhưng nếu mỗi role tự chọn
+    độc lập thì sẽ có lỗi kiểu "sâu" gần hơn "chính", hoặc cùng một vùng bị in lặp.
+    Hàm này không bịa vùng mới; chỉ sắp xếp lại candidate theo khoảng cách thật:
+    - lower: càng gần giá thì swing low càng cao.
+    - upper: càng gần giá thì swing high càng thấp.
+    - vùng trùng pool bị bỏ bớt.
+    - nếu candidate thứ hai quá xa so với scalp thì gán vào "sâu", để "chính" là N/A.
+    """
+    far_pct_cut = 0.025 if mode == "short" else 0.060
+    far_atr_cut = 10.0 if mode == "short" else 12.0
+
+    for side in ("lower", "upper"):
+        raw: list[tuple] = []
+        for role in ("near", "main", "deep"):
+            z = zones.get(f"{side}_{role}")
+            if z and z[0] is not None and z[1] is not None:
+                raw.append(z)
+
+        # Sort trước theo gap, sau đó score giảm dần để candidate gần hơn luôn được xét trước.
+        raw.sort(
+            key=lambda z: (
+                _zone_gap_to_price(z, current_price, side),
+                -float((z[3] if len(z) > 3 and isinstance(z[3], dict) else {}).get("score", 0.0)),
+            )
+        )
+
+        unique: list[tuple] = []
+        for z in raw:
+            if any(_liq_zones_same_pool(z, kept, current_price, mode) for kept in unique):
+                # Nếu trùng/quá sát pool, giữ 1 candidate duy nhất; không in thành gần/chính/sâu riêng.
+                for i, kept in enumerate(unique):
+                    if _liq_zones_same_pool(z, kept, current_price, mode):
+                        mz = z[3] if len(z) > 3 and isinstance(z[3], dict) else {}
+                        mk = kept[3] if len(kept) > 3 and isinstance(kept[3], dict) else {}
+                        wz = abs(float(z[1]) - float(z[0]))
+                        wk = abs(float(kept[1]) - float(kept[0]))
+                        z_role = str(mz.get("role", ""))
+                        kept_role = str(mk.get("role", ""))
+                        # Cùng pool thì ưu tiên box hẹp hơn để scalp không bị in vùng rộng vô nghĩa.
+                        # Nếu độ rộng gần như nhau, dùng score để chọn candidate chất lượng hơn.
+                        choose_z = wz < wk * 0.92 or (
+                            abs(wz - wk) <= wk * 0.08
+                            and float(mz.get("score", 0.0)) > float(mk.get("score", 0.0))
+                        )
+                        if choose_z:
+                            unique[i] = _mark_zone_merged_pool(z, kept_role)
+                        else:
+                            unique[i] = _mark_zone_merged_pool(kept, z_role)
+                        break
+                continue
+            unique.append(z)
+
+        assigned = {"near": None, "main": None, "deep": None}
+        if unique:
+            assigned["near"] = _copy_zone_with_assigned_role(unique[0], "near")
+
+        for z in unique[1:]:
+            gap = _zone_gap_to_price(z, current_price, side)
+            gap_pct = gap / max(current_price, 1e-12)
+            meta = z[3] if len(z) > 3 and isinstance(z[3], dict) else {}
+            distance_atr = float(meta.get("distance_atr", 0.0) or 0.0)
+            is_far = gap_pct >= far_pct_cut or distance_atr >= far_atr_cut
+
+            if is_far:
+                if assigned["deep"] is None:
+                    assigned["deep"] = _copy_zone_with_assigned_role(z, "deep")
+                # Nếu đã có deep, bỏ candidate xa hơn/yếu hơn để tránh prompt loãng.
+                continue
+
+            if assigned["main"] is None:
+                assigned["main"] = _copy_zone_with_assigned_role(z, "main")
+            elif assigned["deep"] is None:
+                assigned["deep"] = _copy_zone_with_assigned_role(z, "deep")
+
+        # Nếu chưa có main nhưng có deep rất gần do chỉ có 2 candidate, không kéo deep lên main.
+        # Nếu có main và deep, đảm bảo deep thật sự xa hơn main.
+        if assigned["main"] is not None and assigned["deep"] is not None:
+            main_gap = _zone_gap_to_price(assigned["main"], current_price, side)
+            deep_gap = _zone_gap_to_price(assigned["deep"], current_price, side)
+            if deep_gap < main_gap:
+                assigned["main"], assigned["deep"] = assigned["deep"], assigned["main"]
+                assigned["main"] = _copy_zone_with_assigned_role(assigned["main"], "main")
+                assigned["deep"] = _copy_zone_with_assigned_role(assigned["deep"], "deep")
+
+        for role in ("near", "main", "deep"):
+            zones[f"{side}_{role}"] = assigned[role]
+
+    # Sau khi chuẩn hóa vai trò, label nên là vai trò giao dịch, không còn label theo timeframe cũ.
+    zones["label_near"] = "gần"
+    zones["label_main"] = "chính"
+    zones["label_deep"] = "sâu"
+    zones["liquidity_method"] = "fractal_swing_pool_v8_cluster_dedupe"
+
 def _liquidity_zones_by_windows(
     timeframe_data: dict[str, pd.DataFrame | None],
     mode: str,
@@ -2005,12 +2211,218 @@ def _first_valid_df(*dfs: pd.DataFrame | None) -> pd.DataFrame | None:
     return None
 
 
+
+def _zone_gap_to_price(zone: tuple | None, current_price: float, side: str) -> float:
+    """Khoảng cách từ giá hiện tại tới mép trong của zone.
+
+    side="lower": zone nằm dưới giá, gap = current - high.
+    side="upper": zone nằm trên giá, gap = low - current.
+    Nếu zone đang ôm/chạm giá thì gap = 0.
+    """
+    if not zone or len(zone) < 2 or zone[0] is None or zone[1] is None:
+        return float("inf")
+    low, high = float(zone[0]), float(zone[1])
+    if low <= current_price <= high:
+        return 0.0
+    if side == "lower":
+        return max(current_price - high, 0.0)
+    return max(low - current_price, 0.0)
+
+
+def _liq_zone_overlap_ratio(a: tuple | None, b: tuple | None) -> float:
+    if not a or not b or a[0] is None or a[1] is None or b[0] is None or b[1] is None:
+        return 0.0
+    a_low, a_high = float(a[0]), float(a[1])
+    b_low, b_high = float(b[0]), float(b[1])
+    overlap = max(0.0, min(a_high, b_high) - max(a_low, b_low))
+    smaller = max(min(a_high - a_low, b_high - b_low), 1e-12)
+    return overlap / smaller
+
+
+def _liq_zone_external_gap(a: tuple | None, b: tuple | None) -> float:
+    """Khoảng cách rỗng giữa 2 liquidity box; overlap/chạm nhau thì bằng 0."""
+    if not a or not b or a[0] is None or a[1] is None or b[0] is None or b[1] is None:
+        return float("inf")
+    a_low, a_high = float(a[0]), float(a[1])
+    b_low, b_high = float(b[0]), float(b[1])
+    if a_high < b_low:
+        return b_low - a_high
+    if b_high < a_low:
+        return a_low - b_high
+    return 0.0
+
+
+def _liq_zone_width(zone: tuple | None) -> float:
+    if not zone or zone[0] is None or zone[1] is None:
+        return 0.0
+    return max(float(zone[1]) - float(zone[0]), 0.0)
+
+
+def _mark_zone_merged_pool(zone: tuple, merged_with: str | None = None) -> tuple:
+    """Đánh dấu nội bộ khi near/main/deep bị gộp vì cùng cụm thanh khoản."""
+    if not zone or len(zone) < 4 or not isinstance(zone[3], dict):
+        return zone
+    meta = dict(zone[3])
+    meta["merged_pool"] = True
+    if merged_with:
+        roles = set(str(meta.get("merged_roles", "")).split("/")) if meta.get("merged_roles") else set()
+        roles.add(str(meta.get("role", "")))
+        roles.add(str(merged_with))
+        roles = {r for r in roles if r}
+        meta["merged_roles"] = "/".join(sorted(roles))
+    return (zone[0], zone[1], zone[2], meta)
+
+
+def _liq_zones_same_pool(a: tuple | None, b: tuple | None, current_price: float, mode: str) -> bool:
+    """Tránh in cùng một pool thành gần/chính/sâu.
+
+    Đây là lỗi chính ở các bản trước: 2 box không overlap nhiều nhưng chỉ cách nhau
+    rất ít vẫn bị gán thành near/main/deep khác nhau. Với scalp, nếu 2 vùng chỉ
+    cách nhau dưới khoảng 0.10% giá hoặc dưới ~1 box-width thì xem là cùng cụm
+    stop/liquidity pool, không in thành nhiều mục tiêu riêng.
+    """
+    if not a or not b:
+        return False
+
+    if _liq_zone_overlap_ratio(a, b) >= 0.20:
+        return True
+
+    gap = _liq_zone_external_gap(a, b)
+    width_a = _liq_zone_width(a)
+    width_b = _liq_zone_width(b)
+    max_width = max(width_a, width_b, 1e-12)
+    avg_width = max((width_a + width_b) / 2.0, 1e-12)
+
+    # Ngưỡng này là để gộp các role gần nhau, KHÔNG phải ép vùng cách xa nhau.
+    # Scalp cần gộp chặt để tránh output kiểu gần/chính/sâu chỉ lệch vài USDT.
+    gap_pct = 0.0010 if mode == "short" else 0.0022
+    close_gap_threshold = max(current_price * gap_pct, avg_width * 0.85)
+    if gap <= close_gap_threshold:
+        return True
+
+    ma = a[3] if len(a) > 3 and isinstance(a[3], dict) else {}
+    mb = b[3] if len(b) > 3 and isinstance(b[3], dict) else {}
+    la = ma.get("swing_level")
+    lb = mb.get("swing_level")
+    if la is None or lb is None:
+        return False
+
+    level_pct = 0.0013 if mode == "short" else 0.0028
+    level_threshold = max(current_price * level_pct, max_width * 1.35)
+    return abs(float(la) - float(lb)) <= level_threshold
+
+
+def _copy_zone_with_assigned_role(zone: tuple, role: str) -> tuple:
+    if not zone or len(zone) < 4 or not isinstance(zone[3], dict):
+        return zone
+    meta = dict(zone[3])
+    meta["assigned_role"] = role
+    meta["role"] = role
+    return (zone[0], zone[1], zone[2], meta)
+
+
+def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str) -> None:
+    """Chuẩn hóa near/main/deep sau khi tính candidate độc lập.
+
+    Lý do: cùng một H4/D1 có thể sinh ra nhiều candidate, nhưng nếu mỗi role tự chọn
+    độc lập thì sẽ có lỗi kiểu "sâu" gần hơn "chính", hoặc cùng một vùng bị in lặp.
+    Hàm này không bịa vùng mới; chỉ sắp xếp lại candidate theo khoảng cách thật:
+    - lower: càng gần giá thì swing low càng cao.
+    - upper: càng gần giá thì swing high càng thấp.
+    - vùng trùng pool bị bỏ bớt.
+    - nếu candidate thứ hai quá xa so với scalp thì gán vào "sâu", để "chính" là N/A.
+    """
+    far_pct_cut = 0.025 if mode == "short" else 0.060
+    far_atr_cut = 10.0 if mode == "short" else 12.0
+
+    for side in ("lower", "upper"):
+        raw: list[tuple] = []
+        for role in ("near", "main", "deep"):
+            z = zones.get(f"{side}_{role}")
+            if z and z[0] is not None and z[1] is not None:
+                raw.append(z)
+
+        # Sort trước theo gap, sau đó score giảm dần để candidate gần hơn luôn được xét trước.
+        raw.sort(
+            key=lambda z: (
+                _zone_gap_to_price(z, current_price, side),
+                -float((z[3] if len(z) > 3 and isinstance(z[3], dict) else {}).get("score", 0.0)),
+            )
+        )
+
+        unique: list[tuple] = []
+        for z in raw:
+            if any(_liq_zones_same_pool(z, kept, current_price, mode) for kept in unique):
+                # Nếu trùng/quá sát pool, giữ 1 candidate duy nhất; không in thành gần/chính/sâu riêng.
+                for i, kept in enumerate(unique):
+                    if _liq_zones_same_pool(z, kept, current_price, mode):
+                        mz = z[3] if len(z) > 3 and isinstance(z[3], dict) else {}
+                        mk = kept[3] if len(kept) > 3 and isinstance(kept[3], dict) else {}
+                        wz = abs(float(z[1]) - float(z[0]))
+                        wk = abs(float(kept[1]) - float(kept[0]))
+                        z_role = str(mz.get("role", ""))
+                        kept_role = str(mk.get("role", ""))
+                        # Cùng pool thì ưu tiên box hẹp hơn để scalp không bị in vùng rộng vô nghĩa.
+                        # Nếu độ rộng gần như nhau, dùng score để chọn candidate chất lượng hơn.
+                        choose_z = wz < wk * 0.92 or (
+                            abs(wz - wk) <= wk * 0.08
+                            and float(mz.get("score", 0.0)) > float(mk.get("score", 0.0))
+                        )
+                        if choose_z:
+                            unique[i] = _mark_zone_merged_pool(z, kept_role)
+                        else:
+                            unique[i] = _mark_zone_merged_pool(kept, z_role)
+                        break
+                continue
+            unique.append(z)
+
+        assigned = {"near": None, "main": None, "deep": None}
+        if unique:
+            assigned["near"] = _copy_zone_with_assigned_role(unique[0], "near")
+
+        for z in unique[1:]:
+            gap = _zone_gap_to_price(z, current_price, side)
+            gap_pct = gap / max(current_price, 1e-12)
+            meta = z[3] if len(z) > 3 and isinstance(z[3], dict) else {}
+            distance_atr = float(meta.get("distance_atr", 0.0) or 0.0)
+            is_far = gap_pct >= far_pct_cut or distance_atr >= far_atr_cut
+
+            if is_far:
+                if assigned["deep"] is None:
+                    assigned["deep"] = _copy_zone_with_assigned_role(z, "deep")
+                # Nếu đã có deep, bỏ candidate xa hơn/yếu hơn để tránh prompt loãng.
+                continue
+
+            if assigned["main"] is None:
+                assigned["main"] = _copy_zone_with_assigned_role(z, "main")
+            elif assigned["deep"] is None:
+                assigned["deep"] = _copy_zone_with_assigned_role(z, "deep")
+
+        # Nếu chưa có main nhưng có deep rất gần do chỉ có 2 candidate, không kéo deep lên main.
+        # Nếu có main và deep, đảm bảo deep thật sự xa hơn main.
+        if assigned["main"] is not None and assigned["deep"] is not None:
+            main_gap = _zone_gap_to_price(assigned["main"], current_price, side)
+            deep_gap = _zone_gap_to_price(assigned["deep"], current_price, side)
+            if deep_gap < main_gap:
+                assigned["main"], assigned["deep"] = assigned["deep"], assigned["main"]
+                assigned["main"] = _copy_zone_with_assigned_role(assigned["main"], "main")
+                assigned["deep"] = _copy_zone_with_assigned_role(assigned["deep"], "deep")
+
+        for role in ("near", "main", "deep"):
+            zones[f"{side}_{role}"] = assigned[role]
+
+    # Sau khi chuẩn hóa vai trò, label nên là vai trò giao dịch, không còn label theo timeframe cũ.
+    zones["label_near"] = "gần"
+    zones["label_main"] = "chính"
+    zones["label_deep"] = "sâu"
+    zones["liquidity_method"] = "fractal_swing_pool_v8_cluster_dedupe"
+
 def _liquidity_zones_by_windows(
     timeframe_data: dict[str, pd.DataFrame | None],
     mode: str,
     current_price: float,
 ) -> dict:
-    """Vùng thanh khoản V5: stop-pool ngoài swing, không phải band giá đang kẹt.
+    """Vùng thanh khoản V8: stop-pool ngoài swing, gộp near/main/deep nếu cùng cụm.
 
     Theo gợi ý OHLCV-only: khung lớn xác định level, khung nhỏ xác nhận sweep.
     SCALP: 1H cho vùng gần, 4H cho vùng chính/sâu, 15M chỉ kiểm tra sweep.
@@ -2041,13 +2453,15 @@ def _liquidity_zones_by_windows(
         ]
         calc_mode = "long"
 
-    result: dict = {"meta": [label for _, label, *_ in windows], "liquidity_method": "fractal_swing_pool_v5"}
+    result: dict = {"meta": [label for _, label, *_ in windows], "liquidity_method": "fractal_swing_pool_v8_cluster_dedupe"}
     for key, label, df, atr, lookback, m in windows:
         lower = _zone_for_liq_pools(df, sweep_df, current_price, atr, "low", key, calc_mode, lookback, m=m)
         upper = _zone_for_liq_pools(df, sweep_df, current_price, atr, "high", key, calc_mode, lookback, m=m)
         result[f"lower_{key}"] = lower
         result[f"upper_{key}"] = upper
         result[f"label_{key}"] = label
+
+    _normalize_liquidity_role_order(result, current_price, calc_mode)
     return result
 
 def _liquidity_zones(df: pd.DataFrame | None, current_price: float, atr: float | None) -> dict:

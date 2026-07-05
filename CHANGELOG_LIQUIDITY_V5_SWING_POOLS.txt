@@ -1,8 +1,0 @@
-Liquidity V5 Swing Pool Fix
-
-- Replaced broad price clustering with fractal swing high/low stop-pool estimation.
-- Lower liquidity zones are now boxes below swing lows; upper liquidity zones are boxes above swing highs.
-- M15/small timeframe candles are used only to mark sweep confirmation, not to build wide zones around current price.
-- Added strict width caps for SCALP so a random 200 USDT support/resistance band is not labelled as one liquidity zone.
-- Increased SCALP 4H fetch limit from 100 to 180 so H4 can retain 60-90 usable candles after indicator warm-up.
-- Updated analyze_system_prompt.txt to stop the model from inventing broad “cụm thanh khoản” ranges that are not printed by Python.
