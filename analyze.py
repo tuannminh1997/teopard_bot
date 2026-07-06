@@ -17,11 +17,33 @@ BINANCE_API_URL   = "https://api.binance.com/api/v3/klines"
 
 # ─── AI provider config ───────────────────────────────────────────────────────
 # Default vẫn là Anthropic/Claude để không làm vỡ config cũ.
-# Muốn test GLM 5.2 qua OpenRouter trên Railway:
-#   AI_PROVIDER=openrouter
-#   OPENROUTER_API_KEY=<key>
-#   OPENROUTER_MODEL=z-ai/glm-5.2
+# Provider hỗ trợ:
+#   AI_PROVIDER=anthropic   -> Claude native
+#   AI_PROVIDER=openrouter  -> OpenRouter, ví dụ z-ai/glm-5.2 hoặc deepseek/deepseek-v4-pro
+#   AI_PROVIDER=zai         -> Z.AI native/chính chủ, ví dụ glm-5.2
 AI_PROVIDER = os.getenv("AI_PROVIDER", "anthropic").strip().lower()
+
+OPENROUTER_PROVIDER_NAMES = {"openrouter", "or", "glm_openrouter", "openrouter_glm"}
+ZAI_PROVIDER_NAMES = {"zai", "z.ai", "z_ai", "zai_native", "zai-official", "zai_official", "glm_native"}
+ANTHROPIC_PROVIDER_NAMES = {"anthropic", "claude", "claude_native"}
+# Backward compatible: trước đây AI_PROVIDER=glm được hiểu là GLM qua OpenRouter.
+OPENROUTER_LEGACY_PROVIDER_NAMES = {"glm"}
+
+
+def _is_openrouter_provider(provider: str | None = None) -> bool:
+    p = (provider or AI_PROVIDER or "").strip().lower()
+    return p in OPENROUTER_PROVIDER_NAMES or p in OPENROUTER_LEGACY_PROVIDER_NAMES
+
+
+def _is_zai_provider(provider: str | None = None) -> bool:
+    p = (provider or AI_PROVIDER or "").strip().lower()
+    return p in ZAI_PROVIDER_NAMES
+
+
+def _is_anthropic_provider(provider: str | None = None) -> bool:
+    p = (provider or AI_PROVIDER or "").strip().lower()
+    return p in ANTHROPIC_PROVIDER_NAMES or not (_is_openrouter_provider(p) or _is_zai_provider(p))
+
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
@@ -35,11 +57,20 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Teopard Bot")
 
+# Z.AI native/chính chủ. Không cần thêm SDK, vẫn gọi HTTP OpenAI-compatible bằng requests.
+ZAI_API_KEY  = os.getenv("ZAI_API_KEY") or os.getenv("Z_AI_API_KEY")
+ZAI_MODEL    = os.getenv("ZAI_MODEL", os.getenv("GLM_MODEL", "glm-5.2"))
+ZAI_BASE_URL = os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4").rstrip("/")
+# Vì bạn muốn giảm lag, native Z.AI mặc định dùng high thay vì max. Có thể đổi max/xhigh trên Railway nếu muốn.
+ZAI_REASONING_EFFORT = os.getenv("ZAI_REASONING_EFFORT", os.getenv("GLM_REASONING_EFFORT", "high")).strip()
+ZAI_SUMMARY_REASONING_EFFORT = os.getenv("ZAI_SUMMARY_REASONING_EFFORT", "none").strip()
+ZAI_APP_NAME = os.getenv("ZAI_APP_NAME", "Teopard Bot")
+
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", os.getenv("CLAUDE_MAX_TOKENS", "8000")))
 LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "2"))
-# Call tóm tắt reasoning dùng token riêng và KHÔNG continuation để tránh GLM lặp length vì reasoning token.
+# Call tóm tắt reasoning dùng token riêng và KHÔNG continuation để tránh model đốt token reasoning ẩn.
 LLM_SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_SUMMARY_MAX_OUTPUT_TOKENS", "600"))
-# Mặc định tắt reasoning cho summary. Phân tích chính vẫn dùng OPENROUTER_REASONING_EFFORT nếu bạn set high/xhigh.
+# Mặc định tắt reasoning cho summary. Phân tích chính vẫn dùng provider-specific reasoning effort nếu bạn set.
 OPENROUTER_SUMMARY_REASONING_EFFORT = os.getenv("OPENROUTER_SUMMARY_REASONING_EFFORT", "off").strip()
 # Giữ tên cũ để code cũ không crash nếu còn tham chiếu.
 CLAUDE_MAX_TOKENS = LLM_MAX_OUTPUT_TOKENS
@@ -3848,21 +3879,37 @@ Yêu cầu:
 
 def get_ai_api_key() -> str | None:
     """Trả về API key theo provider hiện tại."""
-    if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai"):
+    if _is_openrouter_provider():
         return OPENROUTER_API_KEY
+    if _is_zai_provider():
+        return ZAI_API_KEY
     return ANTHROPIC_API_KEY
 
 
 def get_ai_model_name() -> str:
-    if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai"):
+    if _is_openrouter_provider():
         return OPENROUTER_MODEL
+    if _is_zai_provider():
+        return ZAI_MODEL
     return CLAUDE_MODEL
 
 
+def get_ai_provider_label() -> str:
+    if _is_openrouter_provider():
+        return "openrouter"
+    if _is_zai_provider():
+        return "zai"
+    return "anthropic"
+
+
 def ensure_ai_config() -> None:
-    if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai"):
+    if _is_openrouter_provider():
         if not OPENROUTER_API_KEY:
             raise RuntimeError("Missing OPENROUTER_API_KEY. Set AI_PROVIDER=openrouter and OPENROUTER_API_KEY in Railway variables.")
+        return
+    if _is_zai_provider():
+        if not ZAI_API_KEY:
+            raise RuntimeError("Missing ZAI_API_KEY. Set AI_PROVIDER=zai and ZAI_API_KEY in Railway variables.")
         return
     if not ANTHROPIC_API_KEY:
         raise RuntimeError("Missing ANTHROPIC_API_KEY in .env/Railway variables.")
@@ -3971,6 +4018,74 @@ def _openrouter_create_once(
     }
 
 
+def _zai_create_once(
+    system: str | None,
+    messages: list,
+    max_tokens: int,
+    timeout: int,
+    reasoning_effort: str | None = None,
+) -> dict:
+    """Gọi Z.AI native/chính chủ bằng OpenAI-compatible Chat Completions HTTP API."""
+    headers = {
+        "Authorization": f"Bearer {ZAI_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept-Language": "en-US,en",
+        "X-Client-Name": ZAI_APP_NAME,
+    }
+
+    payload_messages = []
+    if system:
+        payload_messages.append({"role": "system", "content": system})
+    payload_messages.extend(messages)
+
+    payload = {
+        "model": ZAI_MODEL,
+        "messages": payload_messages,
+        "max_tokens": max_tokens,
+    }
+
+    # Z.AI dùng top-level reasoning_effort + thinking.
+    # Summary mặc định truyền none/off để không tốn token và giảm latency.
+    if reasoning_effort is None:
+        effective_reasoning_effort = (ZAI_REASONING_EFFORT or "high").strip()
+    else:
+        effective_reasoning_effort = (reasoning_effort or "").strip()
+
+    effort_norm = effective_reasoning_effort.lower()
+    if effort_norm in ("", "off", "false", "0", "disabled"):
+        payload["thinking"] = {"type": "disabled"}
+        effective_effort_for_log = "off"
+    else:
+        # Z.AI docs hỗ trợ max/xhigh/high/medium/low/minimal/none cho GLM-5.2.
+        payload["thinking"] = {"type": "enabled"}
+        payload["reasoning_effort"] = effort_norm
+        effective_effort_for_log = effort_norm
+
+    r = requests.post(
+        f"{ZAI_BASE_URL}/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+    )
+    try:
+        r.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"Z.AI API error: {r.status_code} - {r.text[:1000]}") from exc
+
+    data = r.json()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    return {
+        "text": content,
+        "stop_reason": choice.get("finish_reason"),
+        "usage": data.get("usage"),
+        "effort": effective_effort_for_log,
+    }
+
+
 def llm_create_once(
     system: str | None,
     messages: list,
@@ -3979,8 +4094,10 @@ def llm_create_once(
     reasoning_effort: str | None = None,
 ) -> dict:
     ensure_ai_config()
-    if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai"):
+    if _is_openrouter_provider():
         return _openrouter_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
+    if _is_zai_provider():
+        return _zai_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
     return _anthropic_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
 
 
@@ -4020,7 +4137,7 @@ def create_with_continuation(
         stop_reason = result.get("stop_reason")
         try:
             print(
-                f"[LLM_RESPONSE] call_type={call_type} provider={AI_PROVIDER} model={get_ai_model_name()} "
+                f"[LLM_RESPONSE] call_type={call_type} provider={get_ai_provider_label()} model={get_ai_model_name()} "
                 f"effort={result.get('effort')} attempt={attempt + 1} stop_reason={stop_reason} usage={result.get('usage')}",
                 flush=True,
             )
@@ -4057,11 +4174,12 @@ def summarize_reasoning(full_response: str) -> str:
     if not get_ai_api_key():
         return ""
     try:
-        summary_effort = (
-            OPENROUTER_SUMMARY_REASONING_EFFORT
-            if AI_PROVIDER in ("openrouter", "glm", "zai", "z.ai")
-            else ANTHROPIC_SUMMARY_EFFORT
-        )
+        if _is_openrouter_provider():
+            summary_effort = OPENROUTER_SUMMARY_REASONING_EFFORT
+        elif _is_zai_provider():
+            summary_effort = ZAI_SUMMARY_REASONING_EFFORT
+        else:
+            summary_effort = ANTHROPIC_SUMMARY_EFFORT
         text = create_with_continuation(
             system=None,
             messages=[{

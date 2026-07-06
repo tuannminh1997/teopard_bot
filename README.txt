@@ -249,3 +249,50 @@ V4.12 pending-plan awareness update:
 - Model phải đánh giá kế hoạch cũ còn hiệu lực / bị hủy / cần thay thế trước khi ra kế hoạch mới.
 - Entry của lệnh chờ LONG không được hiểu là TP cho lệnh SHORT ngược lại; Entry của lệnh chờ SHORT không được hiểu là TP cho lệnh LONG ngược lại.
 - Nếu giá chạy theo hướng dự báo nhưng không hồi về Entry cũ, model không được đuổi giá trừ khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu không thì ưu tiên NO_TRADE hoặc chờ kiểm tra lại.
+
+
+=== V16 Z.AI native / OpenRouter / Claude provider switch ===
+Bản này hỗ trợ 3 đường gọi model, chọn bằng AI_PROVIDER:
+
+1) Z.AI native/chính chủ — khuyên dùng nếu muốn giảm latency so với OpenRouter:
+AI_PROVIDER=zai
+ZAI_API_KEY=...
+ZAI_MODEL=glm-5.2
+ZAI_BASE_URL=https://api.z.ai/api/paas/v4
+ZAI_REASONING_EFFORT=high
+ZAI_SUMMARY_REASONING_EFFORT=none
+LLM_MAX_OUTPUT_TOKENS=8000
+LLM_MAX_CONTINUATIONS=2
+LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
+
+2) OpenRouter — giữ lại để chuyển về GLM qua OpenRouter hoặc DeepSeek:
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=z-ai/glm-5.2
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_REASONING_EFFORT=xhigh
+OPENROUTER_SUMMARY_REASONING_EFFORT=off
+LLM_MAX_OUTPUT_TOKENS=8000
+LLM_MAX_CONTINUATIONS=2
+LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
+
+Ví dụ đổi sang DeepSeek trên OpenRouter:
+AI_PROVIDER=openrouter
+OPENROUTER_MODEL=deepseek/deepseek-v4-pro
+OPENROUTER_REASONING_EFFORT=high
+
+3) Claude native / Anthropic:
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=...
+CLAUDE_MODEL=claude-sonnet-5
+ANTHROPIC_EFFORT=max
+ANTHROPIC_SUMMARY_EFFORT=high
+LLM_MAX_OUTPUT_TOKENS=8000
+LLM_MAX_CONTINUATIONS=2
+
+Ghi chú chuyển provider:
+- Các biến provider không dùng có thể để dư trong Railway, code chỉ đọc bộ biến tương ứng với AI_PROVIDER.
+- Nếu muốn dùng Z.AI chính chủ, đặt AI_PROVIDER=zai, không dùng AI_PROVIDER=glm. AI_PROVIDER=glm được giữ tương thích cũ và vẫn route sang OpenRouter.
+- Z.AI native dùng endpoint OpenAI-compatible /chat/completions và truyền reasoning_effort trực tiếp.
+- ZAI_REASONING_EFFORT mặc định high để giảm lag; đổi max/xhigh nếu muốn suy luận sâu hơn nhưng có thể chậm hơn.
+- ZAI_SUMMARY_REASONING_EFFORT mặc định none để summary không đốt token reasoning.

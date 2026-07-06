@@ -127,3 +127,10 @@ Ghi chú kế hoạch đang mở:
 - Khi phân tích lại cùng coin/mode, bot gửi thêm kế hoạch cũ đang chờ/đã khớp cho AI để tránh hiểu nhầm.
 - LONG chờ hồi không phải tín hiệu SHORT về vùng Entry; SHORT chờ hồi không phải tín hiệu LONG về vùng Entry.
 - Nếu giá đã chạy xa khỏi Entry cũ, AI phải nêu giữ/hủy/thay thế kế hoạch, không được đuổi giá nếu chưa có vùng vào mới rõ.
+
+Ghi chú Z.AI native V16:
+- Muốn chạy GLM chính chủ Z.AI: AI_PROVIDER=zai, ZAI_API_KEY=..., ZAI_MODEL=glm-5.2, ZAI_BASE_URL=https://api.z.ai/api/paas/v4.
+- ZAI_REASONING_EFFORT mặc định high để giảm lag; có thể đổi max/xhigh nếu muốn phân tích sâu hơn.
+- ZAI_SUMMARY_REASONING_EFFORT mặc định none để summary nhanh và rẻ hơn.
+- Muốn quay lại OpenRouter: AI_PROVIDER=openrouter, OPENROUTER_MODEL=z-ai/glm-5.2 hoặc deepseek/deepseek-v4-pro.
+- Muốn quay lại Claude native: AI_PROVIDER=anthropic.
