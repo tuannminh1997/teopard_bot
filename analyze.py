@@ -124,7 +124,11 @@ def get_result_check_interval(mode: str) -> str:
 PREDICTION_HISTORY_COUNT = 5
 VISIBLE_PREDICTION_RETENTION_LIMIT = 10
 HIDDEN_LEARNING_RETENTION_LIMIT = 10
+# V19: REJECTED_PLAN/NO_TRADE không còn được lưu vào predictions sau mỗi lần phân tích.
+# Biến này vẫn giữ để lọc dữ liệu cũ trong DB của các bản trước.
 HIDDEN_LEARNING_RESULTS = ("REJECTED_PLAN", "NO_TRADE")
+TRADE_CANDIDATE_RETENTION_LIMIT = int(os.getenv("TRADE_CANDIDATE_RETENTION_LIMIT", "20"))
+TRADE_CANDIDATE_EXPIRE_HOURS = int(os.getenv("TRADE_CANDIDATE_EXPIRE_HOURS", "24"))
 VN_TZ = timezone(timedelta(hours=7))
 
 
@@ -205,10 +209,48 @@ def init_prediction_db() -> None:
         except sqlite3.OperationalError:
             pass
 
+        # V19: phân tích hợp lệ chỉ lưu vào bảng draft/candidate.
+        # Chỉ khi user bấm "Tôi đã trade theo lệnh này" mới copy sang predictions để auto-check.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trade_candidates (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id             INTEGER,
+                chat_id             INTEGER,
+                symbol              TEXT NOT NULL,
+                mode                TEXT NOT NULL,
+                created_at          TEXT NOT NULL,
+                expires_at          TEXT NOT NULL,
+                direction           TEXT NOT NULL,
+                entry_low           REAL,
+                entry_high          REAL,
+                sl                  REAL,
+                tp1                 REAL,
+                tp2                 REAL,
+                market_snapshot     TEXT,
+                feature_snapshot    TEXT,
+                reasoning_summary   TEXT,
+                full_response       TEXT,
+                status              TEXT NOT NULL DEFAULT 'DRAFT',
+                confirmed_at        TEXT,
+                confirmed_prediction_id INTEGER
+            )
+        """)
+        for col, definition in [
+            ("expires_at", "TEXT"),
+            ("status", "TEXT NOT NULL DEFAULT 'DRAFT'"),
+            ("confirmed_at", "TEXT"),
+            ("confirmed_prediction_id", "INTEGER"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE trade_candidates ADD COLUMN {col} {definition}")
+            except sqlite3.OperationalError:
+                pass
+
         # Index nhẹ cho history/stats/learning/auto-check khi DB lớn hơn.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_id_id ON predictions(user_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_symbol_mode_id ON predictions(user_id, symbol, mode, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_result_next_check ON predictions(result, next_check_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_candidates_user_status_id ON trade_candidates(user_id, status, id DESC)")
         conn.commit()
 
 
@@ -259,6 +301,253 @@ def prune_prediction_history(user_id: int | None) -> None:
         )
         conn.commit()
 
+
+
+def prune_trade_candidates(user_id: int | None = None) -> None:
+    """Giữ bảng draft gọn. Candidate chỉ là phân tích chờ user xác nhận, không phải history."""
+    now_s = iso(utc_now())
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            DELETE FROM trade_candidates
+            WHERE status='DRAFT' AND expires_at < ?
+            """,
+            (now_s,),
+        )
+        if user_id is not None:
+            conn.execute(
+                """
+                DELETE FROM trade_candidates
+                WHERE user_id=?
+                  AND id NOT IN (
+                      SELECT id FROM trade_candidates
+                      WHERE user_id=?
+                      ORDER BY id DESC
+                      LIMIT ?
+                  )
+                """,
+                (user_id, user_id, TRADE_CANDIDATE_RETENTION_LIMIT),
+            )
+        conn.commit()
+
+
+def save_trade_candidate(
+    symbol: str,
+    mode: str,
+    direction: str,
+    entry_low: float | None,
+    entry_high: float | None,
+    sl: float | None,
+    tp1: float | None,
+    tp2: float | None,
+    market_snapshot: str | None,
+    feature_snapshot: str | None,
+    reasoning_summary: str | None,
+    full_response: str | None,
+    user_id: int | None = None,
+    chat_id: int | None = None,
+) -> int:
+    """Lưu bản nháp có thể track. Không xuất hiện trong /history, /stats, auto-check."""
+    now = utc_now()
+    expires_at = now + timedelta(hours=TRADE_CANDIDATE_EXPIRE_HOURS)
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO trade_candidates
+                (user_id, chat_id, symbol, mode, created_at, expires_at, direction,
+                 entry_low, entry_high, sl, tp1, tp2,
+                 market_snapshot, feature_snapshot, reasoning_summary, full_response, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT')
+            """,
+            (user_id, chat_id, symbol, mode, iso(now), iso(expires_at), direction,
+             entry_low, entry_high, sl, tp1, tp2,
+             market_snapshot, feature_snapshot, reasoning_summary, full_response),
+        )
+        candidate_id = cursor.lastrowid
+        conn.commit()
+    prune_trade_candidates(user_id)
+    return int(candidate_id)
+
+
+def get_trade_candidate(candidate_id: int, user_id: int | None = None) -> dict | None:
+    init_prediction_db()
+    clauses = ["id=?"]
+    params: list = [candidate_id]
+    if user_id is not None:
+        clauses.append("user_id=?")
+        params.append(user_id)
+    where = " AND ".join(clauses)
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            f"""
+            SELECT id, user_id, chat_id, symbol, mode, created_at, expires_at, direction,
+                   entry_low, entry_high, sl, tp1, tp2,
+                   market_snapshot, feature_snapshot, reasoning_summary, full_response,
+                   status, confirmed_prediction_id
+            FROM trade_candidates
+            WHERE {where}
+            """,
+            params,
+        ).fetchone()
+    if not row:
+        return None
+    keys = [
+        "id", "user_id", "chat_id", "symbol", "mode", "created_at", "expires_at", "direction",
+        "entry_low", "entry_high", "sl", "tp1", "tp2",
+        "market_snapshot", "feature_snapshot", "reasoning_summary", "full_response",
+        "status", "confirmed_prediction_id",
+    ]
+    return dict(zip(keys, row))
+
+
+def _candidate_entry_price(candidate: dict, live_price: float | None = None) -> float | None:
+    low = candidate.get("entry_low")
+    high = candidate.get("entry_high")
+    direction = (candidate.get("direction") or "").upper()
+    if low is None or high is None:
+        return live_price
+    low_f = min(float(low), float(high))
+    high_f = max(float(low), float(high))
+    if live_price is not None and low_f <= float(live_price) <= high_f:
+        return float(live_price)
+    # User bấm "đã trade" nhưng bot không biết giá khớp thực tế. Dùng mép bất lợi để chấm bảo thủ.
+    if direction == "LONG":
+        return high_f
+    if direction == "SHORT":
+        return low_f
+    return (low_f + high_f) / 2.0
+
+
+def confirm_trade_candidate(candidate_id: int, user_id: int | None = None) -> dict:
+    """User xác nhận đã trade theo bot -> copy candidate sang predictions và bắt đầu auto-check.
+
+    V20: mỗi nút xác nhận gắn với đúng một trade_candidates.id.
+    Hàm này claim candidate bằng UPDATE status='CONFIRMING' trước khi save_prediction để chống double-click/race.
+    Vì vậy user bấm nhiều lần hoặc Telegram gửi callback lặp lại cũng không tạo nhiều prediction.
+    """
+    init_prediction_db()
+    candidate = get_trade_candidate(candidate_id, user_id=user_id)
+    if not candidate:
+        return {"ok": False, "message": "Không tìm thấy lệnh nháp này, hoặc lệnh không thuộc user hiện tại."}
+
+    status = (candidate.get("status") or "DRAFT").upper()
+    if status == "CONFIRMED" and candidate.get("confirmed_prediction_id"):
+        return {
+            "ok": True,
+            "already_confirmed": True,
+            "prediction_id": int(candidate["confirmed_prediction_id"]),
+            "message": f"Lệnh nháp #{candidate_id} đã được lưu theo dõi trước đó. Mã theo dõi: #{candidate['confirmed_prediction_id']}.",
+        }
+    if status == "CONFIRMING":
+        return {"ok": True, "message": f"Lệnh nháp #{candidate_id} đang được xử lý xác nhận. Vui lòng không bấm lại."}
+    if status != "DRAFT":
+        return {"ok": False, "message": f"Lệnh nháp #{candidate_id} không còn hiệu lực để lưu. Trạng thái hiện tại: {status}."}
+
+    expires = parse_utc_datetime(candidate.get("expires_at"))
+    if expires is not None and utc_now() > expires:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE trade_candidates SET status='EXPIRED' WHERE id=? AND status='DRAFT'",
+                (candidate_id,),
+            )
+            conn.commit()
+        return {"ok": False, "message": f"Lệnh nháp #{candidate_id} đã quá hạn xác nhận. Hãy phân tích lại để có dữ liệu mới."}
+
+    # Claim atomically before doing network/DB work. This prevents duplicate saves on double-click.
+    with sqlite3.connect(DB_PATH) as conn:
+        if user_id is None:
+            cur = conn.execute(
+                "UPDATE trade_candidates SET status='CONFIRMING' WHERE id=? AND status='DRAFT'",
+                (candidate_id,),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE trade_candidates SET status='CONFIRMING' WHERE id=? AND user_id=? AND status='DRAFT'",
+                (candidate_id, user_id),
+            )
+        conn.commit()
+        claimed = cur.rowcount == 1
+
+    if not claimed:
+        latest = get_trade_candidate(candidate_id, user_id=user_id)
+        latest_status = (latest or {}).get("status", "UNKNOWN")
+        latest_pid = (latest or {}).get("confirmed_prediction_id")
+        if str(latest_status).upper() == "CONFIRMED" and latest_pid:
+            return {
+                "ok": True,
+                "already_confirmed": True,
+                "prediction_id": int(latest_pid),
+                "message": f"Lệnh nháp #{candidate_id} đã được lưu theo dõi trước đó. Mã theo dõi: #{latest_pid}.",
+            }
+        return {"ok": True, "message": f"Lệnh nháp #{candidate_id} đang được xử lý hoặc đã đổi trạng thái: {latest_status}."}
+
+    try:
+        live_price = get_current_price_raw(candidate["symbol"])
+        entry_price = _candidate_entry_price(candidate, live_price)
+
+        prediction_id = save_prediction(
+            symbol=candidate["symbol"],
+            mode=candidate["mode"],
+            direction=candidate["direction"],
+            entry_low=candidate.get("entry_low"),
+            entry_high=candidate.get("entry_high"),
+            sl=candidate.get("sl"),
+            tp1=candidate.get("tp1"),
+            tp2=candidate.get("tp2"),
+            market_snapshot=candidate.get("market_snapshot"),
+            feature_snapshot=candidate.get("feature_snapshot"),
+            reasoning_summary=candidate.get("reasoning_summary"),
+            full_response=candidate.get("full_response"),
+            user_id=candidate.get("user_id"),
+            chat_id=candidate.get("chat_id"),
+        )
+
+        # Vì user bấm "đã trade", bắt đầu theo dõi như lệnh đã khớp thay vì chờ Entry lần nữa.
+        if entry_price is not None:
+            mark_entry_filled(prediction_id, float(entry_price), utc_now(), candidate["mode"])
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """
+                UPDATE trade_candidates
+                SET status='CONFIRMED', confirmed_at=?, confirmed_prediction_id=?
+                WHERE id=?
+                """,
+                (iso(utc_now()), prediction_id, candidate_id),
+            )
+            conn.commit()
+
+        return {
+            "ok": True,
+            "prediction_id": int(prediction_id),
+            "entry_price": entry_price,
+            "message": (
+                f"Đã lưu lệnh nháp #{candidate_id} thành lệnh theo dõi #{prediction_id}. "
+                f"Giá vào theo dõi: {fmt(entry_price)}."
+            ),
+        }
+    except Exception as exc:
+        # Nếu lỗi sau khi claim, mở lại DRAFT để user có thể bấm lại sau khi lỗi tạm thời qua đi.
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE trade_candidates SET status='DRAFT' WHERE id=? AND status='CONFIRMING'",
+                (candidate_id,),
+            )
+            conn.commit()
+        return {"ok": False, "message": f"Lưu lệnh nháp #{candidate_id} thất bại: {exc}"}
+
+
+def discard_trade_candidate(candidate_id: int, user_id: int | None = None) -> dict:
+    init_prediction_db()
+    candidate = get_trade_candidate(candidate_id, user_id=user_id)
+    if not candidate:
+        return {"ok": False, "message": "Không tìm thấy lệnh nháp này, hoặc lệnh không thuộc user hiện tại."}
+    if (candidate.get("status") or "").upper() != "DRAFT":
+        return {"ok": True, "message": "Lệnh này không còn là nháp, không cần bỏ qua."}
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE trade_candidates SET status='DISCARDED' WHERE id=?", (candidate_id,))
+        conn.commit()
+    return {"ok": True, "message": "Đã bỏ qua lệnh này. Bot sẽ không lưu vào history và không theo dõi kết quả."}
 
 def save_prediction(
     symbol: str,
@@ -509,7 +798,7 @@ def get_recent_predictions(
     Lấy lịch sử dùng cho Claude học lại.
 
     Quy tắc privacy/per-user learning:
-    - Khi phân tích cho user nào, Claude chỉ nhận lịch sử của chính user đó.
+    - Khi phân tích cho user nào, AI chỉ nhận lịch sử lệnh mà chính user đó đã bấm xác nhận trade theo bot.
     - Không dùng lịch sử global của user khác để tránh nhiễu chiến lược và tránh lộ dữ liệu.
     - Nếu user_id=None (ví dụ gọi legacy/manual), không đưa lịch sử học lại.
     """
@@ -524,6 +813,7 @@ def get_recent_predictions(
                    market_snapshot, feature_snapshot
             FROM predictions
             WHERE symbol=? AND mode=? AND user_id=?
+              AND result NOT IN ('REJECTED_PLAN', 'NO_TRADE')
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -1069,7 +1359,7 @@ def format_stats(symbol: str | None = None, user_id: int | None = None) -> str:
     title = f"📊 Thống kê {format_scope_label(symbol, user_id)}"
     return "\n".join([
         title,
-        f"Tổng prediction: {total}",
+        f"Tổng lệnh đã trade theo bot: {total}",
         f"WIN/LOSS: {wins}/{losses} | Win rate: {win_rate:.1f}%",
         f"PENDING_ENTRY: {counts.get('PENDING_ENTRY', 0)}",
         f"ENTRY_FILLED: {counts.get('ENTRY_FILLED', 0)}",
@@ -1099,10 +1389,16 @@ def format_history(symbol: str | None = None, limit: int = 10, user_id: int | No
     if not rows:
         return "Chưa có lịch sử dự đoán."
 
+    # V21: /history hiển thị số thứ tự ổn định theo cửa sổ 10 lệnh gần nhất: cũ → mới.
+    # Ví dụ có #1..#10, khi lệnh thứ 11 được lưu thì lệnh cũ nhất bị prune,
+    # lệnh cũ #2 sẽ thành #1, ... và lệnh mới nhất thành #10.
+    # DB id vẫn giữ nguyên ở trong DB, nhưng không dùng làm số hiển thị cho user.
+    rows = list(reversed(rows))
+
     # user_id=None chỉ được dùng cho admin, nên admin sẽ thấy lệnh thuộc user nào.
     is_admin_scope = user_id is None
-    lines = [f"🧾 10 dự đoán gần nhất {format_scope_label(symbol, user_id)}"]
-    for row in rows:
+    lines = [f"🧾 10 lệnh đã trade theo bot gần nhất {format_scope_label(symbol, user_id)}"]
+    for display_idx, row in enumerate(rows, 1):
         pid, owner_user_id, owner_chat_id, sym, mode, direction, entry_low, entry_high, sl, tp1, tp2, result, result_price, created_at, result_reason = row
         mode_label = "SCALP" if mode == "short" else "SWING"
         created_label = format_vn_datetime(created_at) if created_at else "không rõ"
@@ -1116,7 +1412,7 @@ def format_history(symbol: str | None = None, limit: int = 10, user_id: int | No
             short_reason = str(result_reason)[:260] + ("..." if len(str(result_reason)) > 260 else "")
             reason_line = f"\nLý do không auto-check: {short_reason}"
         lines.append(
-            f"#{pid} {sym} {mode_label} {direction} → {result}\n"
+            f"#{display_idx} {sym} {mode_label} {direction} → {result}\n"
             f"{owner_line}"
             f"Thời gian phân tích: {created_label}\n"
             f"Entry {fmt(entry_low)}–{fmt(entry_high)} | SL {fmt(sl)} | TP1 {fmt(tp1)} | TP2 {fmt(tp2)}"
@@ -1126,18 +1422,33 @@ def format_history(symbol: str | None = None, limit: int = 10, user_id: int | No
     return "\n\n".join(lines)
 
 
-def clear_prediction_history() -> int:
+def clear_prediction_history() -> dict:
     init_prediction_db()
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute("SELECT COUNT(*) FROM predictions")
-        count = int(cur.fetchone()[0])
+        visible_count = int(conn.execute(
+            "SELECT COUNT(*) FROM predictions WHERE result NOT IN ('REJECTED_PLAN', 'NO_TRADE')"
+        ).fetchone()[0])
+        total_prediction_count = int(conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0])
+        try:
+            draft_count = int(conn.execute("SELECT COUNT(*) FROM trade_candidates").fetchone()[0])
+        except sqlite3.Error:
+            draft_count = 0
         conn.execute("DELETE FROM predictions")
         try:
+            conn.execute("DELETE FROM trade_candidates")
+        except sqlite3.Error:
+            pass
+        try:
             conn.execute("DELETE FROM sqlite_sequence WHERE name='predictions'")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='trade_candidates'")
         except sqlite3.Error:
             pass
         conn.commit()
-    return count
+    return {
+        "visible_count": visible_count,
+        "total_prediction_count": total_prediction_count,
+        "draft_count": draft_count,
+    }
 
 
 # ─── Binance + Indicators ─────────────────────────────────────────────────────
@@ -3777,7 +4088,7 @@ def format_prediction_history(history: list[dict]) -> str:
     if not history:
         return "No previous analysis for this symbol/mode."
 
-    lines = [f"USER-SPECIFIC RECENT LEARNING SUMMARY ({len(history)} latest analyses from this user only):"]
+    lines = [f"USER-SPECIFIC RECENT TRADED-ONLY LEARNING SUMMARY ({len(history)} user-confirmed trades for this symbol/mode only):"]
     finished = [p for p in history if p["result"] in ("WIN", "LOSS")]
     if finished:
         wins = sum(1 for p in finished if p["result"] == "WIN")
@@ -3815,7 +4126,7 @@ def format_prediction_history(history: list[dict]) -> str:
             f"Market then: {snapshot} Feature then: {feature_snapshot}"
         )
 
-    lines.append("Use this user-specific summary as learning context; do not copy old full responses and do not assume global user behavior.")
+    lines.append("Use this traded-only user-specific summary as learning context. These are signals the user explicitly chose to trade/follow; do not learn from unconfirmed analyses and do not assume global user behavior.")
     return "\n".join(lines)
 
 
@@ -4794,39 +5105,14 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
 
     if direction == "NO_TRADE":
-        save_no_trade_prediction(
-            symbol=binance_symbol,
-            mode=mode,
-            market_snapshot=market_snapshot,
-            feature_snapshot=feature_snapshot,
-            reasoning_summary=build_no_trade_summary(output),
-            full_response=output,
-            user_id=user_id,
-            chat_id=chat_id,
-        )
+        # V19: chỉ lệnh user xác nhận đã trade mới được lưu vào predictions/history.
         return output
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
         guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors)
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
-        save_rejected_prediction(
-            symbol=binance_symbol,
-            mode=mode,
-            direction=direction or pred.get("direction"),
-            entry_low=pred.get("entry_low"),
-            entry_high=pred.get("entry_high"),
-            sl=pred.get("sl"),
-            tp1=pred.get("tp1"),
-            tp2=pred.get("tp2"),
-            market_snapshot=market_snapshot,
-            feature_snapshot=feature_snapshot,
-            reasoning_summary="Guard từ chối tín hiệu: " + " ; ".join(guard_errors[:5]),
-            full_response=output,
-            validation_errors=guard_errors,
-            user_id=user_id,
-            chat_id=chat_id,
-        )
+        # V19: không lưu rejected vào predictions nữa để history chỉ gồm lệnh user thật sự trade.
         return guarded_output
 
     can_track = (
@@ -4840,7 +5126,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
 
     if can_track:
         reasoning_summary = summarize_reasoning(output)
-        save_prediction(
+        save_trade_candidate(
             symbol=binance_symbol,
             mode=mode,
             direction=direction,
@@ -4857,7 +5143,6 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
             chat_id=chat_id,
         )
     else:
-        # Không ẩn output. Chỉ lưu hidden để learning/debug vì bot không đủ số để auto-check.
         missing = []
         if direction not in ("LONG", "SHORT"):
             missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO TRADE.")
@@ -4865,23 +5150,6 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
             if pred.get(field) is None:
                 missing.append(f"Không parse được {field}.")
         log_hidden_rejection(binance_symbol, mode, pred, missing, output)
-        save_rejected_prediction(
-            symbol=binance_symbol,
-            mode=mode,
-            direction=direction or pred.get("direction"),
-            entry_low=pred.get("entry_low"),
-            entry_high=pred.get("entry_high"),
-            sl=pred.get("sl"),
-            tp1=pred.get("tp1"),
-            tp2=pred.get("tp2"),
-            market_snapshot=market_snapshot,
-            feature_snapshot=feature_snapshot,
-            reasoning_summary="Không đủ số để auto-check: " + " ; ".join(missing[:5]),
-            full_response=output,
-            validation_errors=missing,
-            user_id=user_id,
-            chat_id=chat_id,
-        )
 
     return output
 
@@ -4901,7 +5169,7 @@ async def collect_timeframe_data(binance_symbol: str, mode: str) -> dict[str, pd
     return dict(zip(tasks.keys(), results))
 
 
-async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, chat_id: int | None = None) -> str:
+async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, chat_id: int | None = None) -> dict:
     """
     Async entry point used by Telegram handlers.
 
@@ -4971,42 +5239,15 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
 
     if direction == "NO_TRADE":
-        await asyncio.to_thread(
-            save_no_trade_prediction,
-            symbol=binance_symbol,
-            mode=mode,
-            market_snapshot=market_snapshot,
-            feature_snapshot=feature_snapshot,
-            reasoning_summary=build_no_trade_summary(output),
-            full_response=output,
-            user_id=user_id,
-            chat_id=chat_id,
-        )
-        return output
+        # V19: NO TRADE không lưu vào predictions/history; chỉ lệnh user xác nhận mới được theo dõi.
+        return {"text": output, "candidate_id": None}
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
         guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors)
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
-        await asyncio.to_thread(
-            save_rejected_prediction,
-            symbol=binance_symbol,
-            mode=mode,
-            direction=direction or pred.get("direction"),
-            entry_low=pred.get("entry_low"),
-            entry_high=pred.get("entry_high"),
-            sl=pred.get("sl"),
-            tp1=pred.get("tp1"),
-            tp2=pred.get("tp2"),
-            market_snapshot=market_snapshot,
-            feature_snapshot=feature_snapshot,
-            reasoning_summary="Guard từ chối tín hiệu: " + " ; ".join(guard_errors[:5]),
-            full_response=output,
-            validation_errors=guard_errors,
-            user_id=user_id,
-            chat_id=chat_id,
-        )
-        return guarded_output
+        # V19: không lưu rejected vào predictions/history nữa.
+        return {"text": guarded_output, "candidate_id": None}
 
     can_track = (
         direction in ("LONG", "SHORT")
@@ -5017,10 +5258,11 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         and pred.get("tp2") is not None
     )
 
+    candidate_id = None
     if can_track:
         reasoning_summary = await asyncio.to_thread(summarize_reasoning, output)
-        await asyncio.to_thread(
-            save_prediction,
+        candidate_id = await asyncio.to_thread(
+            save_trade_candidate,
             symbol=binance_symbol,
             mode=mode,
             direction=direction,
@@ -5037,7 +5279,6 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             chat_id=chat_id,
         )
     else:
-        # Không ẩn output. Chỉ lưu hidden để learning/debug vì bot không đủ số để auto-check.
         missing = []
         if direction not in ("LONG", "SHORT"):
             missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO TRADE.")
@@ -5045,23 +5286,5 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             if pred.get(field) is None:
                 missing.append(f"Không parse được {field}.")
         log_hidden_rejection(binance_symbol, mode, pred, missing, output)
-        await asyncio.to_thread(
-            save_rejected_prediction,
-            symbol=binance_symbol,
-            mode=mode,
-            direction=direction or pred.get("direction"),
-            entry_low=pred.get("entry_low"),
-            entry_high=pred.get("entry_high"),
-            sl=pred.get("sl"),
-            tp1=pred.get("tp1"),
-            tp2=pred.get("tp2"),
-            market_snapshot=market_snapshot,
-            feature_snapshot=feature_snapshot,
-            reasoning_summary="Không đủ số để auto-check: " + " ; ".join(missing[:5]),
-            full_response=output,
-            validation_errors=missing,
-            user_id=user_id,
-            chat_id=chat_id,
-        )
 
-    return output
+    return {"text": output, "candidate_id": candidate_id}

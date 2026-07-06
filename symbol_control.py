@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import asyncio
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -15,6 +16,8 @@ from telegram.ext import (
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 ANALYZE_SHORT_CALLBACK_PREFIX = "analyze_short"
 ANALYZE_LONG_CALLBACK_PREFIX  = "analyze_long"
+CONFIRM_TRADE_CALLBACK_PREFIX = "confirm_trade"
+DISCARD_TRADE_CALLBACK_PREFIX = "discard_trade"
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -71,6 +74,35 @@ def symbol_analysis_keyboard(symbol: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton("Scalp (15m/1H/4H)", callback_data=f"{ANALYZE_SHORT_CALLBACK_PREFIX}:{symbol}"),
         InlineKeyboardButton("Swing (4H/1D/1W)",  callback_data=f"{ANALYZE_LONG_CALLBACK_PREFIX}:{symbol}"),
     ]])
+
+
+
+
+def is_actionable_trade_response(text: str | None) -> bool:
+    """Return True only for user-visible LONG/SHORT trade signals.
+
+    V22 guard: NO TRADE must never show the confirm-trade keyboard, even if
+    a stale/buggy candidate_id is accidentally returned by analyze_symbol().
+    The DB still uses NO_TRADE internally, but user output may be NO TRADE.
+    """
+    import re
+
+    if not text:
+        return False
+
+    # Any explicit NO TRADE decision wins over later wording.
+    if re.search(r"QUYẾT\s+ĐỊNH[:\s]+(?:NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)", text, re.IGNORECASE):
+        return False
+
+    # Only explicit LONG/SHORT decisions are actionable.
+    return bool(re.search(r"QUYẾT\s+ĐỊNH[:\s]+(?:LONG|SHORT)\b", text, re.IGNORECASE))
+
+
+def trade_candidate_keyboard(candidate_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Tôi đã trade theo lệnh này", callback_data=f"{CONFIRM_TRADE_CALLBACK_PREFIX}:{candidate_id}")],
+        [InlineKeyboardButton("Bỏ qua, không lưu history", callback_data=f"{DISCARD_TRADE_CALLBACK_PREFIX}:{candidate_id}")],
+    ])
 
 
 def split_telegram_message(text: str, limit: int = 3900) -> list[str]:
@@ -203,15 +235,102 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
     try:
-        result = await analyze_symbol(symbol, mode, user_id=user.id, chat_id=query.message.chat_id)
+        result_payload = await analyze_symbol(symbol, mode, user_id=user.id, chat_id=query.message.chat_id)
     except Exception as exc:
         await query.message.reply_text(f"Phân tích thất bại: {exc}")
         return
 
     increment_user_usage(user.id)
 
-    for chunk in split_telegram_message(result):
-        await query.message.reply_text(chunk)
+    if isinstance(result_payload, dict):
+        result_text = result_payload.get("text", "")
+        candidate_id = result_payload.get("candidate_id")
+    else:
+        result_text = str(result_payload)
+        candidate_id = None
+
+    # V22: Chỉ LONG/SHORT hợp lệ mới được hiện nút xác nhận trade.
+    # NO TRADE không bao giờ có nút, kể cả khi analyze_symbol() lỡ trả candidate_id do lỗi/stale state.
+    show_trade_confirm_button = bool(candidate_id) and is_actionable_trade_response(result_text)
+
+    chunks = split_telegram_message(result_text)
+    for idx, chunk in enumerate(chunks):
+        is_last = idx == len(chunks) - 1
+        if is_last and show_trade_confirm_button:
+            await query.message.reply_text(
+                chunk + "\n\nNếu bạn thật sự vào lệnh theo phân tích này, bấm nút bên dưới để bot lưu vào history và theo dõi WIN/LOSS.",
+                reply_markup=trade_candidate_keyboard(int(candidate_id)),
+            )
+        else:
+            await query.message.reply_text(chunk)
+
+
+
+async def confirm_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import confirm_trade_candidate
+
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user or not query.data:
+        return
+    await query.answer()
+    try:
+        _, raw_id = query.data.split(":", 1)
+        candidate_id = int(raw_id)
+    except Exception:
+        await query.message.reply_text("Không đọc được mã lệnh nháp.")
+        return
+
+    result = await asyncio.to_thread(confirm_trade_candidate, candidate_id, user.id)
+    await query.message.reply_text(result.get("message", "Đã xử lý."))
+    # Dù là lần bấm đầu, bấm lặp, hay đang xử lý, nút này không nên còn clickable trên UI.
+    if result.get("ok") or result.get("already_confirmed"):
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+async def discard_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import discard_trade_candidate
+
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user or not query.data:
+        return
+    await query.answer()
+    try:
+        _, raw_id = query.data.split(":", 1)
+        candidate_id = int(raw_id)
+    except Exception:
+        await query.message.reply_text("Không đọc được mã lệnh nháp.")
+        return
+
+    result = await asyncio.to_thread(discard_trade_candidate, candidate_id, user.id)
+    await query.message.reply_text(result.get("message", "Đã xử lý."))
+    if result.get("ok"):
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+async def confirmtrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import confirm_trade_candidate
+
+    user = update.effective_user
+    if not user:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Cú pháp: /confirmtrade <mã_lệnh_nháp>. Thường bạn chỉ cần bấm nút dưới phân tích.")
+        return
+    try:
+        candidate_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("Mã lệnh nháp phải là số.")
+        return
+    result = await asyncio.to_thread(confirm_trade_candidate, candidate_id, user.id)
+    await update.effective_message.reply_text(result.get("message", "Đã xử lý."))
 
 
 # ─── Background job: auto check WIN/LOSS ─────────────────────────────────────
@@ -316,10 +435,18 @@ async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    count = clear_prediction_history()
-    await update.effective_message.reply_text(
-        f"Đã xóa {count} prediction khỏi lịch sử. Whitelist và danh sách symbol vẫn được giữ."
-    )
+    payload = clear_prediction_history()
+    if isinstance(payload, dict):
+        await update.effective_message.reply_text(
+            "Đã xóa lịch sử theo dõi. Whitelist và danh sách symbol vẫn được giữ.\n"
+            f"Lệnh đã trade/đang theo dõi: {payload.get('visible_count', 0)}\n"
+            f"Tổng dòng predictions cũ đã xóa: {payload.get('total_prediction_count', 0)}\n"
+            f"Lệnh nháp chưa xác nhận đã xóa: {payload.get('draft_count', 0)}"
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"Đã xóa {payload} prediction khỏi lịch sử. Whitelist và danh sách symbol vẫn được giữ."
+        )
 
 
 async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -374,6 +501,15 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("dashboardall", dashboardall_command))
     app.add_handler(CommandHandler("clearhistory", clearhistory_command))
     app.add_handler(CommandHandler("checknow", checknow_command))
+    app.add_handler(CommandHandler("confirmtrade", confirmtrade_command))
+    app.add_handler(CallbackQueryHandler(
+        confirm_trade_callback,
+        pattern=f"^{CONFIRM_TRADE_CALLBACK_PREFIX}:",
+    ))
+    app.add_handler(CallbackQueryHandler(
+        discard_trade_callback,
+        pattern=f"^{DISCARD_TRADE_CALLBACK_PREFIX}:",
+    ))
     app.add_handler(CallbackQueryHandler(
         analyze_symbol_callback,
         pattern=f"^({ANALYZE_SHORT_CALLBACK_PREFIX}|{ANALYZE_LONG_CALLBACK_PREFIX}):",
@@ -394,4 +530,5 @@ def symbol_control_commands() -> list[BotCommand]:
         BotCommand("stats", "Xem thống kê win/loss, có thể gõ /stats BTC"),
         BotCommand("history", "Xem lịch sử, có thể gõ /history BTC"),
         BotCommand("dashboard", "Xem dashboard nhanh"),
+        BotCommand("confirmtrade", "Lưu lệnh nháp để theo dõi"),
     ]

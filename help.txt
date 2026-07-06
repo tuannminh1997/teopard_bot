@@ -27,9 +27,9 @@ Sau đó chọn:
 
 Lưu ý: User thường chỉ xem được lịch sử/dashboard của chính mình, không xem được prediction của user khác.
 
-Bot tính sẵn dữ liệu kỹ thuật trước khi gửi AI: EMA, RSI, MACD, khối lượng, ATR, cấu trúc giá, Fibonacci, vùng quét Long/Short và rủi ro tối thiểu. Claude sẽ tự phân tích và tự đặt Entry/SL/TP; Python kiểm tra lại logic trước khi lưu prediction.
+Bot tính sẵn dữ liệu kỹ thuật trước khi gửi AI: EMA, RSI, MACD, khối lượng, ATR, cấu trúc giá, Fibonacci, vùng quét Long/Short và rủi ro tối thiểu. AI sẽ tự phân tích và tự đặt Entry/SL/TP; Python kiểm tra lại logic trước khi hiển thị.
 
-Bot không còn dùng Python validator để ẩn phản hồi của Claude. Claude trả thế nào thì user thấy thế đó. Python chỉ parse tối thiểu Entry/SL/TP để lưu auto-check nếu đủ số. Nếu không parse đủ số, bot vẫn hiển thị phản hồi cho user nhưng chỉ lưu hidden record để learning/debug và không auto-check.
+Từ V19, bot KHÔNG tự đưa mọi phân tích LONG/SHORT vào history nữa. Sau khi bot trả phân tích, nếu bạn thật sự vào lệnh theo phân tích đó, hãy bấm nút “✅ Tôi đã trade theo lệnh này”. Chỉ khi bấm nút này bot mới lưu vào DB theo dõi WIN/LOSS và dùng làm lịch sử học lại cho lần phân tích sau. Nếu không bấm, phân tích chỉ là tham khảo và không xuất hiện trong /history, /stats, /dashboard.
 
 4. Auto-check kết quả
 Scalp:
@@ -44,7 +44,7 @@ Swing:
 - Check mỗi 12h
 - Chấm TP/SL bằng nến 1H
 
-Bot tự động check và cập nhật DB, nhưng không gửi thông báo kết quả tự động cho user/admin nữa. User muốn xem kết quả thì chủ động dùng /history, /stats hoặc /dashboard.
+Bot chỉ tự động check các lệnh bạn đã xác nhận “đã trade theo bot”. Bot cập nhật DB nhưng không gửi thông báo kết quả tự động cho user/admin nữa. User muốn xem kết quả thì chủ động dùng /history, /stats hoặc /dashboard.
 
 5. Lệnh admin
 Admin dùng lệnh user như người dùng bình thường:
@@ -134,3 +134,11 @@ Ghi chú Z.AI native V16:
 - ZAI_SUMMARY_REASONING_EFFORT mặc định none để summary nhanh và rẻ hơn.
 - Muốn quay lại OpenRouter: AI_PROVIDER=openrouter, OPENROUTER_MODEL=z-ai/glm-5.2 hoặc deepseek/deepseek-v4-pro.
 - Muốn quay lại Claude native: AI_PROVIDER=anthropic.
+
+
+Cập nhật V19 - lưu history theo xác nhận user:
+- Phân tích LONG/SHORT hợp lệ chỉ tạo lệnh nháp kèm nút xác nhận.
+- Chỉ khi user bấm “✅ Tôi đã trade theo lệnh này”, bot mới lưu vào bảng predictions và auto-check WIN/LOSS.
+- NO TRADE, REJECTED_PLAN và phân tích chưa xác nhận không còn được đưa vào /history hoặc learning prompt.
+- /history đánh số lại từ #1 đến #10 theo danh sách đang hiển thị, không dùng ID DB nhảy số.
+- /clearhistory báo riêng số lệnh đã trade/đang theo dõi, tổng dòng predictions cũ và số lệnh nháp bị xóa.
