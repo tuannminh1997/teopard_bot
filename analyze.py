@@ -48,18 +48,20 @@ DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
 # Ngắn hạn: scalp trong ngày — 15m timing, 1H momentum, 4H xu hướng chính
 SHORT_TERM_TIMEFRAMES = {
-    "15M": ("15m", 200),
-    "1H":  ("1h",  150),
-    "4H":  ("4h",  180),
+    # V13: tăng history để vùng stop/liquidity ước lượng không chỉ bám vài swing quá gần.
+    # Prompt vẫn chỉ đưa phần candle gần nhất nên không làm model tốn token quá nhiều.
+    "15M": ("15m", 480),   # ~5 ngày, timing + ATR ngắn hạn
+    "1H":  ("1h",  360),   # ~15 ngày, liquidity gần + momentum
+    "4H":  ("4h",  360),   # ~60 ngày, liquidity chính/sâu cho SCALP
 }
 
 # Dài hạn: swing/position — 1H kiểm tra sweep, 4H entry, 1D xu hướng, 1W big picture
 # 1H chỉ dùng làm dữ liệu xác nhận rút râu/quét thanh khoản; khung lập lệnh SWING vẫn là 4H/1D/1W.
 LONG_TERM_TIMEFRAMES = {
-    "1H": ("1h",  240),
-    "4H": ("4h",  180),
-    "1D": ("1d",  150),
-    "1W": ("1w",  120),
+    "1H": ("1h",  480),   # sweep/confirmation cho SWING
+    "4H": ("4h",  360),   # entry + liquidity gần
+    "1D": ("1d",  365),   # liquidity chính ~1 năm
+    "1W": ("1w",  208),   # big picture/liquidity sâu ~4 năm
 }
 
 # V4 lifecycle
@@ -349,8 +351,8 @@ def save_no_trade_prediction(
             """,
             (user_id, chat_id, symbol, mode, iso(now),
              ENTRY_WAIT_HOURS.get(mode, 24), ENTRY_WAIT_HOURS.get(mode, 24), TRADE_MAX_HOLD_HOURS.get(mode, 72),
-             market_snapshot, feature_snapshot, reasoning_summary or "Claude chọn NO_TRADE.", full_response,
-             "Claude chọn NO_TRADE vì chưa có setup đủ rõ hoặc risk/reward chưa đáng để tạo tín hiệu.", iso(now)),
+             market_snapshot, feature_snapshot, reasoning_summary or "Claude chọn NO TRADE.", full_response,
+             "Claude chọn NO TRADE vì chưa có setup đủ rõ hoặc tỷ lệ lời/lỗ chưa đáng để tạo tín hiệu.", iso(now)),
         )
         prediction_id = cursor.lastrowid
         conn.commit()
@@ -608,7 +610,7 @@ def format_open_signal_context(open_signals: list[dict], current_price: float | 
         "Cách dùng kế hoạch đang mở:",
         "- Nếu kế hoạch cũ là LONG chờ hồi, vùng Entry LONG KHÔNG phải TP cho lệnh SHORT ngược lại. Nếu kế hoạch cũ là SHORT chờ hồi, vùng Entry SHORT KHÔNG phải TP cho lệnh LONG ngược lại.",
         "- Khi phân tích lại, phải xem kế hoạch cũ là còn hiệu lực, bị hủy, hay cần thay bằng kế hoạch mới. Nếu thay kế hoạch, nêu ngắn lý do trong Kịch bản chính.",
-        "- Nếu giá không hồi về Entry cũ mà đã chạy theo hướng dự báo, không được đuổi giá chỉ vì giá đang chạy. Chỉ cho vào ngay khi giá hiện tại nằm trong vùng Entry mới hợp lý và đã có xác nhận rõ; nếu không, ưu tiên NO_TRADE hoặc chờ kiểm tra lại.",
+        "- Nếu giá không hồi về Entry cũ mà đã chạy theo hướng dự báo, không được đuổi giá chỉ vì giá đang chạy. Chỉ cho vào ngay khi giá hiện tại nằm trong vùng Entry mới hợp lý và đã có xác nhận rõ; nếu không, ưu tiên NO TRADE hoặc chờ kiểm tra lại.",
     ])
     return "\n".join(lines)
 
@@ -1843,7 +1845,7 @@ def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str
     zones["label_near"] = "gần"
     zones["label_main"] = "chính"
     zones["label_deep"] = "sâu"
-    zones["liquidity_method"] = "fractal_swing_pool_v8_cluster_dedupe"
+    zones["liquidity_method"] = "fractal_swing_pool_v13_longer_lookback_tp_guard"
 
 def _liquidity_zones_by_windows(
     timeframe_data: dict[str, pd.DataFrame | None],
@@ -2415,7 +2417,7 @@ def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str
     zones["label_near"] = "gần"
     zones["label_main"] = "chính"
     zones["label_deep"] = "sâu"
-    zones["liquidity_method"] = "fractal_swing_pool_v8_cluster_dedupe"
+    zones["liquidity_method"] = "fractal_swing_pool_v13_longer_lookback_tp_guard"
 
 def _liquidity_zones_by_windows(
     timeframe_data: dict[str, pd.DataFrame | None],
@@ -2434,9 +2436,11 @@ def _liquidity_zones_by_windows(
         main_df = _first_valid_df(timeframe_data.get("4H"), timeframe_data.get("1H"))
         deep_df = _first_valid_df(timeframe_data.get("4H"), timeframe_data.get("1H"))
         windows = [
-            ("near", "gần 1H", near_df, _current_atr(near_df) or _current_atr(sweep_df), 72, 2),
-            ("main", "chính H4", main_df, _current_atr(main_df) or _current_atr(near_df), 90, 2),
-            ("deep", "sâu H4", deep_df, _current_atr(deep_df) or _current_atr(main_df), 120, 3),
+            # V13: lookback dài hơn để tránh vùng thanh khoản chỉ xoay quanh vài nến sát giá.
+            # near vẫn dùng 1H nhưng lấy ~7 ngày; main/deep dùng H4 ~30-50 ngày.
+            ("near", "gần 1H", near_df, _current_atr(near_df) or _current_atr(sweep_df), 168, 2),
+            ("main", "chính H4", main_df, _current_atr(main_df) or _current_atr(near_df), 180, 2),
+            ("deep", "sâu H4", deep_df, _current_atr(deep_df) or _current_atr(main_df), 300, 3),
         ]
         calc_mode = "short"
     else:
@@ -2447,13 +2451,14 @@ def _liquidity_zones_by_windows(
         main_df = _first_valid_df(timeframe_data.get("1D"), timeframe_data.get("4H"))
         deep_df = _first_valid_df(timeframe_data.get("1W"), timeframe_data.get("1D"), timeframe_data.get("4H"))
         windows = [
-            ("near", "gần H4", near_df, _current_atr(near_df) or _current_atr(sweep_df), 120, 2),
-            ("main", "chính D1", main_df, _current_atr(main_df) or _current_atr(near_df), 90, 2),
-            ("deep", "sâu W1/D1", deep_df, _current_atr(deep_df) or _current_atr(main_df), 120, 3),
+            # V13: SWING cần vùng rộng lịch sử hơn: H4 ~40 ngày, D1 ~6-9 tháng, W1 vài năm.
+            ("near", "gần H4", near_df, _current_atr(near_df) or _current_atr(sweep_df), 240, 2),
+            ("main", "chính D1", main_df, _current_atr(main_df) or _current_atr(near_df), 240, 2),
+            ("deep", "sâu W1/D1", deep_df, _current_atr(deep_df) or _current_atr(main_df), 180, 3),
         ]
         calc_mode = "long"
 
-    result: dict = {"meta": [label for _, label, *_ in windows], "liquidity_method": "fractal_swing_pool_v8_cluster_dedupe"}
+    result: dict = {"meta": [label for _, label, *_ in windows], "liquidity_method": "fractal_swing_pool_v13_longer_lookback_tp_guard"}
     for key, label, df, atr, lookback, m in windows:
         lower = _zone_for_liq_pools(df, sweep_df, current_price, atr, "low", key, calc_mode, lookback, m=m)
         upper = _zone_for_liq_pools(df, sweep_df, current_price, atr, "high", key, calc_mode, lookback, m=m)
@@ -2645,16 +2650,36 @@ def _mode_labels(mode: str) -> tuple[str, str, str]:
 
 
 def _risk_floor(timeframe_data: dict[str, pd.DataFrame | None], mode: str, current_price: float) -> float:
+    """Mốc rủi ro tham chiếu để đưa vào prompt, không phải ngưỡng reject cứng.
+
+    V11 dùng 0.35% giá cho SCALP nên BTC/ETH dễ bị ép risk quá lớn, TP gần không đạt
+    RR và bot chuyển NO_TRADE liên tục. V12 giảm vai trò price% và dùng ATR thực tế nhiều hơn.
+    """
     if mode == "short":
-        atr_main = _current_atr(timeframe_data.get("15M")) or 0
-        atr_confirm = _current_atr(timeframe_data.get("1H")) or 0
-        # Risk floor chỉ là mốc chống nhiễu để AI không đặt SL quá sát.
-        # Bản cũ dùng 2.5 ATR 15M / 1.2 ATR 1H / 0.6% giá nên Entry-SL/TP dễ bị quá rộng.
-        return max(atr_main * 1.6, atr_confirm * 0.7, current_price * 0.0035)
-    atr_main = _current_atr(timeframe_data.get("4H")) or 0
-    atr_confirm = _current_atr(timeframe_data.get("1D")) or 0
-    # Swing cần rộng hơn scalp, nhưng vẫn tránh ép SL/TP quá xa.
-    return max(atr_main * 1.6, atr_confirm * 0.45, current_price * 0.015)
+        atr_main = _current_atr(timeframe_data.get("15M")) or 0.0
+        atr_confirm = _current_atr(timeframe_data.get("1H")) or 0.0
+        return max(atr_main * 1.15, atr_confirm * 0.45, current_price * 0.0016)
+    atr_main = _current_atr(timeframe_data.get("4H")) or 0.0
+    atr_confirm = _current_atr(timeframe_data.get("1D")) or 0.0
+    return max(atr_main * 1.20, atr_confirm * 0.38, current_price * 0.0090)
+
+
+def _minimum_stop_distance(timeframe_data: dict[str, pd.DataFrame | None], mode: str, current_price: float) -> float:
+    """Ngưỡng chống SL quá sát dùng để reject plan.
+
+    Khác _risk_floor: đây là mức nhiễu tối thiểu, có cap theo % giá để không làm bot
+    NO_TRADE quá nhiều khi ATR 1H/4H phình to. SL vẫn được đặt theo cấu trúc; hàm này chỉ
+    chặn các plan có Entry-SL quá bé so với nhiễu thị trường.
+    """
+    if mode == "short":
+        atr_main = _current_atr(timeframe_data.get("15M")) or 0.0
+        atr_confirm = _current_atr(timeframe_data.get("1H")) or 0.0
+        raw = max(atr_main * 1.05, atr_confirm * 0.35, current_price * 0.0015)
+        return min(raw, current_price * 0.0030)
+    atr_main = _current_atr(timeframe_data.get("4H")) or 0.0
+    atr_confirm = _current_atr(timeframe_data.get("1D")) or 0.0
+    raw = max(atr_main * 1.00, atr_confirm * 0.32, current_price * 0.0070)
+    return min(raw, current_price * 0.0180)
 
 
 
@@ -2672,7 +2697,7 @@ def _structural_sl_buffer(timeframe_data: dict[str, pd.DataFrame | None], mode: 
     """ATR buffer cho SL cấu trúc.
 
     Buffer này không dùng để kéo SL đại ra xa. Nó chỉ đặt SL ra ngoài swing/invalidation
-    gần nhất một khoảng đủ tránh nhiễu nến. Nếu sau đó RR không đạt, plan sẽ bị NO_TRADE.
+    gần nhất một khoảng đủ tránh nhiễu nến. Nếu sau đó RR không đạt, plan sẽ bị NO TRADE.
     """
     main_label, structure_label, _ = _mode_labels(mode)
     atr_main = _current_atr(timeframe_data.get(main_label)) or 0.0
@@ -2840,6 +2865,210 @@ def _plan_worst_case_risk_reward(pred: dict) -> dict:
     }
 
 
+
+
+MIN_TP1_R = 0.75
+MIN_TP2_R = 1.05
+TP2_MIN_SEPARATION_MULT = 1.10
+
+
+def _dedupe_price_candidates(candidates: list[dict], price_ref: float, risk: float) -> list[dict]:
+    """Gộp các target gần như trùng nhau để TP không nhảy giữa vài mức sát nhau."""
+    if not candidates:
+        return []
+    tol = max(price_ref * 0.00035, risk * 0.08, 1e-9)
+    ordered = sorted(candidates, key=lambda c: float(c["price"]))
+    unique: list[dict] = []
+    for cand in ordered:
+        price = float(cand["price"])
+        matched = None
+        for kept in unique:
+            if abs(price - float(kept["price"])) <= tol:
+                matched = kept
+                break
+        if matched is None:
+            unique.append(dict(cand))
+            continue
+        # Ưu tiên pivot/liquidity/fib có score cao hơn; nếu tương đương giữ mức xa hơn theo source ổn định.
+        if float(cand.get("score", 0.0)) > float(matched.get("score", 0.0)):
+            matched.update(cand)
+    return unique
+
+
+def _collect_tp_target_candidates(
+    pred: dict,
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+    risk: float,
+) -> list[dict]:
+    """Thu thập target cấu trúc để sửa TP1/TP2 nếu model đặt quá sát.
+
+    LONG lấy các swing high / liquidity trên / fib phía trên Entry.
+    SHORT lấy các swing low / liquidity dưới / fib phía dưới Entry.
+    Đây chỉ là target ứng viên; validator vẫn quyết định cuối cùng theo RR.
+    """
+    direction = (pred.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT"):
+        return []
+    try:
+        entry_low = float(pred["entry_low"])
+        entry_high = float(pred["entry_high"])
+    except Exception:
+        return []
+    if entry_low > entry_high:
+        entry_low, entry_high = entry_high, entry_low
+    edge = entry_high if direction == "LONG" else entry_low
+    price_ref = float(current_price) if current_price is not None else (entry_low + entry_high) / 2.0
+
+    candidates: list[dict] = []
+
+    def add(price: float | None, source: str, score: float = 1.0) -> None:
+        if price is None:
+            return
+        try:
+            val = float(price)
+        except Exception:
+            return
+        if not np.isfinite(val) or val <= 0:
+            return
+        if direction == "LONG" and val <= edge:
+            return
+        if direction == "SHORT" and val >= edge:
+            return
+        candidates.append({"price": val, "source": source, "score": score})
+
+    # 1) Swing/pivot levels theo hướng TP.
+    side = "high" if direction == "LONG" else "low"
+    for lv in _collect_structural_levels(timeframe_data, mode, side):
+        score = 2.0 if lv.get("kind") == "pivot" else 1.35
+        # Khung lớn hơn đáng tin hơn cho TP xa, nhưng không để nó thắng mọi target gần.
+        score += max(0.0, 0.25 - float(lv.get("order", 0)) * 0.05)
+        add(float(lv["price"]), f"{lv.get('label')} {lv.get('kind')}", score)
+
+    # 2) Fibonacci/biên cấu trúc từ khung xác nhận và khung lớn.
+    _, structure_label, big_label = _mode_labels(mode)
+    for label, weight in [(structure_label, 1.45), (big_label, 1.25)]:
+        struct = _structure_info(timeframe_data.get(label), price_ref)
+        for name, value in (struct.get("fib") or {}).items():
+            add(value, f"Fib {label} {name}", weight)
+        if direction == "LONG":
+            add(struct.get("recent_high"), f"đỉnh gần {label}", weight + 0.15)
+            add(struct.get("major_high"), f"biên cao {label}", weight + 0.05)
+        else:
+            add(struct.get("recent_low"), f"đáy gần {label}", weight + 0.15)
+            add(struct.get("major_low"), f"biên thấp {label}", weight + 0.05)
+
+    # 3) Liquidity box đối diện, nhưng chỉ làm target nếu nó đủ RR; không ép bám mép box hẹp.
+    try:
+        zones = _liquidity_zones_by_windows(timeframe_data, mode, price_ref)
+        if direction == "LONG":
+            for role, score in [("near", 1.6), ("main", 1.45), ("deep", 1.25)]:
+                zone = zones.get(f"upper_{role}")
+                if zone and zone[0] is not None and zone[1] is not None:
+                    add(float(zone[0]), f"liquidity trên {role} mép gần", score)
+                    add(float(zone[1]), f"liquidity trên {role} mép xa", score * 0.9)
+        else:
+            for role, score in [("near", 1.6), ("main", 1.45), ("deep", 1.25)]:
+                zone = zones.get(f"lower_{role}")
+                if zone and zone[0] is not None and zone[1] is not None:
+                    add(float(zone[1]), f"liquidity dưới {role} mép gần", score)
+                    add(float(zone[0]), f"liquidity dưới {role} mép xa", score * 0.9)
+    except Exception:
+        pass
+
+    # Loại target cực xa bất thường so với risk/khung để tránh TP bị kéo ảo.
+    # SCALP giữ target trong khoảng ~5R hoặc 2.8% giá; SWING rộng hơn.
+    max_reward = max(risk * (5.0 if mode == "short" else 7.0), price_ref * (0.028 if mode == "short" else 0.12))
+    bounded: list[dict] = []
+    for c in candidates:
+        reward = abs(float(c["price"]) - edge)
+        if reward <= max_reward:
+            bounded.append(c)
+    candidates = bounded or candidates
+
+    candidates = _dedupe_price_candidates(candidates, price_ref, risk)
+    if direction == "LONG":
+        return sorted(candidates, key=lambda c: (float(c["price"]) - edge, -float(c.get("score", 0.0))))
+    return sorted(candidates, key=lambda c: (edge - float(c["price"]), -float(c.get("score", 0.0))))
+
+
+def _pick_tp_candidate(candidates: list[dict], direction: str, threshold_price: float) -> dict | None:
+    if direction == "LONG":
+        valid = [c for c in candidates if float(c["price"]) >= threshold_price]
+        return min(valid, key=lambda c: float(c["price"])) if valid else None
+    valid = [c for c in candidates if float(c["price"]) <= threshold_price]
+    return max(valid, key=lambda c: float(c["price"])) if valid else None
+
+
+def _normalize_trade_plan_structural_tps(
+    pred: dict,
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+    output: str | None = None,
+) -> tuple[dict, str | None]:
+    """Nếu TP1/TP2 quá sát sau khi SL đã chuẩn hóa, thử chuyển sang target cấu trúc kế tiếp.
+
+    Nếu không có target cấu trúc đủ RR, validator sẽ reject thành NO TRADE.
+    """
+    direction = (pred.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT"):
+        return pred, output
+    required = ("entry_low", "entry_high", "sl", "tp1", "tp2")
+    if any(pred.get(k) is None for k in required):
+        return pred, output
+
+    normalized = dict(pred)
+    rr = _plan_worst_case_risk_reward(normalized)
+    risk = rr.get("risk")
+    if not risk or risk <= 0:
+        return normalized, output
+
+    entry_low = float(normalized["entry_low"])
+    entry_high = float(normalized["entry_high"])
+    if entry_low > entry_high:
+        entry_low, entry_high = entry_high, entry_low
+    edge = entry_high if direction == "LONG" else entry_low
+    candidates = _collect_tp_target_candidates(normalized, timeframe_data, mode, current_price, float(risk))
+
+    reward1 = rr.get("reward1") or 0.0
+    reward2 = rr.get("reward2") or 0.0
+    rr1 = rr.get("rr1") or 0.0
+    rr2 = rr.get("rr2") or 0.0
+
+    if rr1 < MIN_TP1_R:
+        threshold = edge + risk * MIN_TP1_R if direction == "LONG" else edge - risk * MIN_TP1_R
+        cand = _pick_tp_candidate(candidates, direction, threshold)
+        if cand:
+            old_tp1 = float(normalized["tp1"])
+            normalized["tp1"] = float(cand["price"])
+            normalized["_tp1_adjusted_by_structure"] = True
+            normalized["_tp1_source"] = cand.get("source")
+            normalized["_tp1_old"] = old_tp1
+
+    # Tính lại sau khi có thể đã sửa TP1.
+    rr = _plan_worst_case_risk_reward(normalized)
+    risk = rr.get("risk") or risk
+    reward1 = rr.get("reward1") or reward1
+    reward2 = rr.get("reward2") or reward2
+    rr2 = rr.get("rr2") or 0.0
+
+    need_tp2 = rr2 < MIN_TP2_R or reward2 <= reward1 * TP2_MIN_SEPARATION_MULT
+    if need_tp2:
+        min_reward2 = max(risk * MIN_TP2_R, reward1 * TP2_MIN_SEPARATION_MULT)
+        threshold = edge + min_reward2 if direction == "LONG" else edge - min_reward2
+        cand = _pick_tp_candidate(candidates, direction, threshold)
+        if cand:
+            old_tp2 = float(normalized["tp2"])
+            normalized["tp2"] = float(cand["price"])
+            normalized["_tp2_adjusted_by_structure"] = True
+            normalized["_tp2_source"] = cand.get("source")
+            normalized["_tp2_old"] = old_tp2
+
+    output = _update_output_trade_numbers(output or "", normalized)
+    return normalized, output
+
 def _update_output_trade_numbers(output: str, pred: dict) -> str:
     """Đồng bộ SL/Rủi ro trong câu trả lời sau khi Python chuẩn hóa SL cấu trúc."""
     text = output or ""
@@ -2867,7 +3096,7 @@ def _normalize_trade_plan_structural_sl(
     """Ép SL theo cấu trúc: swing/invalidation gần nhất ± ATR buffer.
 
     Không kéo SL đại để cứu lệnh. Sau khi thay SL, validator vẫn kiểm tra RR.
-    Nếu không tìm được swing/invalidation đủ rõ thì plan sẽ bị reject thành NO_TRADE.
+    Nếu không tìm được swing/invalidation đủ rõ thì plan sẽ bị reject thành NO TRADE.
     """
     direction = (pred.get("direction") or "").upper()
     if direction not in ("LONG", "SHORT"):
@@ -2888,7 +3117,7 @@ def _normalize_trade_plan_structural_sl(
     normalized["_structural_sl_buffer"] = float(inv["buffer"])
     normalized["_structural_sl_source"] = f"{inv.get('label')} {inv.get('kind')}"
 
-    # SL luôn lấy theo cấu trúc gần nhất ± buffer. Nếu RR không còn đạt, plan bị NO_TRADE.
+    # SL luôn lấy theo cấu trúc gần nhất ± buffer. Nếu RR không còn đạt, plan bị NO TRADE.
     if abs(new_sl - old_sl) > max(abs(old_sl) * 1e-7, 1e-8):
         normalized["sl"] = new_sl
         normalized["_sl_adjusted_by_structure"] = True
@@ -2906,7 +3135,7 @@ def _analysis_row(df: pd.DataFrame | None):
     Dùng nến đã đóng gần nhất để đọc indicator/volume.
 
     Binance thường trả kèm nến hiện tại đang chạy; volume của nến này rất thấp
-    nếu vừa mở nến, dễ làm Claude hiểu nhầm là thanh khoản yếu và chọn NO_TRADE.
+    nếu vừa mở nến, dễ làm Claude hiểu nhầm là thanh khoản yếu và chọn NO TRADE.
     Vì vậy indicator/regime/snapshot dùng nến -2 khi có đủ dữ liệu.
     """
     if df is None or df.empty:
@@ -3137,8 +3366,9 @@ def build_feature_engineering_block(
         f"- Fibonacci {structure_label}: 0.382={fmt(fib.get('0.382'))}; 0.5={fmt(fib.get('0.5'))}; 0.618={fmt(fib.get('0.618'))}",
         _format_liquidity_window_line("Vùng thanh khoản dưới giá ước lượng", zones, "lower", price),
         _format_liquidity_window_line("Vùng thanh khoản trên giá ước lượng", zones, "upper", price),
-        "- Vai trò vùng quét: Entry ưu tiên dùng vùng gần/chính nếu hợp xu hướng và có xác nhận. Với SCALP, không dùng vùng thanh khoản dưới làm Entry LONG hoặc vùng thanh khoản trên làm Entry SHORT theo kiểu chạm-là-fill; nếu cần sweep/reclaim nhưng chưa có nến xác nhận thì chọn NO_TRADE. TP dùng vùng đối diện: TP1 ưu tiên vùng đối diện gần/chính, TP2 có thể dùng vùng đối diện chính/sâu. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét.",
-        "- Quy tắc rủi ro: SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; Python sẽ tự chuẩn hóa SL theo cấu trúc này trước khi lưu. Sau đó RR được tính theo mép Entry bất lợi nhất: TP1 phải >= 0.75R, TP2 phải hợp lý >= 1.05R và không quá sát TP1; nếu không đạt thì chọn NO_TRADE.",
+        "- Vai trò vùng quét: Entry có thể tham khảo vùng gần/chính nếu hợp xu hướng và có xác nhận. Với SCALP, không dùng vùng thanh khoản dưới làm Entry LONG hoặc vùng thanh khoản trên làm Entry SHORT theo kiểu chạm-là-fill; nếu cần quét thanh khoản/lấy lại vùng nhưng chưa có nến xác nhận thì chọn NO TRADE.",
+        "- TP không bị ép bám sát mép box thanh khoản ước lượng. Nếu box đối diện quá gần làm RR xấu, hãy dùng swing high/low kế tiếp, Fibonacci hoặc vùng cấu trúc kế tiếp làm TP; Python cũng sẽ thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp trước khi reject. Nếu vẫn không đủ RR thì chọn NO TRADE. Không tạo TP quá gần chỉ vì box thanh khoản rất hẹp.",
+        "- Quy tắc rủi ro: SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; Python sẽ tự chuẩn hóa SL theo cấu trúc này trước khi lưu. Sau đó Python thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp nếu TP quá sát. RR được tính theo mép Entry bất lợi nhất: TP1 phải >= 0.75R, TP2 phải hợp lý >= 1.05R và không quá sát TP1; nếu sau khi thử target cấu trúc vẫn không đạt thì chọn NO TRADE.",
         "- Ghi chú: Vùng quét là vùng thanh khoản kỹ thuật ước lượng theo cửa sổ thời gian, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật nội bộ, không phải lệnh giao dịch chốt sẵn. Không show trực tiếp các vùng thanh khoản/thanh lý/heatmap ra user; chỉ dùng chúng để lập quyết định, Entry/SL/TP, lý do và rủi ro.",
     ]
     return "\n".join(lines)
@@ -3430,20 +3660,20 @@ Phương pháp: {focus}
 Yêu cầu:
 1. Python chỉ cung cấp dữ liệu cứng: EMA/RSI/MACD/ATR, market regime, cấu trúc, Fibonacci, vùng quét thanh khoản ước lượng, raw candle context, rủi ro tham chiếu. Không có kế hoạch LONG/SHORT chốt sẵn. Vùng quét/thanh khoản là dữ liệu nội bộ, không liệt kê ra user.
 2. Model phải tự phân tích và tự lập Entry/SL/TP dựa trên dữ liệu cứng đó. Không được tự tạo thêm Fibonacci/vùng quét nếu block Python ghi N/A hoặc không đủ dữ liệu.
-3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO_TRADE theo xu hướng đa khung, vị trí giá, vùng quét ước lượng theo cửa sổ thời gian, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user, không in mục thanh khoản/heatmap/vùng thanh lý.
-4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và risk/reward đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO_TRADE. Không dùng NO_TRADE chỉ vì giá chưa chạm Entry; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.
-5. Cách dùng vùng quét: Entry ưu tiên vùng gần/chính nếu hợp hướng setup và có xác nhận. Với SCALP, không được LONG chỉ vì giá chạm vùng thanh khoản dưới và không được SHORT chỉ vì giá chạm vùng thanh khoản trên; phải có sweep + rút râu/đóng nến xác nhận. Nếu chưa có xác nhận rõ thì chọn NO_TRADE, vì auto-check chỉ biết chạm Entry là khớp.
-6. TP dùng vùng đối diện: với LONG nhìn vùng thanh khoản trên, với SHORT nhìn vùng thanh khoản dưới. TP1 ưu tiên vùng đối diện gần/chính; TP2 có thể dùng vùng đối diện chính/sâu. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét. Với SCALP, risk Entry–SL không được thấp hơn rủi ro tham chiếu.
+3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO TRADE theo xu hướng đa khung, vị trí giá, vùng quét ước lượng theo cửa sổ thời gian, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user, không in mục thanh khoản/heatmap/vùng thanh lý.
+4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và tỷ lệ lời/lỗ đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO TRADE. Không dùng NO TRADE chỉ vì giá chưa chạm Entry; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.
+5. Cách dùng vùng quét: Entry ưu tiên vùng gần/chính nếu hợp hướng setup và có xác nhận. Với SCALP, không được LONG chỉ vì giá chạm vùng thanh khoản dưới và không được SHORT chỉ vì giá chạm vùng thanh khoản trên; phải có quét thanh khoản + rút râu/đóng nến xác nhận. Nếu chưa có xác nhận rõ thì chọn NO TRADE, vì auto-check chỉ biết chạm Entry là khớp.
+6. TP dùng vùng đối diện nhưng không được ép bám sát mép box hẹp: với LONG nhìn vùng thanh khoản trên/swing high/Fibonacci phía trên, với SHORT nhìn vùng thanh khoản dưới/swing low/Fibonacci phía dưới. Nếu TP1 quá gần Entry làm RR < 0.75R, hãy chọn target cấu trúc kế tiếp; nếu không có target hợp lý thì NO TRADE. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét. Với SCALP, rủi ro Entry–SL không được thấp hơn ngưỡng chống nhiễu.
 7. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”.
 8. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
-9. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát; nếu phải đặt SL quá sát mới có tỷ lệ đẹp thì chọn NO_TRADE. Không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
-10. Nếu chọn NO_TRADE: không cần Entry/SL/TP; trả quyết định NO_TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Được chọn NO_TRADE khi lợi thế chưa đủ rõ, kể cả khi vẫn có thể vẽ ra một vùng Entry hợp lệ nhưng kèo không đáng vào.
+9. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát; nếu phải đặt SL quá sát mới có tỷ lệ đẹp thì chọn NO TRADE. Không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
+10. Nếu chọn NO TRADE: không cần Entry/SL/TP; trả quyết định NO TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Được chọn NO TRADE khi lợi thế chưa đủ rõ, kể cả khi vẫn có thể vẽ ra một vùng Entry hợp lệ nhưng kèo không đáng vào.
 11. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
 12. Đọc kỹ KẾ HOẠCH ĐANG MỞ nếu có. Không được hiểu vùng Entry của một lệnh chờ LONG là mục tiêu TP cho lệnh SHORT ngược lại, hoặc vùng Entry của lệnh chờ SHORT là mục tiêu TP cho lệnh LONG ngược lại.
-13. Nếu đang có kế hoạch cũ PENDING_ENTRY mà giá đã chạy xa khỏi Entry theo đúng hướng dự báo, không được đuổi giá chỉ vì giá chạy. Chỉ cho vào ngay khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu không thì NO_TRADE hoặc chờ kiểm tra lại.
+13. Nếu đang có kế hoạch cũ PENDING_ENTRY mà giá đã chạy xa khỏi Entry theo đúng hướng dự báo, không được đuổi giá chỉ vì giá chạy. Chỉ cho vào ngay khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu không thì NO TRADE hoặc chờ kiểm tra lại.
 14. Nếu kế hoạch mới thay thế kế hoạch cũ, ghi ngắn trong “📊 Kịch bản chính” lý do kế hoạch cũ bị hủy/thay thế.
 15. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
-16. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO_TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
+16. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
 17. Format output cho user chỉ giữ quyết định, Entry/SL/TP nếu có, Lý do và Rủi ro. Không in mục “💧 Thanh khoản”, không liệt kê vùng dưới/trên/gần/chính/sâu.
 """
 
@@ -3672,7 +3902,7 @@ def summarize_reasoning(full_response: str) -> str:
                 "role": "user",
                 "content": (
                     "Tóm tắt trong 1-2 câu (tối đa 60 từ) lý do kỹ thuật chính "
-                    "dẫn đến quyết định LONG/SHORT/NO_TRADE trong phân tích sau. "
+                    "dẫn đến quyết định LONG/SHORT/NO TRADE trong phân tích sau. "
                     "Chỉ nêu các chỉ báo cụ thể (EMA, RSI, MACD, volume, ATR, vùng giá) và mức giá. "
                     "Không dùng chữ Hist, MACD_hist, Histogram; hãy viết động lượng MACD âm/dương hoặc MACD còn âm/dương. "
                     "Không giải thích, không lời mở đầu.\n\n"
@@ -3706,9 +3936,10 @@ def parse_prediction_from_output(output: str) -> dict:
 
     # Direction: ưu tiên dòng QUYẾT ĐỊNH, fallback emoji
     direction = "WAIT"
-    m = re.search(r"QUYẾT ĐỊNH[:\s]+(LONG|SHORT|NO[_\s-]?TRADE)", output, re.IGNORECASE)
+    m = re.search(r"QUYẾT ĐỊNH[:\s]+(LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)", output, re.IGNORECASE)
     if m:
-        direction = m.group(1).upper().replace(" ", "_").replace("-", "_")
+        raw_direction = m.group(1).upper().replace("-", "_").replace(" ", "_")
+        direction = "NO_TRADE" if raw_direction in ("NO_TRADE", "NO__TRADE", "KHÔNG_VÀO_LỆNH", "KHONG_VAO_LENH") else raw_direction
     elif re.search(r"📈\s*LONG", output):
         direction = "LONG"
     elif re.search(r"📉\s*SHORT", output):
@@ -3804,7 +4035,7 @@ def _validate_actionable_trade_plan(
     Lý do thêm guard:
     - Auto-check hiện tại chỉ biết giá chạm Entry là ENTRY_FILLED.
     - Với LONG tại liquidity pool dưới hoặc SHORT tại liquidity pool trên, setup đúng phải chờ
-      sweep + rút râu/đóng nến xác nhận. Nếu lưu như limit order chạm-là-fill thì rất dễ
+      quét thanh khoản + rút râu/đóng nến xác nhận. Nếu lưu như limit order chạm-là-fill thì rất dễ
       bắt dao rơi/bắt đỉnh và SL bị quét ngay.
     - Vì vậy plan nào thiếu khoảng SL tối thiểu hoặc là scalp pending entry quá xa giá hiện tại
       sẽ bị lưu REJECTED_PLAN và trả NO_TRADE an toàn cho user.
@@ -3832,6 +4063,9 @@ def _validate_actionable_trade_plan(
         errors.append(str(pred.get("_structural_sl_error")))
 
     risk_ref = _risk_floor(timeframe_data, mode, price or ((entry_low + entry_high) / 2.0))
+    min_stop = _minimum_stop_distance(timeframe_data, mode, price or ((entry_low + entry_high) / 2.0))
+    pred["_risk_reference"] = risk_ref
+    pred["_min_stop_distance"] = min_stop
     # Dùng risk/RR theo mép Entry bất lợi nhất:
     # LONG giả sử fill ở mép cao; SHORT giả sử fill ở mép thấp.
     if direction == "LONG":
@@ -3855,37 +4089,37 @@ def _validate_actionable_trade_plan(
         reward1 = max(entry_low - tp1, 0.0)
         reward2 = max(entry_low - tp2, 0.0)
 
-    min_risk = risk_ref if mode == "short" else risk_ref * 0.85
+    min_risk = min_stop
     if risk <= 0:
         errors.append("Risk Entry-SL không hợp lệ.")
     elif risk < min_risk:
         errors.append(
-            f"SL cấu trúc vẫn quá sát Entry: risk bất lợi {fmt(risk)} USDT < ngưỡng tối thiểu {fmt(min_risk)} USDT."
+            f"SL cấu trúc vẫn quá sát Entry: risk bất lợi {fmt(risk)} USDT < ngưỡng chống nhiễu {fmt(min_risk)} USDT."
         )
 
     if risk > 0:
         rr1 = reward1 / risk
         rr2 = reward2 / risk
-        if rr1 < 0.75:
-            errors.append(f"TP1 không đủ bù rủi ro: RR1 khoảng {fmt(rr1, 2)}R < 0.75R.")
-        if rr2 < 1.05:
-            errors.append(f"TP2 không hợp lý: RR2 khoảng {fmt(rr2, 2)}R < 1.05R.")
-        if reward2 <= reward1 * 1.10:
-            errors.append("TP2 quá sát TP1, không đáng là mục tiêu mở rộng riêng.")
+        if rr1 < MIN_TP1_R:
+            errors.append(f"TP1 không đủ bù rủi ro sau khi thử target cấu trúc: RR1 khoảng {fmt(rr1, 2)}R < {fmt(MIN_TP1_R, 2)}R.")
+        if rr2 < MIN_TP2_R:
+            errors.append(f"TP2 không hợp lý sau khi thử target cấu trúc: RR2 khoảng {fmt(rr2, 2)}R < {fmt(MIN_TP2_R, 2)}R.")
+        if reward2 <= reward1 * TP2_MIN_SEPARATION_MULT:
+            errors.append("TP2 quá sát TP1 sau khi thử target cấu trúc, không đáng là mục tiêu mở rộng riêng.")
 
     # Chặn scalp pending entry dạng bắt thanh khoản: bot hiện chưa lưu được điều kiện
-    # "chờ đóng nến xác nhận/reclaim", nên không được auto-fill chỉ bằng chạm giá.
+    # "chờ đóng nến xác nhận/lấy lại vùng", nên không được auto-fill chỉ bằng chạm giá.
     if mode == "short" and price is not None:
         dist_to_entry = _distance_price_to_entry({**pred, "entry_low": entry_low, "entry_high": entry_high}, price)
-        near_threshold = max(risk_ref * 0.35, price * 0.0008)
+        near_threshold = max(min_stop * 0.70, price * 0.0008)
         if dist_to_entry is not None and dist_to_entry > near_threshold:
             if direction == "LONG" and entry_high < price:
                 errors.append(
-                    "SCALP LONG là lệnh chờ thấp hơn giá hiện tại; nếu đó là bắt vùng thanh khoản dưới thì phải chờ sweep + đóng nến xác nhận, auto-check chạm-là-fill không an toàn."
+                    "SCALP LONG là lệnh chờ thấp hơn giá hiện tại; nếu đó là bắt vùng thanh khoản dưới thì phải chờ quét thanh khoản + đóng nến xác nhận, auto-check chạm-là-fill không an toàn."
                 )
             elif direction == "SHORT" and entry_low > price:
                 errors.append(
-                    "SCALP SHORT là lệnh chờ cao hơn giá hiện tại; nếu đó là bắt vùng thanh khoản trên thì phải chờ sweep + đóng nến xác nhận, auto-check chạm-là-fill không an toàn."
+                    "SCALP SHORT là lệnh chờ cao hơn giá hiện tại; nếu đó là bắt vùng thanh khoản trên thì phải chờ quét thanh khoản + đóng nến xác nhận, auto-check chạm-là-fill không an toàn."
                 )
 
     return errors
@@ -3895,10 +4129,10 @@ def _guarded_no_trade_output(symbol: str, mode: str, current_price: float | None
     mode_label = "SCALP" if mode == "short" else "SWING"
     price_text = f" Giá hiện tại {fmt(current_price)} USDT." if current_price is not None else ""
     reason = errors[0] if errors else "Kế hoạch LONG/SHORT bị bộ lọc rủi ro từ chối."
-    return (
+    return sanitize_user_output(
         f"🎯 {symbol} — {mode_label}\n"
-        f"🏆 QUYẾT ĐỊNH: NO_TRADE — 65%\n"
-        f"Lý do: {reason}{price_text} Bot không lưu tín hiệu này để tránh trường hợp vừa chạm Entry đã bị quét SL.\n"
+        f"🏆 QUYẾT ĐỊNH: NO TRADE — 65%\n"
+        f"Lý do: {reason}{price_text} Bot không lưu tín hiệu này để tránh trường hợp vừa chạm vùng vào lệnh đã bị quét SL.\n"
         f"⚠️ Rủi ro: Nếu cố vào lệnh, xác suất bị nhiễu hoặc quét SL ngắn hạn còn cao."
     )
 
@@ -3976,6 +4210,17 @@ def sanitize_user_output(output: str) -> str:
         "modifier": "ghi chú",
     }
     text = output or ""
+    # Dọn lỗi gõ/nhãn tiếng Anh thường bị model chèn vào output user.
+    text = re.sub(r"\bNO[_\s-]?TRADE\b", "NO TRADE", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bREJECTED[_\s-]?PLAN\b", "kế hoạch bị từ chối", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bsweep\b", "quét thanh khoản", text, flags=re.IGNORECASE)
+    text = re.sub(r"\breclaim\b", "lấy lại vùng", text, flags=re.IGNORECASE)
+    text = re.sub(r"\brisk\s*/\s*reward\b", "tỷ lệ lời/lỗ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\brisk\s*-\s*reward\b", "tỷ lệ lời/lỗ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\brisk\b", "rủi ro", text, flags=re.IGNORECASE)
+    text = re.sub(r"\breward\b", "lợi nhuận kỳ vọng", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bNếuu\b", "Nếu", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bNếuuu+\b", "Nếu", text, flags=re.IGNORECASE)
     # Replace longer internal labels first so overlapping terms do not leave fragments.
     for old in sorted(replacements, key=len, reverse=True):
         text = text.replace(old, replacements[old])
@@ -4002,8 +4247,8 @@ def sanitize_user_output(output: str) -> str:
 def build_no_trade_summary(output: str) -> str:
     text = (output or "").strip().replace("\n", " ")
     if not text:
-        return "Claude chọn NO_TRADE nhưng không có lý do rõ."
-    return "NO_TRADE: " + text[:600]
+        return "Claude chọn NO TRADE nhưng không có lý do rõ."
+    return "NO TRADE: " + text[:600]
 
 
 def log_hidden_rejection(symbol: str, mode: str, pred: dict, validation_errors: list[str], output: str) -> None:
@@ -4012,6 +4257,19 @@ def log_hidden_rejection(symbol: str, mode: str, pred: dict, validation_errors: 
         print("[TEOPARD_REJECTED]", flush=True)
         print(f"symbol={symbol} mode={mode} direction={pred.get('direction')}", flush=True)
         print("errors=" + " | ".join(str(e) for e in (validation_errors or [])), flush=True)
+        try:
+            rr = _plan_worst_case_risk_reward(pred)
+            print(
+                "metrics="
+                + f"risk={fmt(rr.get('risk'))} reward1={fmt(rr.get('reward1'))} reward2={fmt(rr.get('reward2'))} "
+                + f"rr1={fmt(rr.get('rr1'),2)} rr2={fmt(rr.get('rr2'),2)} "
+                + f"risk_ref={fmt(pred.get('_risk_reference'))} min_stop={fmt(pred.get('_min_stop_distance'))} "
+                + f"sl_src={pred.get('_structural_sl_source')} inv={fmt(pred.get('_structural_invalidation_level'))} "
+                + f"buf={fmt(pred.get('_structural_sl_buffer'))}",
+                flush=True,
+            )
+        except Exception:
+            pass
         print("output_preview=" + (output or "")[:1500].replace("\n", " "), flush=True)
     except Exception:
         pass
@@ -4099,6 +4357,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
 
     if direction in ("LONG", "SHORT"):
         pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
+        pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
 
     if direction == "NO_TRADE":
         save_no_trade_prediction(
@@ -4167,7 +4426,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         # Không ẩn output. Chỉ lưu hidden để learning/debug vì bot không đủ số để auto-check.
         missing = []
         if direction not in ("LONG", "SHORT"):
-            missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO_TRADE.")
+            missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO TRADE.")
         for field in ("entry_low", "entry_high", "sl", "tp1", "tp2"):
             if pred.get(field) is None:
                 missing.append(f"Không parse được {field}.")
@@ -4275,6 +4534,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     if direction in ("LONG", "SHORT"):
         pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
+        pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
 
     if direction == "NO_TRADE":
         await asyncio.to_thread(
@@ -4346,7 +4606,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         # Không ẩn output. Chỉ lưu hidden để learning/debug vì bot không đủ số để auto-check.
         missing = []
         if direction not in ("LONG", "SHORT"):
-            missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO_TRADE.")
+            missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO TRADE.")
         for field in ("entry_low", "entry_high", "sl", "tp1", "tp2"):
             if pred.get(field) is None:
                 missing.append(f"Không parse được {field}.")
