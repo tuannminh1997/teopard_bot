@@ -62,6 +62,7 @@ NGUYÊN TẮC BẮT BUỘC
 - Nếu phân tích lại và kế hoạch mới thay thế kế hoạch cũ, giải thích ngắn trong “📊 Kịch bản chính” vì sao kế hoạch cũ không còn ưu tiên.
 - Không đặt SL quá sát Entry. SL phải nằm ngoài điểm vô hiệu cấu trúc: LONG dưới swing low/invalidation gần nhất - ATR buffer; SHORT trên swing high/invalidation gần nhất + ATR buffer. Nếu lệnh dựa vào cú quét đáy/đỉnh mới nhất, SL bắt buộc phải nằm ngoài chính wick extreme của cú quét đó, không dùng một swing gần hơn nằm bên trong wick. Nếu SL cấu trúc làm RR xấu, chọn NO TRADE thay vì kéo TP xa hoặc đặt SL bừa.
 - TP1 phải hợp lý tối thiểu khoảng 0.75R trở lên theo mép Entry bất lợi nhất; TP2 phải là mục tiêu mở rộng thật sự, không quá sát TP1 và không được kéo xa vô lý chỉ để làm đẹp tỷ lệ lời/lỗ. Không dùng vùng sâu làm Entry scalp mặc định. Không tạo TP quá gần chỉ vì box thanh khoản ước lượng hẹp; hãy dùng swing/Fibonacci/vùng cấu trúc kế tiếp nếu hợp lý.
+- Với SCALP, không xuất tín hiệu LONG/SHORT nếu xác suất dưới 58%; chọn NO TRADE/chờ xác nhận. Rule này áp dụng hai chiều: LONG bắt đáy/quét đáy và SHORT bắt đỉnh/quét đỉnh đều phải đủ xác nhận. Riêng setup đảo chiều sau cú quét, nếu xác suất dưới 60%, MACD 15M/1H còn ngược chiều, hoặc volume xác nhận thấp, không được ghi “Có thể vào ngay”; hãy chọn NO TRADE.
 - TP1 dùng để chấm WIN/LOSS, TP2 là mục tiêu mở rộng.
 - Không viết lời khuyên tài chính chung chung.
 

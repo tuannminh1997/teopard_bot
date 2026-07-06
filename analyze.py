@@ -3047,6 +3047,12 @@ MIN_TP1_R = 0.75
 MIN_TP2_R = 1.05
 TP2_MIN_SEPARATION_MULT = 1.10
 
+# V17: không cho SCALP thành lệnh thật khi độ tin cậy thấp.
+# Case thực tế: LONG 55% bắt đáy, 3 phút sau thành NO TRADE. Với bot auto-check,
+# lệnh xác suất thấp như vậy phải bị chặn thành NO TRADE thay vì cho "vào ngay".
+MIN_ACTION_CONFIDENCE_SCALP = 58.0
+MIN_REVERSAL_CONFIDENCE_SCALP = 60.0
+
 
 def _dedupe_price_candidates(candidates: list[dict], price_ref: float, risk: float) -> list[dict]:
     """Gộp các target gần như trùng nhau để TP không nhảy giữa vài mức sát nhau."""
@@ -4267,8 +4273,25 @@ def parse_prediction_from_output(output: str) -> dict:
     tp1 = find_price([r"TP1[:\s]+([0-9,\.]+)"], selected_output)
     tp2 = find_price([r"TP2[:\s]+([0-9,\.]+)"], selected_output)
 
+    confidence = None
+    # Bắt phần trăm tin cậy từ dòng quyết định hoặc dòng LONG/SHORT.
+    # Ví dụ: "🏆 QUYẾT ĐỊNH: LONG — 55%" hoặc "📈 LONG — 62%".
+    conf_patterns = [
+        r"QUYẾT\s+ĐỊNH[:\s]+(?:LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"(?:📈|📉)?\s*(?:LONG|SHORT|NO[_\s-]?TRADE)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+    ]
+    for pat in conf_patterns:
+        cm = re.search(pat, output, flags=re.IGNORECASE)
+        if cm:
+            try:
+                confidence = float(cm.group(1))
+                break
+            except Exception:
+                pass
+
     return {
         "direction":  direction,
+        "confidence": confidence,
         "entry_low":  entry_low,
         "entry_high": entry_high,
         "sl":         sl,
@@ -4306,6 +4329,130 @@ def _distance_price_to_entry(pred: dict, current_price: float | None) -> float |
     return price - entry_high
 
 
+
+def _output_mentions_reversal_entry(output: str | None, direction: str) -> bool:
+    """Nhận diện setup scalp đảo chiều/bắt đáy-bắt đỉnh từ lời giải thích của model.
+
+    Guard này phải đối xứng:
+    - LONG bắt đáy / quét đáy / râu dưới / quá bán.
+    - SHORT bắt đỉnh / quét đỉnh / râu trên / quá mua / bị từ chối vùng trên.
+
+    Dùng nhiều biến thể từ ngữ vì model có thể diễn đạt khác nhau sau mỗi lần gọi.
+    """
+    if not output:
+        return False
+    text = str(output).lower()
+    if direction == "LONG":
+        keys = (
+            "quét đáy", "đáy quét", "quét vùng dưới", "quét hỗ trợ",
+            "rút râu dưới", "râu dưới", "wick dưới", "lower wick",
+            "bắt đáy", "quá bán", "oversold", "hồi phục", "bật lên",
+            "lấy lại vùng", "đóng lại trên", "reclaim",
+        )
+    elif direction == "SHORT":
+        keys = (
+            "quét đỉnh", "đỉnh quét", "quét vùng trên", "quét kháng cự",
+            "rút râu trên", "râu trên", "wick trên", "upper wick",
+            "bắt đỉnh", "quá mua", "overbought", "đảo chiều giảm",
+            "bị từ chối", "từ chối vùng trên", "từ chối kháng cự",
+            "đóng lại dưới", "mất vùng", "reject", "rejection",
+        )
+    else:
+        return False
+    return any(k in text for k in keys)
+
+
+def _closed_row_momentum_flags(timeframe_data: dict[str, pd.DataFrame | None], direction: str) -> dict:
+    """Đọc động lượng từ nến đã đóng để guard các lệnh scalp đảo chiều quá sớm."""
+    flags = {
+        "m15_against": False,
+        "h1_against": False,
+        "m15_ema_against": False,
+        "h1_ema_against": False,
+        "m15_vol": None,
+        "h1_vol": None,
+    }
+    for label, prefix in (("15M", "m15"), ("1H", "h1")):
+        row = _analysis_row(timeframe_data.get(label))
+        if row is None:
+            continue
+        macd = _safe_float(row.get("macd_hist"), 0.0) or 0.0
+        e7 = _safe_float(row.get("ema_7")); e25 = _safe_float(row.get("ema_25")); e50 = _safe_float(row.get("ema_50"))
+        vol = _safe_float(row.get("vol_ratio"), None)
+        flags[f"{prefix}_vol"] = vol
+        if direction == "LONG":
+            flags[f"{prefix}_against"] = macd < 0
+            flags[f"{prefix}_ema_against"] = e7 is not None and e25 is not None and e50 is not None and e7 < e25 < e50
+        elif direction == "SHORT":
+            flags[f"{prefix}_against"] = macd > 0
+            flags[f"{prefix}_ema_against"] = e7 is not None and e25 is not None and e50 is not None and e7 > e25 > e50
+    return flags
+
+
+def _validate_scalp_reversal_quality(
+    pred: dict,
+    timeframe_data: dict[str, pd.DataFrame | None],
+    output: str | None,
+) -> list[str]:
+    """Guard riêng cho setup SCALP đảo chiều.
+
+    Một lệnh bắt đáy/bắt đỉnh chỉ được vào ngay khi đủ xác nhận. Nếu confidence thấp,
+    MACD 15M/1H vẫn ngược chiều hoặc volume xác nhận yếu, bot phải NO TRADE/chờ nến.
+    """
+    errors: list[str] = []
+    direction = (pred.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT"):
+        return errors
+
+    conf = pred.get("confidence")
+    try:
+        conf_val = float(conf) if conf is not None else None
+    except Exception:
+        conf_val = None
+
+    is_reversal = _output_mentions_reversal_entry(output, direction)
+    if conf_val is not None and conf_val < MIN_ACTION_CONFIDENCE_SCALP:
+        errors.append(
+            f"Tín hiệu SCALP chỉ {conf_val:.1f}%, dưới ngưỡng tối thiểu {MIN_ACTION_CONFIDENCE_SCALP:.1f}% để lưu thành lệnh thật."
+        )
+
+    if not is_reversal:
+        return errors
+
+    flags = _closed_row_momentum_flags(timeframe_data, direction)
+    against_count = sum(bool(flags.get(k)) for k in ("m15_against", "h1_against", "m15_ema_against"))
+    vol_values = [v for v in (flags.get("m15_vol"), flags.get("h1_vol")) if v is not None and np.isfinite(v)]
+    max_vol = max(vol_values) if vol_values else None
+
+    if conf_val is not None and conf_val < MIN_REVERSAL_CONFIDENCE_SCALP:
+        errors.append(
+            f"Setup SCALP đảo chiều/bắt đáy-bắt đỉnh chỉ {conf_val:.1f}%; phải chờ thêm nến xác nhận thay vì vào ngay."
+        )
+
+    if against_count >= 2 and (max_vol is None or max_vol < 1.0):
+        errors.append(
+            "Setup đảo chiều còn ngược động lượng 15M/1H và volume xác nhận chưa đủ mạnh; không vào ngay để tránh vừa vào đã bị đảo sang NO TRADE."
+        )
+    elif against_count >= 3:
+        errors.append(
+            "Setup đảo chiều còn bị 15M/1H chống lại quá rõ; cần chờ đóng nến xác nhận/lấy lại vùng trước khi lưu lệnh."
+        )
+
+    # Nếu model tự ghi rủi ro rằng MACD còn âm/dương ngược hướng + volume thấp,
+    # xem đó là cảnh báo bắt buộc, không cho biến thành lệnh executable khi confidence thấp.
+    text = (output or "").lower()
+    warning_markers = 0
+    for key in ("volume", "khối lượng", "macd", "động lượng", "chưa hoàn toàn", "vẫn nghiêng giảm", "vẫn nghiêng tăng", "lực mua không duy trì", "lực bán không duy trì"):
+        if key in text:
+            warning_markers += 1
+    if conf_val is not None and conf_val < MIN_REVERSAL_CONFIDENCE_SCALP and warning_markers >= 3:
+        errors.append(
+            "Phần rủi ro của model còn nêu nhiều cảnh báo ngược chiều, nên không cho phép vào lệnh đảo chiều ngay."
+        )
+
+    return errors
+
+
 def _validate_actionable_trade_plan(
     pred: dict,
     timeframe_data: dict[str, pd.DataFrame | None],
@@ -4328,6 +4475,9 @@ def _validate_actionable_trade_plan(
     direction = (pred.get("direction") or "").upper()
     if direction not in ("LONG", "SHORT"):
         return errors
+
+    if mode == "short":
+        errors.extend(_validate_scalp_reversal_quality(pred, timeframe_data, output))
 
     required = ("entry_low", "entry_high", "sl", "tp1", "tp2")
     missing = [name for name in required if pred.get(name) is None]
