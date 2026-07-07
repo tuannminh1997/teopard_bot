@@ -4257,13 +4257,13 @@ Yêu cầu:
 4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và tỷ lệ lời/lỗ đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO TRADE. Không dùng NO TRADE chỉ vì giá chưa chạm Entry; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.
 5. Cách dùng vùng quét: Entry ưu tiên vùng gần/chính nếu hợp hướng setup và có xác nhận. Với SCALP, không được LONG chỉ vì giá chạm vùng thanh khoản dưới và không được SHORT chỉ vì giá chạm vùng thanh khoản trên; cần có lợi thế rõ như quét thanh khoản/rút râu/đóng nến xác nhận, hoặc một vùng chờ hợp lý với SL/TP đạt tỷ lệ. Nếu còn thiếu xác nhận, được phép đưa lệnh chờ với điều kiện kích hoạt rõ; chỉ chọn NO TRADE khi cả Entry, SL/TP hoặc động lượng đều không đủ.
 6. TP dùng vùng đối diện nhưng không được ép bám sát mép box hẹp: với LONG nhìn vùng thanh khoản trên/swing high/Fibonacci phía trên, với SHORT nhìn vùng thanh khoản dưới/swing low/Fibonacci phía dưới. Nếu TP1 quá gần Entry làm RR < 0.40R, hãy chọn target cấu trúc kế tiếp; nếu không có target hợp lý thì NO TRADE. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét; Python sẽ còn nới SL thêm theo biến cấu hình để ra SL cuối cùng cho user; phần nới thêm mặc định không tính vào RR guard. Với SCALP, SL cuối cùng vẫn không được sai hình học hoặc quá sát Entry.
-7. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”.
+7. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”. Nếu Entry chưa chạm giá hiện tại nhưng vẫn là vùng đẹp, giữ quyết định LONG/SHORT dạng lệnh chờ và ghi rõ “Chưa vào ngay, chờ giá về vùng Entry...”, không chọn NO TRADE chỉ vì chưa chạm Entry.
 8. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
 9. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát; nếu phải đặt SL quá sát mới có tỷ lệ đẹp thì chọn NO TRADE. Không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
 10. Nếu chọn NO TRADE: không cần Entry/SL/TP; trả quyết định NO TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Được chọn NO TRADE khi lợi thế chưa đủ rõ, kể cả khi vẫn có thể vẽ ra một vùng Entry hợp lệ nhưng kèo không đáng vào.
 11. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
 12. Đọc kỹ KẾ HOẠCH ĐANG MỞ nếu có. Không được hiểu vùng Entry của một lệnh chờ LONG là mục tiêu TP cho lệnh SHORT ngược lại, hoặc vùng Entry của lệnh chờ SHORT là mục tiêu TP cho lệnh LONG ngược lại.
-13. Nếu đang có kế hoạch cũ PENDING_ENTRY mà giá đã chạy xa khỏi Entry theo đúng hướng dự báo, không được đuổi giá chỉ vì giá chạy. Chỉ cho vào ngay khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu không thì NO TRADE hoặc chờ kiểm tra lại.
+13. Nếu đang có kế hoạch cũ PENDING_ENTRY mà giá đã chạy xa khỏi Entry theo đúng hướng dự báo, không được đuổi giá chỉ vì giá chạy. Chỉ cho vào ngay khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu Entry còn tốt nhưng chưa tới giá thì ghi lệnh chờ, không ép thành NO TRADE chỉ vì Entry xa.
 14. Nếu kế hoạch mới thay thế kế hoạch cũ, ghi ngắn trong “📊 Kịch bản chính” lý do kế hoạch cũ bị hủy/thay thế.
 15. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
 16. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
@@ -4720,6 +4720,95 @@ def _distance_price_to_entry(pred: dict, current_price: float | None) -> float |
 
 
 
+def _output_claims_immediate_entry(output: str | None) -> bool:
+    """True nếu lời giải thích nói đang/có thể vào ngay."""
+    if not output:
+        return False
+    text = str(output).lower()
+    return any(k in text for k in (
+        "vào ngay",
+        "có thể vào ngay",
+        "có thể vào lệnh ngay",
+        "giá hiện tại đang nằm",
+        "đang nằm trong vùng entry",
+        "đang trong vùng entry",
+    ))
+
+
+def _normalize_pending_entry_activation(
+    output: str,
+    pred: dict,
+    current_price: float | None,
+) -> str:
+    """Nếu Entry chưa tới nhưng model ghi 'vào ngay', đổi thành lệnh chờ.
+
+    Đây là bản sửa V29: Entry xa giá hiện tại không phải lý do NO TRADE.
+    Kế hoạch vẫn có thể là LONG/SHORT dạng PENDING_ENTRY; chỉ cần sửa wording
+    kích hoạt để user hiểu là phải chờ giá về Entry, không vào market ngay.
+    """
+    if not output or current_price is None:
+        return output
+    direction = (pred.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT"):
+        return output
+    entry_low = pred.get("entry_low")
+    entry_high = pred.get("entry_high")
+    if entry_low is None or entry_high is None:
+        return output
+
+    try:
+        low = float(entry_low)
+        high = float(entry_high)
+        price = float(current_price)
+    except Exception:
+        return output
+    if low > high:
+        low, high = high, low
+    if low <= price <= high:
+        return output
+    if not _output_claims_immediate_entry(output):
+        return output
+
+    if price < low:
+        relation = "giá hiện tại còn thấp hơn vùng Entry"
+    else:
+        relation = "giá hiện tại đã vượt khỏi vùng Entry"
+    wait_line = (
+        f"Kích hoạt: Chưa vào ngay. Chờ giá về vùng Entry {fmt(low)}–{fmt(high)} "
+        f"và có nến xác nhận đúng hướng; {relation} tại {fmt(price)}, không đuổi giá."
+    )
+
+    # Thay toàn bộ dòng Kích hoạt cũ nếu có.
+    if re.search(r"^\s*Kích hoạt:\s*.*$", output, flags=re.IGNORECASE | re.MULTILINE):
+        output = re.sub(
+            r"^\s*Kích hoạt:\s*.*$",
+            wait_line,
+            output,
+            count=1,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+    else:
+        # Nếu model thiếu dòng Kích hoạt, chèn sau Rủi ro mỗi lệnh hoặc sau TP2.
+        if re.search(r"^\s*Rủi ro mỗi lệnh:\s*.*$", output, flags=re.IGNORECASE | re.MULTILINE):
+            output = re.sub(
+                r"(^\s*Rủi ro mỗi lệnh:\s*.*$)",
+                r"\1\n" + wait_line,
+                output,
+                count=1,
+                flags=re.IGNORECASE | re.MULTILINE,
+            )
+        else:
+            output = re.sub(
+                r"(^\s*TP2:\s*.*$)",
+                r"\1\n" + wait_line,
+                output,
+                count=1,
+                flags=re.IGNORECASE | re.MULTILINE,
+            )
+    return output
+
+
+
 def _output_mentions_reversal_entry(output: str | None, direction: str) -> bool:
     """Nhận diện setup scalp đảo chiều/bắt đáy-bắt đỉnh từ lời giải thích của model.
 
@@ -4939,19 +5028,9 @@ def _validate_actionable_trade_plan(
         if TP2_MIN_SEPARATION_MULT > 1.0 and reward2 <= reward1 * TP2_MIN_SEPARATION_MULT:
             errors.append("TP2 quá sát TP1 sau khi thử target cấu trúc, không đáng là mục tiêu mở rộng riêng.")
 
-    # V23: Không còn reject mọi lệnh chờ scalp chỉ vì Entry thấp/cao hơn giá hiện tại.
-    # Sau V19, lệnh chỉ được đưa vào history/auto-check khi user bấm xác nhận trade,
-    # nên việc chặn pending entry quá rộng làm bot NO TRADE quá nhiều. Chỉ chặn khi
-    # Entry cực xa giá hiện tại và lời giải thích lại nói kiểu "vào ngay", vì đó là mâu thuẫn rõ.
-    if mode == "short" and price is not None:
-        dist_to_entry = _distance_price_to_entry({**pred, "entry_low": entry_low, "entry_high": entry_high}, price)
-        far_threshold = max(min_stop * 3.00, price * 0.0050)
-        text = (output or "").lower()
-        claims_immediate = any(k in text for k in ("vào ngay", "có thể vào ngay", "giá hiện tại đang nằm", "đang nằm trong vùng entry"))
-        if dist_to_entry is not None and dist_to_entry > far_threshold and claims_immediate:
-            errors.append(
-                "Kế hoạch SCALP mâu thuẫn: Entry còn xa giá hiện tại nhưng phần kích hoạt lại ghi có thể vào ngay."
-            )
+    # V29: Entry xa giá hiện tại nhưng model ghi "vào ngay" không còn bị ép NO TRADE.
+    # Output sẽ được _normalize_pending_entry_activation() đổi thành lệnh chờ PENDING_ENTRY.
+    # Validator chỉ giữ các lỗi cứng về hình học, SL/TP và confidence.
 
     return errors
 
@@ -5189,6 +5268,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     if direction in ("LONG", "SHORT"):
         pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
         pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
+        output = _normalize_pending_entry_activation(output, pred, current_price)
 
     if direction == "NO_TRADE":
         # V19: chỉ lệnh user xác nhận đã trade mới được lưu vào predictions/history.
@@ -5323,6 +5403,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     if direction in ("LONG", "SHORT"):
         pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
         pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
+        output = _normalize_pending_entry_activation(output, pred, current_price)
 
     if direction == "NO_TRADE":
         # V19: NO TRADE không lưu vào predictions/history; chỉ lệnh user xác nhận mới được theo dõi.
