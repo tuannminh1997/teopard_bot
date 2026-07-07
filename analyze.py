@@ -3349,10 +3349,32 @@ def _nearest_invalidation_level(
     return {**chosen, "sl": sl, "buffer": buffer}
 
 
-def _plan_worst_case_risk_reward(pred: dict) -> dict:
+def _rr_guard_uses_extra_sl_buffer() -> bool:
+    """Có tính phần nới SL thêm vào RR guard hay không.
+
+    Mặc định False theo phong cách của user: TEOPARD_EXTRA_SL_BUFFER_PCT là lớp đệm
+    SL cuối cùng để tránh nhiễu, không được làm Python đổi kèo thành NO TRADE chỉ vì
+    tỷ lệ lời/lỗ xấu đi sau khi cộng đệm.
+    """
+    raw = (os.getenv("TEOPARD_RR_USE_EXTRA_SL_BUFFER") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _sl_for_rr_guard(pred: dict) -> float:
+    if not _rr_guard_uses_extra_sl_buffer() and pred.get("_sl_before_extra_buffer") is not None:
+        try:
+            return float(pred["_sl_before_extra_buffer"])
+        except Exception:
+            pass
+    return float(pred["sl"])
+
+
+def _plan_worst_case_risk_reward(pred: dict, *, use_rr_guard_sl: bool = False) -> dict:
     """RR bảo thủ theo mép Entry bất lợi nhất.
 
     LONG: giả sử fill ở mép cao của Entry. SHORT: giả sử fill ở mép thấp của Entry.
+    Nếu use_rr_guard_sl=True, RR dùng SL cấu trúc gốc trước lớp đệm % thêm, trừ khi
+    TEOPARD_RR_USE_EXTRA_SL_BUFFER=1. SL xuất ra user/tracking vẫn là SL cuối cùng.
     """
     direction = (pred.get("direction") or "").upper()
     try:
@@ -3360,7 +3382,7 @@ def _plan_worst_case_risk_reward(pred: dict) -> dict:
         entry_high = float(pred["entry_high"])
         if entry_low > entry_high:
             entry_low, entry_high = entry_high, entry_low
-        sl = float(pred["sl"])
+        sl = _sl_for_rr_guard(pred) if use_rr_guard_sl else float(pred["sl"])
         tp1 = float(pred["tp1"])
         tp2 = float(pred["tp2"])
     except Exception:
@@ -3403,8 +3425,8 @@ def _guard_profile() -> str:
 def _guard_is_off() -> bool:
     return _guard_profile() in ("off", "trust", "model", "model_only")
 
-MIN_TP1_R = _env_float("TEOPARD_MIN_TP1_R", 0.50)
-MIN_TP2_R = _env_float("TEOPARD_MIN_TP2_R", 0.60)
+MIN_TP1_R = _env_float("TEOPARD_MIN_TP1_R", 0.40)
+MIN_TP2_R = _env_float("TEOPARD_MIN_TP2_R", 0.50)
 TP2_MIN_SEPARATION_MULT = _env_float("TEOPARD_TP2_SEPARATION_MULT", 1.00)
 
 MIN_ACTION_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", 48.0)
@@ -3560,7 +3582,7 @@ def _normalize_trade_plan_structural_tps(
         return pred, output
 
     normalized = dict(pred)
-    rr = _plan_worst_case_risk_reward(normalized)
+    rr = _plan_worst_case_risk_reward(normalized, use_rr_guard_sl=True)
     risk = rr.get("risk")
     if not risk or risk <= 0:
         return normalized, output
@@ -3588,7 +3610,7 @@ def _normalize_trade_plan_structural_tps(
             normalized["_tp1_old"] = old_tp1
 
     # Tính lại sau khi có thể đã sửa TP1.
-    rr = _plan_worst_case_risk_reward(normalized)
+    rr = _plan_worst_case_risk_reward(normalized, use_rr_guard_sl=True)
     risk = rr.get("risk") or risk
     reward1 = rr.get("reward1") or reward1
     reward2 = rr.get("reward2") or reward2
@@ -3674,8 +3696,9 @@ def _normalize_trade_plan_structural_sl(
             new_sl = inv_price + buffer
             inv = {**inv, "price": inv_price, "kind": "model_sweep_extreme", "label": "output"}
 
-    # V27: sau SL cấu trúc, nới thêm % theo biến Railway để tránh SL quá sát.
-    # SHORT: SL cao hơn thêm %, LONG: SL thấp hơn thêm %. Nếu nới ra làm RR xấu, validator sẽ NO TRADE.
+    # V28: sau SL cấu trúc, luôn nới thêm % theo biến Railway để tránh SL quá sát.
+    # SHORT: SL cao hơn thêm %, LONG: SL thấp hơn thêm %. Phần nới thêm mặc định KHÔNG
+    # tham gia RR guard; user muốn đây là phong cách SL, không phải lý do để NO TRADE.
     extra_pct = _extra_user_sl_buffer_pct()
     if extra_pct > 0:
         before_extra_sl = float(new_sl)
@@ -3938,7 +3961,7 @@ def build_feature_engineering_block(
         _format_liquidity_window_line("Vùng thanh khoản trên giá ước lượng", zones, "upper", price),
         "- Vai trò vùng quét: Entry có thể tham khảo vùng gần/chính nếu hợp xu hướng và có xác nhận. Với SCALP, không dùng vùng thanh khoản dưới làm Entry LONG hoặc vùng thanh khoản trên làm Entry SHORT theo kiểu chạm-là-fill. Nếu cần thêm xác nhận, có thể ghi lệnh chờ kèm điều kiện rõ; chỉ chọn NO TRADE khi SL/TP, động lượng hoặc vùng vào không đạt.",
         "- TP không bị ép bám sát mép box thanh khoản ước lượng. Nếu box đối diện quá gần làm RR xấu, hãy dùng swing high/low kế tiếp, Fibonacci hoặc vùng cấu trúc kế tiếp làm TP; Python cũng sẽ thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp trước khi reject. Nếu vẫn không đủ RR thì chọn NO TRADE. Không tạo TP quá gần chỉ vì box thanh khoản rất hẹp.",
-        "- Quy tắc rủi ro: SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; nếu setup dựa vào cú quét đáy/đỉnh mới nhất thì wick extreme của cú quét đó là invalidation trực tiếp và SL phải nằm ngoài wick đó. Python sẽ tự chuẩn hóa SL theo cấu trúc này, rồi nới thêm phần trăm cấu hình để tránh SL quá sát trước khi lưu. Sau đó Python thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp nếu TP quá sát. RR được tính theo mép Entry bất lợi nhất: TP1 nên >= 0.60R, TP2 nên >= 0.80R và không quá sát TP1; nếu sau khi thử target cấu trúc vẫn không đạt thì chọn NO TRADE.",
+        "- Quy tắc rủi ro: SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; nếu setup dựa vào cú quét đáy/đỉnh mới nhất thì wick extreme của cú quét đó là invalidation trực tiếp và SL phải nằm ngoài wick đó. Python sẽ tự chuẩn hóa SL theo cấu trúc này, tính RR theo SL cấu trúc gốc, rồi mới nới thêm phần trăm cấu hình để ra SL cuối cùng cho user/tracking. Phần nới SL thêm là phong cách quản trị rủi ro và mặc định không làm đổi LONG/SHORT thành NO TRADE vì RR xấu đi. Sau đó Python thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp nếu TP quá sát. RR guard nội bộ dùng SL cấu trúc gốc: TP1 nên >= 0.40R, TP2 nên >= 0.50R; nếu sau khi thử target cấu trúc vẫn không đạt thì chọn NO TRADE.",
         "- Ghi chú: Vùng quét là vùng thanh khoản kỹ thuật ước lượng theo cửa sổ thời gian, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật nội bộ, không phải lệnh giao dịch chốt sẵn. Không show trực tiếp các vùng thanh khoản/thanh lý/heatmap ra user; chỉ dùng chúng để lập quyết định, Entry/SL/TP, lý do và rủi ro.",
     ]
     return "\n".join(lines)
@@ -4233,7 +4256,7 @@ Yêu cầu:
 3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO TRADE theo xu hướng đa khung, vị trí giá, vùng quét ước lượng theo cửa sổ thời gian, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user, không in mục thanh khoản/heatmap/vùng thanh lý.
 4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và tỷ lệ lời/lỗ đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO TRADE. Không dùng NO TRADE chỉ vì giá chưa chạm Entry; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.
 5. Cách dùng vùng quét: Entry ưu tiên vùng gần/chính nếu hợp hướng setup và có xác nhận. Với SCALP, không được LONG chỉ vì giá chạm vùng thanh khoản dưới và không được SHORT chỉ vì giá chạm vùng thanh khoản trên; cần có lợi thế rõ như quét thanh khoản/rút râu/đóng nến xác nhận, hoặc một vùng chờ hợp lý với SL/TP đạt tỷ lệ. Nếu còn thiếu xác nhận, được phép đưa lệnh chờ với điều kiện kích hoạt rõ; chỉ chọn NO TRADE khi cả Entry, SL/TP hoặc động lượng đều không đủ.
-6. TP dùng vùng đối diện nhưng không được ép bám sát mép box hẹp: với LONG nhìn vùng thanh khoản trên/swing high/Fibonacci phía trên, với SHORT nhìn vùng thanh khoản dưới/swing low/Fibonacci phía dưới. Nếu TP1 quá gần Entry làm RR < 0.60R, hãy chọn target cấu trúc kế tiếp; nếu không có target hợp lý thì NO TRADE. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét; Python sẽ còn nới SL thêm theo biến cấu hình để ra SL cuối cùng cho user. Với SCALP, rủi ro Entry–SL không được thấp hơn ngưỡng chống nhiễu.
+6. TP dùng vùng đối diện nhưng không được ép bám sát mép box hẹp: với LONG nhìn vùng thanh khoản trên/swing high/Fibonacci phía trên, với SHORT nhìn vùng thanh khoản dưới/swing low/Fibonacci phía dưới. Nếu TP1 quá gần Entry làm RR < 0.40R, hãy chọn target cấu trúc kế tiếp; nếu không có target hợp lý thì NO TRADE. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét; Python sẽ còn nới SL thêm theo biến cấu hình để ra SL cuối cùng cho user; phần nới thêm mặc định không tính vào RR guard. Với SCALP, SL cuối cùng vẫn không được sai hình học hoặc quá sát Entry.
 7. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”.
 8. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
 9. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát; nếu phải đặt SL quá sát mới có tỷ lệ đẹp thì chọn NO TRADE. Không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
@@ -4871,8 +4894,8 @@ def _validate_actionable_trade_plan(
     min_stop = _minimum_stop_distance(timeframe_data, mode, price or ((entry_low + entry_high) / 2.0))
     pred["_risk_reference"] = risk_ref
     pred["_min_stop_distance"] = min_stop
-    # Dùng risk/RR theo mép Entry bất lợi nhất:
-    # LONG giả sử fill ở mép cao; SHORT giả sử fill ở mép thấp.
+    # Hình học dùng SL cuối cùng xuất cho user/tracking. RR guard mặc định dùng SL cấu trúc
+    # gốc trước lớp đệm % thêm, để TEOPARD_EXTRA_SL_BUFFER_PCT không làm kèo bị NO TRADE.
     if direction == "LONG":
         if sl >= entry_low:
             errors.append("LONG sai hình học: SL phải nằm dưới toàn bộ vùng Entry.")
@@ -4880,9 +4903,7 @@ def _validate_actionable_trade_plan(
             errors.append("LONG sai hình học: TP1 phải nằm trên toàn bộ vùng Entry.")
         if tp2 < tp1:
             errors.append("LONG sai hình học: TP2 không được thấp hơn TP1.")
-        risk = max(entry_high - sl, 0.0)
-        reward1 = max(tp1 - entry_high, 0.0)
-        reward2 = max(tp2 - entry_high, 0.0)
+        final_risk = max(entry_high - sl, 0.0)
     else:
         if sl <= entry_high:
             errors.append("SHORT sai hình học: SL phải nằm trên toàn bộ vùng Entry.")
@@ -4890,21 +4911,24 @@ def _validate_actionable_trade_plan(
             errors.append("SHORT sai hình học: TP1 phải nằm dưới toàn bộ vùng Entry.")
         if tp2 > tp1:
             errors.append("SHORT sai hình học: TP2 không được cao hơn TP1.")
-        risk = max(sl - entry_low, 0.0)
-        reward1 = max(entry_low - tp1, 0.0)
-        reward2 = max(entry_low - tp2, 0.0)
+        final_risk = max(sl - entry_low, 0.0)
+
+    rr_guard = _plan_worst_case_risk_reward(pred, use_rr_guard_sl=True)
+    risk = float(rr_guard.get("risk") or 0.0)
+    reward1 = float(rr_guard.get("reward1") or 0.0)
+    reward2 = float(rr_guard.get("reward2") or 0.0)
 
     min_risk = min_stop
-    if risk <= 0:
+    if final_risk <= 0:
         errors.append("Risk Entry-SL không hợp lệ.")
-    elif not _guard_is_off() and risk < min_risk:
+    elif not _guard_is_off() and final_risk < min_risk:
         errors.append(
-            f"SL cấu trúc vẫn quá sát Entry: risk bất lợi {fmt(risk)} USDT < ngưỡng chống nhiễu {fmt(min_risk)} USDT."
+            f"SL cuối vẫn quá sát Entry: risk bất lợi {fmt(final_risk)} USDT < ngưỡng chống nhiễu {fmt(min_risk)} USDT."
         )
 
-    # V26: RR chỉ là guard mềm. Ở profile loose mặc định, ngưỡng thấp hơn nhiều để không biến
-    # các plan có cấu trúc hợp lệ thành NO TRADE liên tục. Nếu muốn gần như tin model hoàn toàn,
-    # set TEOPARD_GUARD_PROFILE=off trên Railway.
+    # RR guard không tính phần nới SL thêm theo %. Muốn ép RR theo SL cuối cùng thì set
+    # TEOPARD_RR_USE_EXTRA_SL_BUFFER=1. Mặc định: buffer SL là phong cách quản trị rủi ro
+    # của user, không được tự làm Python đổi LONG/SHORT thành NO TRADE.
     if risk > 0 and not _guard_is_off():
         rr1 = reward1 / risk
         rr2 = reward2 / risk
