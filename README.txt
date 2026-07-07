@@ -296,3 +296,30 @@ Ghi chú chuyển provider:
 - Z.AI native dùng endpoint OpenAI-compatible /chat/completions và truyền reasoning_effort trực tiếp.
 - ZAI_REASONING_EFFORT mặc định high để giảm lag; đổi max/xhigh nếu muốn suy luận sâu hơn nhưng có thể chậm hơn.
 - ZAI_SUMMARY_REASONING_EFFORT mặc định none để summary không đốt token reasoning.
+
+## Railway guard variables hiện tại
+
+Các biến guard có thể chỉnh trên Railway mà không cần sửa code:
+
+```env
+TEOPARD_GUARD_PROFILE=loose
+TEOPARD_MIN_TP1_R=0.50
+TEOPARD_MIN_TP2_R=0.60
+TEOPARD_MIN_SCALP_CONFIDENCE=48
+TEOPARD_MIN_REVERSAL_CONFIDENCE=50
+TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE=52
+TEOPARD_WEAK_CONFIRM_VOLUME=0.45
+```
+
+Biến mới từ V27:
+
+```env
+TEOPARD_EXTRA_SL_BUFFER_PCT=2
+```
+
+Ý nghĩa: sau khi Python chuẩn hóa SL theo swing/invalidation + ATR buffer, bot nới thêm SL theo phần trăm giá SL trước khi gửi user.
+
+- LONG: `SL cuối = SL cấu trúc × (1 - pct)`
+- SHORT: `SL cuối = SL cấu trúc × (1 + pct)`
+
+Ví dụ SHORT SL cấu trúc `1,783.99`, `TEOPARD_EXTRA_SL_BUFFER_PCT=2` thì SL cuối khoảng `1,819.67`. Nếu SL cuối làm RR quá xấu, Python sẽ đổi thành `NO TRADE` thay vì gửi lệnh rủi ro xấu.

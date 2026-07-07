@@ -3050,6 +3050,39 @@ def _structural_sl_buffer(timeframe_data: dict[str, pd.DataFrame | None], mode: 
     return max(atr_main * 0.55, atr_structure * 0.20, current_price * 0.0030)
 
 
+def _extra_user_sl_buffer_pct() -> float:
+    """Phần trăm nới SL thêm sau khi có SL cấu trúc.
+
+    Biến Railway TEOPARD_EXTRA_SL_BUFFER_PCT nhập theo đơn vị phần trăm:
+      2    = nới 2% theo giá SL
+      0.2  = nới 0.2%
+      0    = tắt
+    LONG: SL cuối = SL * (1 - pct)
+    SHORT: SL cuối = SL * (1 + pct)
+    """
+    raw = os.getenv("TEOPARD_EXTRA_SL_BUFFER_PCT")
+    if raw is None or str(raw).strip() == "":
+        raw = os.getenv("TEOPARD_SL_EXTRA_BUFFER_PCT", "2")
+    try:
+        pct = float(str(raw).strip()) / 100.0
+    except Exception:
+        pct = 0.02
+    if not np.isfinite(pct) or pct < 0:
+        return 0.0
+    return min(pct, 0.10)
+
+
+def _apply_extra_sl_buffer(sl: float, direction: str) -> float:
+    pct = _extra_user_sl_buffer_pct()
+    if pct <= 0:
+        return float(sl)
+    if direction == "LONG":
+        return float(sl) * (1.0 - pct)
+    if direction == "SHORT":
+        return float(sl) * (1.0 + pct)
+    return float(sl)
+
+
 def _collect_structural_levels(
     timeframe_data: dict[str, pd.DataFrame | None],
     mode: str,
@@ -3641,6 +3674,15 @@ def _normalize_trade_plan_structural_sl(
             new_sl = inv_price + buffer
             inv = {**inv, "price": inv_price, "kind": "model_sweep_extreme", "label": "output"}
 
+    # V27: sau SL cấu trúc, nới thêm % theo biến Railway để tránh SL quá sát.
+    # SHORT: SL cao hơn thêm %, LONG: SL thấp hơn thêm %. Nếu nới ra làm RR xấu, validator sẽ NO TRADE.
+    extra_pct = _extra_user_sl_buffer_pct()
+    if extra_pct > 0:
+        before_extra_sl = float(new_sl)
+        new_sl = _apply_extra_sl_buffer(before_extra_sl, direction)
+        normalized["_sl_before_extra_buffer"] = before_extra_sl
+        normalized["_extra_sl_buffer_pct"] = extra_pct
+
     normalized["_structural_invalidation_level"] = float(inv_price)
     normalized["_structural_sl_buffer"] = float(buffer)
     normalized["_structural_sl_source"] = f"{inv.get('label')} {inv.get('kind')}"
@@ -3896,7 +3938,7 @@ def build_feature_engineering_block(
         _format_liquidity_window_line("Vùng thanh khoản trên giá ước lượng", zones, "upper", price),
         "- Vai trò vùng quét: Entry có thể tham khảo vùng gần/chính nếu hợp xu hướng và có xác nhận. Với SCALP, không dùng vùng thanh khoản dưới làm Entry LONG hoặc vùng thanh khoản trên làm Entry SHORT theo kiểu chạm-là-fill. Nếu cần thêm xác nhận, có thể ghi lệnh chờ kèm điều kiện rõ; chỉ chọn NO TRADE khi SL/TP, động lượng hoặc vùng vào không đạt.",
         "- TP không bị ép bám sát mép box thanh khoản ước lượng. Nếu box đối diện quá gần làm RR xấu, hãy dùng swing high/low kế tiếp, Fibonacci hoặc vùng cấu trúc kế tiếp làm TP; Python cũng sẽ thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp trước khi reject. Nếu vẫn không đủ RR thì chọn NO TRADE. Không tạo TP quá gần chỉ vì box thanh khoản rất hẹp.",
-        "- Quy tắc rủi ro: SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; nếu setup dựa vào cú quét đáy/đỉnh mới nhất thì wick extreme của cú quét đó là invalidation trực tiếp và SL phải nằm ngoài wick đó. Python sẽ tự chuẩn hóa SL theo cấu trúc này trước khi lưu. Sau đó Python thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp nếu TP quá sát. RR được tính theo mép Entry bất lợi nhất: TP1 nên >= 0.60R, TP2 nên >= 0.80R và không quá sát TP1; nếu sau khi thử target cấu trúc vẫn không đạt thì chọn NO TRADE.",
+        "- Quy tắc rủi ro: SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; nếu setup dựa vào cú quét đáy/đỉnh mới nhất thì wick extreme của cú quét đó là invalidation trực tiếp và SL phải nằm ngoài wick đó. Python sẽ tự chuẩn hóa SL theo cấu trúc này, rồi nới thêm phần trăm cấu hình để tránh SL quá sát trước khi lưu. Sau đó Python thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp nếu TP quá sát. RR được tính theo mép Entry bất lợi nhất: TP1 nên >= 0.60R, TP2 nên >= 0.80R và không quá sát TP1; nếu sau khi thử target cấu trúc vẫn không đạt thì chọn NO TRADE.",
         "- Ghi chú: Vùng quét là vùng thanh khoản kỹ thuật ước lượng theo cửa sổ thời gian, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật nội bộ, không phải lệnh giao dịch chốt sẵn. Không show trực tiếp các vùng thanh khoản/thanh lý/heatmap ra user; chỉ dùng chúng để lập quyết định, Entry/SL/TP, lý do và rủi ro.",
     ]
     return "\n".join(lines)
@@ -4191,7 +4233,7 @@ Yêu cầu:
 3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO TRADE theo xu hướng đa khung, vị trí giá, vùng quét ước lượng theo cửa sổ thời gian, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user, không in mục thanh khoản/heatmap/vùng thanh lý.
 4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và tỷ lệ lời/lỗ đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO TRADE. Không dùng NO TRADE chỉ vì giá chưa chạm Entry; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.
 5. Cách dùng vùng quét: Entry ưu tiên vùng gần/chính nếu hợp hướng setup và có xác nhận. Với SCALP, không được LONG chỉ vì giá chạm vùng thanh khoản dưới và không được SHORT chỉ vì giá chạm vùng thanh khoản trên; cần có lợi thế rõ như quét thanh khoản/rút râu/đóng nến xác nhận, hoặc một vùng chờ hợp lý với SL/TP đạt tỷ lệ. Nếu còn thiếu xác nhận, được phép đưa lệnh chờ với điều kiện kích hoạt rõ; chỉ chọn NO TRADE khi cả Entry, SL/TP hoặc động lượng đều không đủ.
-6. TP dùng vùng đối diện nhưng không được ép bám sát mép box hẹp: với LONG nhìn vùng thanh khoản trên/swing high/Fibonacci phía trên, với SHORT nhìn vùng thanh khoản dưới/swing low/Fibonacci phía dưới. Nếu TP1 quá gần Entry làm RR < 0.60R, hãy chọn target cấu trúc kế tiếp; nếu không có target hợp lý thì NO TRADE. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét. Với SCALP, rủi ro Entry–SL không được thấp hơn ngưỡng chống nhiễu.
+6. TP dùng vùng đối diện nhưng không được ép bám sát mép box hẹp: với LONG nhìn vùng thanh khoản trên/swing high/Fibonacci phía trên, với SHORT nhìn vùng thanh khoản dưới/swing low/Fibonacci phía dưới. Nếu TP1 quá gần Entry làm RR < 0.60R, hãy chọn target cấu trúc kế tiếp; nếu không có target hợp lý thì NO TRADE. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét; Python sẽ còn nới SL thêm theo biến cấu hình để ra SL cuối cùng cho user. Với SCALP, rủi ro Entry–SL không được thấp hơn ngưỡng chống nhiễu.
 7. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”.
 8. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
 9. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát; nếu phải đặt SL quá sát mới có tỷ lệ đẹp thì chọn NO TRADE. Không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
@@ -5030,7 +5072,7 @@ def log_hidden_rejection(symbol: str, mode: str, pred: dict, validation_errors: 
                 + f"rr1={fmt(rr.get('rr1'),2)} rr2={fmt(rr.get('rr2'),2)} "
                 + f"risk_ref={fmt(pred.get('_risk_reference'))} min_stop={fmt(pred.get('_min_stop_distance'))} "
                 + f"sl_src={pred.get('_structural_sl_source')} inv={fmt(pred.get('_structural_invalidation_level'))} "
-                + f"buf={fmt(pred.get('_structural_sl_buffer'))}",
+                + f"buf={fmt(pred.get('_structural_sl_buffer'))} extra_sl_pct={fmt((pred.get('_extra_sl_buffer_pct') or 0) * 100)}% before_extra_sl={fmt(pred.get('_sl_before_extra_buffer'))}",
                 flush=True,
             )
         except Exception:
