@@ -3016,8 +3016,8 @@ def _minimum_stop_distance(timeframe_data: dict[str, pd.DataFrame | None], mode:
     if mode == "short":
         atr_main = _current_atr(timeframe_data.get("15M")) or 0.0
         atr_confirm = _current_atr(timeframe_data.get("1H")) or 0.0
-        raw = max(atr_main * 0.85, atr_confirm * 0.25, current_price * 0.0010)
-        return min(raw, current_price * 0.0025)
+        raw = max(atr_main * 0.65, atr_confirm * 0.18, current_price * 0.0007)
+        return min(raw, current_price * 0.0020)
     atr_main = _current_atr(timeframe_data.get("4H")) or 0.0
     atr_confirm = _current_atr(timeframe_data.get("1D")) or 0.0
     raw = max(atr_main * 1.00, atr_confirm * 0.32, current_price * 0.0070)
@@ -3045,7 +3045,7 @@ def _structural_sl_buffer(timeframe_data: dict[str, pd.DataFrame | None], mode: 
     atr_main = _current_atr(timeframe_data.get(main_label)) or 0.0
     atr_structure = _current_atr(timeframe_data.get(structure_label)) or 0.0
     if mode == "short":
-        return max(atr_main * 0.60, atr_structure * 0.25, current_price * 0.0007)
+        return max(atr_main * 0.45, atr_structure * 0.18, current_price * 0.0005)
     return max(atr_main * 0.70, atr_structure * 0.28, current_price * 0.0040)
 
 
@@ -3354,16 +3354,16 @@ def _plan_worst_case_risk_reward(pred: dict) -> dict:
 
 
 
-MIN_TP1_R = 0.70
-MIN_TP2_R = 0.95
-TP2_MIN_SEPARATION_MULT = 1.03
+MIN_TP1_R = 0.60
+MIN_TP2_R = 0.80
+TP2_MIN_SEPARATION_MULT = 1.00
 
-# V24 balanced: nới các ngưỡng làm bot NO TRADE quá nhiều nhưng vẫn giữ guard cứng cho
-# hình học Entry/SL/TP, SL cấu trúc và RR tối thiểu. Lệnh yếu vẫn không tự lưu history
-# nếu user chưa bấm xác nhận trade.
-MIN_ACTION_CONFIDENCE_SCALP = 52.0
-MIN_REVERSAL_CONFIDENCE_SCALP = 55.0
-MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = 57.0
+# V25 loose: giảm thêm các ngưỡng gây NO TRADE quá nhiều. Vẫn giữ guard cứng cho
+# hình học Entry/SL/TP và SL cấu trúc, nhưng cho phép kế hoạch scalp có RR thấp hơn
+# một chút vì user phải bấm xác nhận trade thì bot mới lưu/theo dõi.
+MIN_ACTION_CONFIDENCE_SCALP = 50.0
+MIN_REVERSAL_CONFIDENCE_SCALP = 53.0
+MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = 55.0
 
 
 def _dedupe_price_candidates(candidates: list[dict], price_ref: float, risk: float) -> list[dict]:
@@ -3743,7 +3743,7 @@ def _timeframe_regime_details(label: str, df: pd.DataFrame | None) -> dict:
 
     if vol_ratio >= 1.50:
         volume_tag = "HIGH_VOLUME"
-    elif vol_ratio <= 0.70:
+    elif vol_ratio <= 0.55:
         volume_tag = "LOW_VOLUME"
     else:
         volume_tag = "NORMAL_VOLUME"
@@ -3883,7 +3883,7 @@ def build_feature_engineering_block(
         _format_liquidity_window_line("Vùng thanh khoản trên giá ước lượng", zones, "upper", price),
         "- Vai trò vùng quét: Entry có thể tham khảo vùng gần/chính nếu hợp xu hướng và có xác nhận. Với SCALP, không dùng vùng thanh khoản dưới làm Entry LONG hoặc vùng thanh khoản trên làm Entry SHORT theo kiểu chạm-là-fill. Nếu cần thêm xác nhận, có thể ghi lệnh chờ kèm điều kiện rõ; chỉ chọn NO TRADE khi SL/TP, động lượng hoặc vùng vào không đạt.",
         "- TP không bị ép bám sát mép box thanh khoản ước lượng. Nếu box đối diện quá gần làm RR xấu, hãy dùng swing high/low kế tiếp, Fibonacci hoặc vùng cấu trúc kế tiếp làm TP; Python cũng sẽ thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp trước khi reject. Nếu vẫn không đủ RR thì chọn NO TRADE. Không tạo TP quá gần chỉ vì box thanh khoản rất hẹp.",
-        "- Quy tắc rủi ro: SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; nếu setup dựa vào cú quét đáy/đỉnh mới nhất thì wick extreme của cú quét đó là invalidation trực tiếp và SL phải nằm ngoài wick đó. Python sẽ tự chuẩn hóa SL theo cấu trúc này trước khi lưu. Sau đó Python thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp nếu TP quá sát. RR được tính theo mép Entry bất lợi nhất: TP1 phải >= 0.70R, TP2 phải hợp lý >= 0.95R và không quá sát TP1; nếu sau khi thử target cấu trúc vẫn không đạt thì chọn NO TRADE.",
+        "- Quy tắc rủi ro: SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; nếu setup dựa vào cú quét đáy/đỉnh mới nhất thì wick extreme của cú quét đó là invalidation trực tiếp và SL phải nằm ngoài wick đó. Python sẽ tự chuẩn hóa SL theo cấu trúc này trước khi lưu. Sau đó Python thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp nếu TP quá sát. RR được tính theo mép Entry bất lợi nhất: TP1 nên >= 0.60R, TP2 nên >= 0.80R và không quá sát TP1; nếu sau khi thử target cấu trúc vẫn không đạt thì chọn NO TRADE.",
         "- Ghi chú: Vùng quét là vùng thanh khoản kỹ thuật ước lượng theo cửa sổ thời gian, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật nội bộ, không phải lệnh giao dịch chốt sẵn. Không show trực tiếp các vùng thanh khoản/thanh lý/heatmap ra user; chỉ dùng chúng để lập quyết định, Entry/SL/TP, lý do và rủi ro.",
     ]
     return "\n".join(lines)
@@ -4178,7 +4178,7 @@ Yêu cầu:
 3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO TRADE theo xu hướng đa khung, vị trí giá, vùng quét ước lượng theo cửa sổ thời gian, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user, không in mục thanh khoản/heatmap/vùng thanh lý.
 4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và tỷ lệ lời/lỗ đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO TRADE. Không dùng NO TRADE chỉ vì giá chưa chạm Entry; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.
 5. Cách dùng vùng quét: Entry ưu tiên vùng gần/chính nếu hợp hướng setup và có xác nhận. Với SCALP, không được LONG chỉ vì giá chạm vùng thanh khoản dưới và không được SHORT chỉ vì giá chạm vùng thanh khoản trên; cần có lợi thế rõ như quét thanh khoản/rút râu/đóng nến xác nhận, hoặc một vùng chờ hợp lý với SL/TP đạt tỷ lệ. Nếu còn thiếu xác nhận, được phép đưa lệnh chờ với điều kiện kích hoạt rõ; chỉ chọn NO TRADE khi cả Entry, SL/TP hoặc động lượng đều không đủ.
-6. TP dùng vùng đối diện nhưng không được ép bám sát mép box hẹp: với LONG nhìn vùng thanh khoản trên/swing high/Fibonacci phía trên, với SHORT nhìn vùng thanh khoản dưới/swing low/Fibonacci phía dưới. Nếu TP1 quá gần Entry làm RR < 0.70R, hãy chọn target cấu trúc kế tiếp; nếu không có target hợp lý thì NO TRADE. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét. Với SCALP, rủi ro Entry–SL không được thấp hơn ngưỡng chống nhiễu.
+6. TP dùng vùng đối diện nhưng không được ép bám sát mép box hẹp: với LONG nhìn vùng thanh khoản trên/swing high/Fibonacci phía trên, với SHORT nhìn vùng thanh khoản dưới/swing low/Fibonacci phía dưới. Nếu TP1 quá gần Entry làm RR < 0.60R, hãy chọn target cấu trúc kế tiếp; nếu không có target hợp lý thì NO TRADE. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét. Với SCALP, rủi ro Entry–SL không được thấp hơn ngưỡng chống nhiễu.
 7. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”.
 8. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
 9. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát; nếu phải đặt SL quá sát mới có tỷ lệ đẹp thì chọn NO TRADE. Không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
@@ -4709,7 +4709,7 @@ def _validate_scalp_reversal_quality(
     """Guard riêng cho setup SCALP đảo chiều.
 
     V23 tuning:
-    - Không reject LONG/SHORT chỉ vì confidence 55-57 nữa; user đã tự bấm xác nhận trade
+    - Không reject LONG/SHORT chỉ vì confidence 51-55 nữa; user đã tự bấm xác nhận trade
       trước khi bot lưu history, nên output được phép là kế hoạch tham khảo nếu SL/RR đạt.
     - Chỉ reject cứng khi confidence quá thấp, hoặc setup bắt đáy/bắt đỉnh còn bị 15M/1H
       chống lại rõ ràng và volume xác nhận yếu.
@@ -4742,9 +4742,9 @@ def _validate_scalp_reversal_quality(
     against_count = sum(bool(flags.get(k)) for k in ("m15_against", "h1_against", "m15_ema_against"))
     vol_values = [v for v in (flags.get("m15_vol"), flags.get("h1_vol")) if v is not None and np.isfinite(v)]
     max_vol = max(vol_values) if vol_values else None
-    weak_confirm_volume = max_vol is None or max_vol < 0.70
+    weak_confirm_volume = max_vol is None or max_vol < 0.55
 
-    # Reversal 55-56% không bị chặn chỉ vì % thấp; chỉ chặn khi nó còn đi kèm động lượng ngược rõ.
+    # Reversal 53-55% không bị chặn chỉ vì % thấp; chỉ chặn khi nó còn đi kèm động lượng ngược rõ.
     if (
         conf_val is not None
         and conf_val < MIN_REVERSAL_CONFIDENCE_SCALP
@@ -4752,7 +4752,7 @@ def _validate_scalp_reversal_quality(
         and weak_confirm_volume
     ):
         errors.append(
-            f"Setup SCALP đảo chiều chỉ {conf_val:.1f}% và còn ngược động lượng 15M/1H với volume xác nhận yếu; nên chờ thêm nến thay vì vào ngay."
+            f"Setup SCALP đảo chiều chỉ {conf_val:.1f}% và còn ngược động lượng 15M/1H với volume xác nhận rất yếu; nên chờ thêm nến thay vì vào ngay."
         )
 
     # Nếu confidence chưa đủ mạnh mà 15M/1H chống lại rất rõ thì vẫn chặn.
@@ -4869,7 +4869,7 @@ def _validate_actionable_trade_plan(
             errors.append(f"TP1 không đủ bù rủi ro sau khi thử target cấu trúc: RR1 khoảng {fmt(rr1, 2)}R < {fmt(MIN_TP1_R, 2)}R.")
         if rr2 < MIN_TP2_R:
             errors.append(f"TP2 không hợp lý sau khi thử target cấu trúc: RR2 khoảng {fmt(rr2, 2)}R < {fmt(MIN_TP2_R, 2)}R.")
-        if reward2 <= reward1 * TP2_MIN_SEPARATION_MULT:
+        if TP2_MIN_SEPARATION_MULT > 1.0 and reward2 <= reward1 * TP2_MIN_SEPARATION_MULT:
             errors.append("TP2 quá sát TP1 sau khi thử target cấu trúc, không đáng là mục tiêu mở rộng riêng.")
 
     # V23: Không còn reject mọi lệnh chờ scalp chỉ vì Entry thấp/cao hơn giá hiện tại.
@@ -4878,7 +4878,7 @@ def _validate_actionable_trade_plan(
     # Entry cực xa giá hiện tại và lời giải thích lại nói kiểu "vào ngay", vì đó là mâu thuẫn rõ.
     if mode == "short" and price is not None:
         dist_to_entry = _distance_price_to_entry({**pred, "entry_low": entry_low, "entry_high": entry_high}, price)
-        far_threshold = max(min_stop * 2.20, price * 0.0035)
+        far_threshold = max(min_stop * 3.00, price * 0.0050)
         text = (output or "").lower()
         claims_immediate = any(k in text for k in ("vào ngay", "có thể vào ngay", "giá hiện tại đang nằm", "đang nằm trong vùng entry"))
         if dist_to_entry is not None and dist_to_entry > far_threshold and claims_immediate:
