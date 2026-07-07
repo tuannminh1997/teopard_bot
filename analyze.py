@@ -3016,12 +3016,13 @@ def _minimum_stop_distance(timeframe_data: dict[str, pd.DataFrame | None], mode:
     if mode == "short":
         atr_main = _current_atr(timeframe_data.get("15M")) or 0.0
         atr_confirm = _current_atr(timeframe_data.get("1H")) or 0.0
-        raw = max(atr_main * 0.65, atr_confirm * 0.18, current_price * 0.0007)
-        return min(raw, current_price * 0.0020)
+        # V26: chỉ còn là ngưỡng chống SL vô lý siêu sát, không phải bộ lọc RR gắt.
+        raw = max(atr_main * 0.35, atr_confirm * 0.10, current_price * 0.0003)
+        return min(raw, current_price * 0.0012)
     atr_main = _current_atr(timeframe_data.get("4H")) or 0.0
     atr_confirm = _current_atr(timeframe_data.get("1D")) or 0.0
-    raw = max(atr_main * 1.00, atr_confirm * 0.32, current_price * 0.0070)
-    return min(raw, current_price * 0.0180)
+    raw = max(atr_main * 0.70, atr_confirm * 0.22, current_price * 0.0045)
+    return min(raw, current_price * 0.0120)
 
 
 
@@ -3045,8 +3046,8 @@ def _structural_sl_buffer(timeframe_data: dict[str, pd.DataFrame | None], mode: 
     atr_main = _current_atr(timeframe_data.get(main_label)) or 0.0
     atr_structure = _current_atr(timeframe_data.get(structure_label)) or 0.0
     if mode == "short":
-        return max(atr_main * 0.45, atr_structure * 0.18, current_price * 0.0005)
-    return max(atr_main * 0.70, atr_structure * 0.28, current_price * 0.0040)
+        return max(atr_main * 0.30, atr_structure * 0.10, current_price * 0.00025)
+    return max(atr_main * 0.55, atr_structure * 0.20, current_price * 0.0030)
 
 
 def _collect_structural_levels(
@@ -3354,16 +3355,28 @@ def _plan_worst_case_risk_reward(pred: dict) -> dict:
 
 
 
-MIN_TP1_R = 0.60
-MIN_TP2_R = 0.80
-TP2_MIN_SEPARATION_MULT = 1.00
+# V26 trade-leaning defaults: các ngưỡng được hạ thêm và có thể override bằng biến Railway.
+# Vì từ V19 trở đi chỉ khi user bấm “Tôi đã trade theo lệnh này” bot mới lưu/theo dõi,
+# Python guard không nên biến quá nhiều plan LONG/SHORT thành NO TRADE.
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
-# V25 loose: giảm thêm các ngưỡng gây NO TRADE quá nhiều. Vẫn giữ guard cứng cho
-# hình học Entry/SL/TP và SL cấu trúc, nhưng cho phép kế hoạch scalp có RR thấp hơn
-# một chút vì user phải bấm xác nhận trade thì bot mới lưu/theo dõi.
-MIN_ACTION_CONFIDENCE_SCALP = 50.0
-MIN_REVERSAL_CONFIDENCE_SCALP = 53.0
-MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = 55.0
+def _guard_profile() -> str:
+    return (os.getenv("TEOPARD_GUARD_PROFILE") or "loose").strip().lower()
+
+def _guard_is_off() -> bool:
+    return _guard_profile() in ("off", "trust", "model", "model_only")
+
+MIN_TP1_R = _env_float("TEOPARD_MIN_TP1_R", 0.50)
+MIN_TP2_R = _env_float("TEOPARD_MIN_TP2_R", 0.60)
+TP2_MIN_SEPARATION_MULT = _env_float("TEOPARD_TP2_SEPARATION_MULT", 1.00)
+
+MIN_ACTION_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", 48.0)
+MIN_REVERSAL_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_REVERSAL_CONFIDENCE", 50.0)
+MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = _env_float("TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE", 52.0)
 
 
 def _dedupe_price_candidates(candidates: list[dict], price_ref: float, risk: float) -> list[dict]:
@@ -4716,6 +4729,8 @@ def _validate_scalp_reversal_quality(
     - Guard SL cấu trúc và RR vẫn nằm ở _validate_actionable_trade_plan, không nới bừa.
     """
     errors: list[str] = []
+    if _guard_is_off():
+        return errors
     direction = (pred.get("direction") or "").upper()
     if direction not in ("LONG", "SHORT"):
         return errors
@@ -4742,44 +4757,27 @@ def _validate_scalp_reversal_quality(
     against_count = sum(bool(flags.get(k)) for k in ("m15_against", "h1_against", "m15_ema_against"))
     vol_values = [v for v in (flags.get("m15_vol"), flags.get("h1_vol")) if v is not None and np.isfinite(v)]
     max_vol = max(vol_values) if vol_values else None
-    weak_confirm_volume = max_vol is None or max_vol < 0.55
+    weak_confirm_volume = max_vol is None or max_vol < _env_float("TEOPARD_WEAK_CONFIRM_VOLUME", 0.45)
 
-    # Reversal 53-55% không bị chặn chỉ vì % thấp; chỉ chặn khi nó còn đi kèm động lượng ngược rõ.
+    # V26: đảo chiều scalp không bị chặn chỉ vì volume/MACD chưa đẹp.
+    # Chỉ chặn khi confidence rất thấp và dữ liệu 15M/1H chống lại cực rõ.
     if (
         conf_val is not None
         and conf_val < MIN_REVERSAL_CONFIDENCE_SCALP
-        and against_count >= 2
+        and against_count >= 3
         and weak_confirm_volume
     ):
         errors.append(
-            f"Setup SCALP đảo chiều chỉ {conf_val:.1f}% và còn ngược động lượng 15M/1H với volume xác nhận rất yếu; nên chờ thêm nến thay vì vào ngay."
+            f"Setup SCALP đảo chiều chỉ {conf_val:.1f}% và còn bị 15M/1H chống lại rõ với volume xác nhận rất yếu."
         )
 
-    # Nếu confidence chưa đủ mạnh mà 15M/1H chống lại rất rõ thì vẫn chặn.
     if (
         conf_val is not None
         and conf_val < MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM
-        and against_count >= 3
+        and against_count >= 4
     ):
         errors.append(
-            "Setup đảo chiều còn bị 15M/1H chống lại quá rõ; cần chờ đóng nến xác nhận/lấy lại vùng trước khi lưu lệnh."
-        )
-
-    # Nếu model tự ghi nhiều cảnh báo ngược chiều, chỉ dùng như blocker khi confidence dưới hard reversal floor
-    # và có ít nhất một dấu hiệu volume/động lượng ngược từ dữ liệu thật.
-    text = (output or "").lower()
-    warning_markers = 0
-    for key in ("volume", "khối lượng", "macd", "động lượng", "chưa hoàn toàn", "vẫn nghiêng giảm", "vẫn nghiêng tăng", "lực mua không duy trì", "lực bán không duy trì"):
-        if key in text:
-            warning_markers += 1
-    if (
-        conf_val is not None
-        and conf_val < MIN_REVERSAL_CONFIDENCE_SCALP
-        and warning_markers >= 3
-        and (against_count >= 2 or weak_confirm_volume)
-    ):
-        errors.append(
-            "Phần rủi ro của model còn nêu nhiều cảnh báo ngược chiều, nên không cho phép vào lệnh đảo chiều ngay."
+            "Setup đảo chiều bị cả MACD và EMA 15M/1H chống lại quá rõ."
         )
 
     return errors
@@ -4857,12 +4855,15 @@ def _validate_actionable_trade_plan(
     min_risk = min_stop
     if risk <= 0:
         errors.append("Risk Entry-SL không hợp lệ.")
-    elif risk < min_risk:
+    elif not _guard_is_off() and risk < min_risk:
         errors.append(
             f"SL cấu trúc vẫn quá sát Entry: risk bất lợi {fmt(risk)} USDT < ngưỡng chống nhiễu {fmt(min_risk)} USDT."
         )
 
-    if risk > 0:
+    # V26: RR chỉ là guard mềm. Ở profile loose mặc định, ngưỡng thấp hơn nhiều để không biến
+    # các plan có cấu trúc hợp lệ thành NO TRADE liên tục. Nếu muốn gần như tin model hoàn toàn,
+    # set TEOPARD_GUARD_PROFILE=off trên Railway.
+    if risk > 0 and not _guard_is_off():
         rr1 = reward1 / risk
         rr2 = reward2 / risk
         if rr1 < MIN_TP1_R:
