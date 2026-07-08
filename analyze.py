@@ -5,7 +5,10 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-import anthropic
+try:
+    import anthropic
+except Exception:
+    anthropic = None
 import numpy as np
 import pandas as pd
 import requests
@@ -16,12 +19,9 @@ load_dotenv()
 BINANCE_API_URL   = "https://api.binance.com/api/v3/klines"
 
 # ─── AI provider config ───────────────────────────────────────────────────────
-# Default vẫn là Anthropic/Claude để không làm vỡ config cũ.
-# Provider hỗ trợ:
-#   AI_PROVIDER=anthropic   -> Claude native
-#   AI_PROVIDER=openrouter  -> OpenRouter, ví dụ z-ai/glm-5.2 hoặc deepseek/deepseek-v4-pro
-#   AI_PROVIDER=zai         -> Z.AI native/chính chủ, ví dụ glm-5.2
-AI_PROVIDER = os.getenv("AI_PROVIDER", "anthropic").strip().lower()
+# V33: chốt dùng GLM/Z.AI native làm provider chính.
+# OpenRouter/Claude code vẫn còn để không làm vỡ import cũ, nhưng Railway không cần set các biến đó nữa.
+AI_PROVIDER = os.getenv("AI_PROVIDER", "zai").strip().lower()
 
 OPENROUTER_PROVIDER_NAMES = {"openrouter", "or", "glm_openrouter", "openrouter_glm"}
 ZAI_PROVIDER_NAMES = {"zai", "z.ai", "z_ai", "zai_native", "zai-official", "zai_official", "glm_native"}
@@ -58,15 +58,15 @@ OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Teopard Bot")
 
 # Z.AI native/chính chủ. Không cần thêm SDK, vẫn gọi HTTP OpenAI-compatible bằng requests.
-ZAI_API_KEY  = os.getenv("ZAI_API_KEY") or os.getenv("Z_AI_API_KEY")
-ZAI_MODEL    = os.getenv("ZAI_MODEL", os.getenv("GLM_MODEL", "glm-5.2"))
+ZAI_API_KEY  = os.getenv("ZAI_API_KEY")
+ZAI_MODEL    = os.getenv("ZAI_MODEL", "glm-5.2")
 ZAI_BASE_URL = os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4").rstrip("/")
 # Vì bạn muốn giảm lag, native Z.AI mặc định dùng high thay vì max. Có thể đổi max/xhigh trên Railway nếu muốn.
-ZAI_REASONING_EFFORT = os.getenv("ZAI_REASONING_EFFORT", os.getenv("GLM_REASONING_EFFORT", "high")).strip()
+ZAI_REASONING_EFFORT = os.getenv("ZAI_REASONING_EFFORT", "high").strip()
 ZAI_SUMMARY_REASONING_EFFORT = os.getenv("ZAI_SUMMARY_REASONING_EFFORT", "none").strip()
 ZAI_APP_NAME = os.getenv("ZAI_APP_NAME", "Teopard Bot")
 
-LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", os.getenv("CLAUDE_MAX_TOKENS", "8000")))
+LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "8000"))
 LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "2"))
 # Call tóm tắt reasoning dùng token riêng và KHÔNG continuation để tránh model đốt token reasoning ẩn.
 LLM_SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_SUMMARY_MAX_OUTPUT_TOKENS", "600"))
@@ -77,22 +77,21 @@ CLAUDE_MAX_TOKENS = LLM_MAX_OUTPUT_TOKENS
 
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
-# Ngắn hạn: scalp trong ngày — 15m timing, 1H momentum, 4H xu hướng chính
+# V33 timeframe roles:
+# SCALP: 15M chỉ là trigger/timing; 1H là khung setup chính; 4H là trend filter; 1D là macro context.
 SHORT_TERM_TIMEFRAMES = {
-    # V13: tăng history để vùng stop/liquidity ước lượng không chỉ bám vài swing quá gần.
-    # Prompt vẫn chỉ đưa phần candle gần nhất nên không làm model tốn token quá nhiều.
-    "15M": ("15m", 480),   # ~5 ngày, timing + ATR ngắn hạn
-    "1H":  ("1h",  360),   # ~15 ngày, liquidity gần + momentum
-    "4H":  ("4h",  360),   # ~60 ngày, liquidity chính/sâu cho SCALP
+    "15M": ("15m", 480),   # ~5 ngày, trigger/timing, sweep/wick; không dùng làm bias chính
+    "1H":  ("1h",  360),   # ~15 ngày, setup/momentum chính cho SCALP
+    "4H":  ("4h",  360),   # ~60 ngày, trend filter + target/liquidity chính
+    "1D":  ("1d",  365),   # ~1 năm, bối cảnh lớn; tránh scalp ngược macro quá rõ
 }
 
-# Dài hạn: swing/position — 1H kiểm tra sweep, 4H entry, 1D xu hướng, 1W big picture
-# 1H chỉ dùng làm dữ liệu xác nhận rút râu/quét thanh khoản; khung lập lệnh SWING vẫn là 4H/1D/1W.
+# SWING: 1H chỉ timing phụ; 4H setup; 1D decision/trend chính; 1W macro context.
 LONG_TERM_TIMEFRAMES = {
-    "1H": ("1h",  480),   # sweep/confirmation cho SWING
-    "4H": ("4h",  360),   # entry + liquidity gần
-    "1D": ("1d",  365),   # liquidity chính ~1 năm
-    "1W": ("1w",  208),   # big picture/liquidity sâu ~4 năm
+    "1H": ("1h",  480),   # entry trigger / pullback timing phụ cho SWING
+    "4H": ("4h",  360),   # setup + invalidation gần
+    "1D": ("1d",  365),   # trend/decision chính cho SWING
+    "1W": ("1w",  208),   # macro context/liquidity sâu
 }
 
 # V4 lifecycle
@@ -1564,7 +1563,8 @@ def _last_close_from_data(timeframe_data: dict[str, pd.DataFrame | None]) -> flo
 def _current_atr(df: pd.DataFrame | None) -> float | None:
     if df is None or df.empty or "atr_14" not in df.columns:
         return None
-    return _safe_float(df.iloc[-1].get("atr_14"))
+    row = _analysis_row(df) if "_analysis_row" in globals() else (df.iloc[-2] if len(df) >= 2 else df.iloc[-1])
+    return _safe_float(row.get("atr_14"))
 
 
 def _window_tail(df: pd.DataFrame | None, hours: int | None = None, max_candles: int | None = None) -> pd.DataFrame | None:
@@ -2773,10 +2773,10 @@ def _liquidity_zones_by_windows(
     SWING: H4 cho vùng gần, D1 cho vùng chính, W1/D1 cho vùng sâu, 1H/4H chỉ kiểm tra sweep.
     """
     if mode == "short":
-        sweep_df = timeframe_data.get("15M")
-        near_df = _first_valid_df(timeframe_data.get("1H"), timeframe_data.get("15M"))
-        main_df = _first_valid_df(timeframe_data.get("4H"), timeframe_data.get("1H"))
-        deep_df = _first_valid_df(timeframe_data.get("4H"), timeframe_data.get("1H"))
+        sweep_df = _closed_candles(timeframe_data.get("15M"))
+        near_df = _first_valid_df(_closed_candles(timeframe_data.get("1H")), _closed_candles(timeframe_data.get("15M")))
+        main_df = _first_valid_df(_closed_candles(timeframe_data.get("4H")), _closed_candles(timeframe_data.get("1H")))
+        deep_df = _first_valid_df(_closed_candles(timeframe_data.get("4H")), _closed_candles(timeframe_data.get("1H")))
         windows = [
             # V13: lookback dài hơn để tránh vùng thanh khoản chỉ xoay quanh vài nến sát giá.
             # near vẫn dùng 1H nhưng lấy ~7 ngày; main/deep dùng H4 ~30-50 ngày.
@@ -2786,12 +2786,12 @@ def _liquidity_zones_by_windows(
         ]
         calc_mode = "short"
     else:
-        # SWING: level lấy từ H4/D1/W1, sweep lấy từ 1H trước rồi fallback 4H.
+        # SWING: level lấy từ H4/D1/W1 đã đóng; sweep lấy từ 1H/4H đã đóng để không nhiễu nến live.
         # Không dùng 1H để tạo liquidity box vì sẽ khiến vùng swing bị nhiễu như scalp.
-        sweep_df = _first_valid_df(timeframe_data.get("1H"), timeframe_data.get("4H"))
-        near_df = timeframe_data.get("4H")
-        main_df = _first_valid_df(timeframe_data.get("1D"), timeframe_data.get("4H"))
-        deep_df = _first_valid_df(timeframe_data.get("1W"), timeframe_data.get("1D"), timeframe_data.get("4H"))
+        sweep_df = _first_valid_df(_closed_candles(timeframe_data.get("1H")), _closed_candles(timeframe_data.get("4H")))
+        near_df = _closed_candles(timeframe_data.get("4H"))
+        main_df = _first_valid_df(_closed_candles(timeframe_data.get("1D")), _closed_candles(timeframe_data.get("4H")))
+        deep_df = _first_valid_df(_closed_candles(timeframe_data.get("1W")), _closed_candles(timeframe_data.get("1D")), _closed_candles(timeframe_data.get("4H")))
         windows = [
             # V13: SWING cần vùng rộng lịch sử hơn: H4 ~40 ngày, D1 ~6-9 tháng, W1 vài năm.
             ("near", "gần H4", near_df, _current_atr(near_df) or _current_atr(sweep_df), 240, 2),
@@ -2913,6 +2913,7 @@ def _format_liquidity_window_line(prefix: str, zones: dict, side: str, current_p
     )
 
 def _structure_info(df: pd.DataFrame | None, current_price: float | None) -> dict:
+    df = _closed_candles(df)
     if df is None or df.empty:
         return {}
     data_recent = df.tail(60)
@@ -2957,11 +2958,12 @@ def _structure_info(df: pd.DataFrame | None, current_price: float | None) -> dic
 
 
 def _consecutive_candles(df: pd.DataFrame | None) -> str:
-    if df is None or len(df) < 2:
+    data = _closed_candles(df) if "_closed_candles" in globals() else df
+    if data is None or len(data) < 2:
         return "Không đủ dữ liệu"
     count = 0
     last_dir = None
-    for _, row in df.tail(12).iloc[::-1].iterrows():
+    for _, row in data.tail(12).iloc[::-1].iterrows():
         direction = "xanh" if float(row["close"]) > float(row["open"]) else "đỏ" if float(row["close"]) < float(row["open"]) else "doji"
         if last_dir is None:
             last_dir = direction
@@ -2974,21 +2976,41 @@ def _consecutive_candles(df: pd.DataFrame | None) -> str:
 
 
 def _wick_body_info(df: pd.DataFrame | None) -> str:
-    if df is None or df.empty:
+    data = _closed_candles(df) if "_closed_candles" in globals() else df
+    if data is None or data.empty:
         return "Không đủ dữ liệu"
-    row = df.iloc[-1]
+    row = data.iloc[-1]
     high, low, open_, close = map(float, [row["high"], row["low"], row["open"], row["close"]])
     rng = max(high - low, 1e-12)
     body = abs(close - open_)
     upper = high - max(open_, close)
     lower = min(open_, close) - low
-    return f"thân nến {body / rng * 100:.0f}%, râu trên {upper / rng * 100:.0f}%, râu dưới {lower / rng * 100:.0f}%"
+    return f"nến đã đóng: thân {body / rng * 100:.0f}%, râu trên {upper / rng * 100:.0f}%, râu dưới {lower / rng * 100:.0f}%"
 
 
 def _mode_labels(mode: str) -> tuple[str, str, str]:
+    # main/structure/big là các khung dùng để quyết định, không nhất thiết là khung trigger nhỏ nhất.
+    # SCALP: 1H quyết định setup, 4H xác nhận xu hướng, 1D bối cảnh lớn. 15M chỉ timing.
     if mode == "short":
-        return "15M", "1H", "4H"
+        return "1H", "4H", "1D"
+    # SWING: 4H setup/entry zone, 1D quyết định xu hướng chính, 1W macro. 1H chỉ timing phụ.
     return "4H", "1D", "1W"
+
+
+def _mode_trigger_label(mode: str) -> str:
+    return "15M" if mode == "short" else "1H"
+
+
+def _mode_role_text(mode: str) -> str:
+    if mode == "short":
+        return (
+            "SCALP roles: 1H là khung setup/chính; 4H là xu hướng xác nhận; "
+            "1D là bối cảnh lớn; 15M chỉ dùng để timing entry, đọc sweep/râu nến và không được đảo bias một mình."
+        )
+    return (
+        "SWING roles: 1D là xu hướng/chính; 4H là setup/vùng vào; "
+        "1W là bối cảnh lớn; 1H chỉ timing entry phụ và không được đảo bias swing một mình."
+    )
 
 
 def _risk_floor(timeframe_data: dict[str, pd.DataFrame | None], mode: str, current_price: float) -> float:
@@ -3043,6 +3065,8 @@ def _structural_sl_buffer(timeframe_data: dict[str, pd.DataFrame | None], mode: 
     gần nhất một khoảng đủ tránh nhiễu nến. Nếu sau đó RR không đạt, plan sẽ bị NO TRADE.
     """
     main_label, structure_label, _ = _mode_labels(mode)
+    trigger_label = _mode_trigger_label(mode)
+    atr_trigger = _current_atr(timeframe_data.get(trigger_label)) or 0.0
     atr_main = _current_atr(timeframe_data.get(main_label)) or 0.0
     atr_structure = _current_atr(timeframe_data.get(structure_label)) or 0.0
     if mode == "short":
@@ -3062,11 +3086,11 @@ def _extra_user_sl_buffer_pct() -> float:
     """
     raw = os.getenv("TEOPARD_EXTRA_SL_BUFFER_PCT")
     if raw is None or str(raw).strip() == "":
-        raw = os.getenv("TEOPARD_SL_EXTRA_BUFFER_PCT", "2")
+        raw = os.getenv("TEOPARD_SL_EXTRA_BUFFER_PCT", "0")
     try:
         pct = float(str(raw).strip()) / 100.0
     except Exception:
-        pct = 0.02
+        pct = 0.0
     if not np.isfinite(pct) or pct < 0:
         return 0.0
     return min(pct, 0.10)
@@ -3081,6 +3105,119 @@ def _apply_extra_sl_buffer(sl: float, direction: str) -> float:
     if direction == "SHORT":
         return float(sl) * (1.0 + pct)
     return float(sl)
+
+
+def _apply_extra_sl_buffer_to_plan(pred: dict, output: str | None = None) -> tuple[dict, str | None]:
+    """Áp buffer SL theo phong cách user SAU khi model/Python đã có plan gốc.
+
+    Mặc định V32: model tự chọn SL. Python chỉ cộng/trừ phần trăm nếu user set
+    TEOPARD_EXTRA_SL_BUFFER_PCT. RR guard mặc định dùng SL gốc trước buffer,
+    nên style buffer không làm plan bị NO TRADE.
+    """
+    direction = (pred.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT") or pred.get("sl") is None:
+        return pred, output
+    pct = _extra_user_sl_buffer_pct()
+    if pct <= 0:
+        return pred, output
+    normalized = dict(pred)
+    old_sl = float(normalized["sl"])
+    new_sl = _apply_extra_sl_buffer(old_sl, direction)
+    normalized["_sl_before_extra_buffer"] = old_sl
+    normalized["_extra_sl_buffer_pct"] = pct
+    normalized["sl"] = new_sl
+    if abs(new_sl - old_sl) > max(abs(old_sl) * 1e-7, 1e-8):
+        output = _update_output_trade_numbers(output or "", normalized)
+    return normalized, output
+
+
+def _extra_user_tp_buffer_pct(tp_name: str) -> float:
+    """Phần trăm nới TP thêm theo phong cách user.
+
+    Biến Railway nhập theo đơn vị phần trăm:
+      TEOPARD_EXTRA_TP1_BUFFER_PCT=1.2
+      TEOPARD_EXTRA_TP2_BUFFER_PCT=1.2
+
+    Có thể set chung TEOPARD_EXTRA_TP_BUFFER_PCT nếu muốn TP1/TP2 dùng cùng một %.
+    LONG: TP cuối = TP * (1 + pct)
+    SHORT: TP cuối = TP * (1 - pct)
+    """
+    name = (tp_name or "").strip().upper()
+    raw = os.getenv(f"TEOPARD_EXTRA_{name}_BUFFER_PCT")
+    if raw is None or str(raw).strip() == "":
+        raw = os.getenv(f"TEOPARD_{name}_EXTRA_BUFFER_PCT")
+    if raw is None or str(raw).strip() == "":
+        raw = os.getenv("TEOPARD_EXTRA_TP_BUFFER_PCT", "0")
+    try:
+        pct = float(str(raw).strip()) / 100.0
+    except Exception:
+        pct = 0.0
+    if not np.isfinite(pct) or pct < 0:
+        return 0.0
+    return min(pct, 0.20)
+
+
+def _apply_extra_tp_buffer(tp: float, direction: str, tp_name: str) -> float:
+    pct = _extra_user_tp_buffer_pct(tp_name)
+    if pct <= 0:
+        return float(tp)
+    if direction == "LONG":
+        return float(tp) * (1.0 + pct)
+    if direction == "SHORT":
+        return float(tp) * (1.0 - pct)
+    return float(tp)
+
+
+def _rr_guard_uses_extra_tp_buffer() -> bool:
+    """Mặc định False trong V31: TP buffer là style user sau phân tích model.
+
+    Nếu muốn RR guard dùng TP đã nới theo %, set:
+      TEOPARD_RR_USE_EXTRA_TP_BUFFER=1
+    """
+    raw = (os.getenv("TEOPARD_RR_USE_EXTRA_TP_BUFFER") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "y", "on")
+
+
+def _tp_for_rr_guard(pred: dict, key: str) -> float:
+    if not _rr_guard_uses_extra_tp_buffer():
+        before_key = f"_{key}_before_extra_buffer"
+        if pred.get(before_key) is not None:
+            try:
+                return float(pred[before_key])
+            except Exception:
+                pass
+    return float(pred[key])
+
+
+def _apply_extra_tp_buffers_to_plan(pred: dict, output: str | None = None) -> tuple[dict, str | None]:
+    """Nới TP1/TP2 sau khi đã chuẩn hóa target cấu trúc.
+
+    Đây là lớp chỉnh style xuất lệnh/tracking giống TEOPARD_EXTRA_SL_BUFFER_PCT.
+    """
+    direction = (pred.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT"):
+        return pred, output
+    if pred.get("tp1") is None and pred.get("tp2") is None:
+        return pred, output
+
+    normalized = dict(pred)
+    changed = False
+    for key in ("tp1", "tp2"):
+        if normalized.get(key) is None:
+            continue
+        pct = _extra_user_tp_buffer_pct(key.upper())
+        if pct <= 0:
+            continue
+        old_tp = float(normalized[key])
+        new_tp = _apply_extra_tp_buffer(old_tp, direction, key.upper())
+        normalized[f"_{key}_before_extra_buffer"] = old_tp
+        normalized[f"_extra_{key}_buffer_pct"] = pct
+        normalized[key] = new_tp
+        changed = changed or abs(new_tp - old_tp) > max(abs(old_tp) * 1e-7, 1e-8)
+
+    if changed:
+        output = _update_output_trade_numbers(output or "", normalized)
+    return normalized, output
 
 
 def _collect_structural_levels(
@@ -3369,12 +3506,19 @@ def _sl_for_rr_guard(pred: dict) -> float:
     return float(pred["sl"])
 
 
-def _plan_worst_case_risk_reward(pred: dict, *, use_rr_guard_sl: bool = False) -> dict:
+def _plan_worst_case_risk_reward(
+    pred: dict,
+    *,
+    use_rr_guard_sl: bool = False,
+    use_rr_guard_tp: bool = False,
+) -> dict:
     """RR bảo thủ theo mép Entry bất lợi nhất.
 
     LONG: giả sử fill ở mép cao của Entry. SHORT: giả sử fill ở mép thấp của Entry.
     Nếu use_rr_guard_sl=True, RR dùng SL cấu trúc gốc trước lớp đệm % thêm, trừ khi
-    TEOPARD_RR_USE_EXTRA_SL_BUFFER=1. SL xuất ra user/tracking vẫn là SL cuối cùng.
+    TEOPARD_RR_USE_EXTRA_SL_BUFFER=1.
+    Nếu use_rr_guard_tp=True, RR dùng TP cuối đã nới %, trừ khi
+    TEOPARD_RR_USE_EXTRA_TP_BUFFER=0.
     """
     direction = (pred.get("direction") or "").upper()
     try:
@@ -3383,8 +3527,12 @@ def _plan_worst_case_risk_reward(pred: dict, *, use_rr_guard_sl: bool = False) -
         if entry_low > entry_high:
             entry_low, entry_high = entry_high, entry_low
         sl = _sl_for_rr_guard(pred) if use_rr_guard_sl else float(pred["sl"])
-        tp1 = float(pred["tp1"])
-        tp2 = float(pred["tp2"])
+        if use_rr_guard_tp:
+            tp1 = _tp_for_rr_guard(pred, "tp1")
+            tp2 = _tp_for_rr_guard(pred, "tp2")
+        else:
+            tp1 = float(pred["tp1"])
+            tp2 = float(pred["tp2"])
     except Exception:
         return {}
 
@@ -3424,6 +3572,28 @@ def _guard_profile() -> str:
 
 def _guard_is_off() -> bool:
     return _guard_profile() in ("off", "trust", "model", "model_only")
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _python_adjusts_model_sl() -> bool:
+    """Mặc định tắt: model là nguồn quyết định SL, Python chỉ validate và áp buffer user.
+
+    Bật TEOPARD_PYTHON_ADJUST_SL=1 nếu muốn quay lại kiểu Python ép SL theo
+    swing/invalidation.
+    """
+    return _env_bool("TEOPARD_PYTHON_ADJUST_SL", False)
+
+def _python_adjusts_model_tp() -> bool:
+    """Mặc định tắt: model là nguồn quyết định TP, Python chỉ validate và áp buffer user.
+
+    Bật TEOPARD_PYTHON_ADJUST_TP=1 nếu muốn Python tự nhảy TP sang target kế tiếp
+    khi model đặt TP quá sát.
+    """
+    return _env_bool("TEOPARD_PYTHON_ADJUST_TP", False)
 
 MIN_TP1_R = _env_float("TEOPARD_MIN_TP1_R", 0.40)
 MIN_TP2_R = _env_float("TEOPARD_MIN_TP2_R", 0.50)
@@ -3632,10 +3802,14 @@ def _normalize_trade_plan_structural_tps(
     return normalized, output
 
 def _update_output_trade_numbers(output: str, pred: dict) -> str:
-    """Đồng bộ SL/Rủi ro trong câu trả lời sau khi Python chuẩn hóa SL cấu trúc."""
+    """Đồng bộ SL/TP/Rủi ro trong câu trả lời sau khi Python chuẩn hóa plan."""
     text = output or ""
     if pred.get("sl") is not None:
         text = re.sub(r"(\bSL\s*:\s*)([0-9,\.]+)", lambda m: m.group(1) + fmt(float(pred["sl"])), text, count=1, flags=re.IGNORECASE)
+    if pred.get("tp1") is not None:
+        text = re.sub(r"(\bTP1\s*:\s*)([0-9,\.]+)", lambda m: m.group(1) + fmt(float(pred["tp1"])), text, count=1, flags=re.IGNORECASE)
+    if pred.get("tp2") is not None:
+        text = re.sub(r"(\bTP2\s*:\s*)([0-9,\.]+)", lambda m: m.group(1) + fmt(float(pred["tp2"])), text, count=1, flags=re.IGNORECASE)
     rr = _plan_worst_case_risk_reward(pred)
     if rr.get("risk") is not None:
         text = re.sub(
@@ -3696,15 +3870,9 @@ def _normalize_trade_plan_structural_sl(
             new_sl = inv_price + buffer
             inv = {**inv, "price": inv_price, "kind": "model_sweep_extreme", "label": "output"}
 
-    # V28: sau SL cấu trúc, luôn nới thêm % theo biến Railway để tránh SL quá sát.
-    # SHORT: SL cao hơn thêm %, LONG: SL thấp hơn thêm %. Phần nới thêm mặc định KHÔNG
-    # tham gia RR guard; user muốn đây là phong cách SL, không phải lý do để NO TRADE.
-    extra_pct = _extra_user_sl_buffer_pct()
-    if extra_pct > 0:
-        before_extra_sl = float(new_sl)
-        new_sl = _apply_extra_sl_buffer(before_extra_sl, direction)
-        normalized["_sl_before_extra_buffer"] = before_extra_sl
-        normalized["_extra_sl_buffer_pct"] = extra_pct
+    # V31: không áp style buffer trong hàm chuẩn hóa cấu trúc.
+    # Buffer theo sở thích user được áp riêng ở cuối flow để model/Python base-plan
+    # không bị trộn với lớp quản trị rủi ro cá nhân.
 
     normalized["_structural_invalidation_level"] = float(inv_price)
     normalized["_structural_sl_buffer"] = float(buffer)
@@ -3913,19 +4081,189 @@ def _format_candle_compact(row) -> str:
 
 
 def build_raw_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
-    """Gửi thêm nến thô có body/wick để Sonnet đọc hành vi giá, nhưng vẫn giữ gọn."""
-    main_label, structure_label, _ = _mode_labels(mode)
-    blocks = ["RAW_CANDLE_CONTEXT_CHON_LOC:"]
-    for label, n in [(main_label, 24), (structure_label, 12)]:
+    """Gửi nến thô đã đóng. Nến đang chạy được tách riêng để model không coi là xác nhận."""
+    main_label, structure_label, big_label = _mode_labels(mode)
+    trigger_label = _mode_trigger_label(mode)
+    if mode == "short":
+        ordered = [("15M", 24, "trigger/timing"), ("1H", 24, "setup chính"), ("4H", 12, "trend filter"), ("1D", 8, "macro context")]
+    else:
+        ordered = [("1H", 12, "trigger phụ"), ("4H", 24, "setup"), ("1D", 18, "decision chính"), ("1W", 12, "macro context")]
+
+    blocks = ["RAW_CANDLE_CONTEXT_CHON_LOC — CHỈ NẾN ĐÃ ĐÓNG:"]
+    blocks.append(f"- Vai trò khung: {_mode_role_text(mode)}")
+    for label, n, role in ordered:
         df = timeframe_data.get(label)
-        if df is None or df.empty:
-            blocks.append(f"- {label}: Không đủ dữ liệu nến thô.")
+        closed_df = _closed_candles(df)
+        if closed_df is None or closed_df.empty:
+            blocks.append(f"- {label} ({role}): Không đủ dữ liệu nến đã đóng.")
             continue
-        rows = ["  " + _format_candle_compact(row) for _, row in df.tail(n).iterrows()]
-        blocks.append(f"- {label}: {n} nến gần nhất, dùng để đọc phá giả/rút râu/đuối lực:")
+        rows = ["  " + _format_candle_compact(row) for _, row in closed_df.tail(n).iterrows()]
+        blocks.append(f"- {label} ({role}): {min(n, len(closed_df))} nến đã đóng gần nhất, dùng để đọc phá giả/rút râu/đuối lực:")
         blocks.extend(rows)
     return "\n".join(blocks)
 
+
+def build_live_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
+    """Tách nến đang chạy khỏi nến đã đóng để chỉ dùng tham khảo, không xác nhận."""
+    if mode == "short":
+        labels = ["15M", "1H"]
+    else:
+        labels = ["1H", "4H"]
+    blocks = ["LIVE_CANDLE_CONTEXT — NẾN ĐANG CHẠY, CHỈ THAM KHẢO:"]
+    blocks.append("- Không dùng nến đang chạy để xác nhận entry/đảo chiều. Chỉ dùng để biết giá hiện tại đang di chuyển ra sao so với nến đã đóng.")
+    for label in labels:
+        df = timeframe_data.get(label)
+        if df is None or df.empty or len(df) < 2:
+            blocks.append(f"- {label}: Không đủ dữ liệu nến đang chạy.")
+            continue
+        row = df.iloc[-1]
+        blocks.append(f"- {label} live: {_format_candle_compact(row)}")
+    return "\n".join(blocks)
+
+
+
+
+def _format_model_level_map(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    price: float,
+    zones: dict | None = None,
+    structure: dict | None = None,
+) -> str:
+    """Bản đồ mức giá cho model tự lập Entry/SL/TP.
+
+    Mục tiêu V32: Python không tự sửa TP/SL mặc định, nên prompt phải đưa đủ
+    candidate levels để model chọn TP/SL thực tế hơn. Các mức này KHÔNG được show
+    trực tiếp ra user; chỉ dùng nội bộ để model lập plan.
+    """
+    zones = zones or _liquidity_zones_by_windows(timeframe_data, mode, price)
+    main_label, structure_label, big_label = _mode_labels(mode)
+    main_structure = _structure_info(timeframe_data.get(main_label), price)
+    structure = structure or _structure_info(timeframe_data.get(structure_label), price)
+
+    above: list[tuple[float, str]] = []
+    below: list[tuple[float, str]] = []
+
+    def add(level: float | None, name: str) -> None:
+        try:
+            val = float(level)
+        except Exception:
+            return
+        if not np.isfinite(val) or val <= 0:
+            return
+        if val > price:
+            above.append((val, name))
+        elif val < price:
+            below.append((val, name))
+
+    # Cấu trúc/fib của khung setup/chính.
+    if main_label != structure_label:
+        add(main_structure.get("recent_high"), f"đỉnh gần {main_label}")
+        add(main_structure.get("recent_low"), f"đáy gần {main_label}")
+        add(main_structure.get("major_high"), f"biên cao {main_label}")
+        add(main_structure.get("major_low"), f"biên thấp {main_label}")
+        for k, v in (main_structure.get("fib") or {}).items():
+            add(v, f"Fib {main_label} {k}")
+
+    # Cấu trúc/fib của khung xác nhận.
+    add(structure.get("recent_high"), f"đỉnh gần {structure_label}")
+    add(structure.get("recent_low"), f"đáy gần {structure_label}")
+    add(structure.get("major_high"), f"biên cao {structure_label}")
+    add(structure.get("major_low"), f"biên thấp {structure_label}")
+    for k, v in (structure.get("fib") or {}).items():
+        add(v, f"Fib {structure_label} {k}")
+
+    # Cấu trúc khung lớn hơn để có target không quá sát.
+    big_structure = _structure_info(timeframe_data.get(big_label), price)
+    add(big_structure.get("recent_high"), f"đỉnh gần {big_label}")
+    add(big_structure.get("recent_low"), f"đáy gần {big_label}")
+    add(big_structure.get("major_high"), f"biên cao {big_label}")
+    add(big_structure.get("major_low"), f"biên thấp {big_label}")
+    for k, v in (big_structure.get("fib") or {}).items():
+        add(v, f"Fib {big_label} {k}")
+
+    # Liquidity box: đưa cả mép gần/mép xa để model biết nếu mép gần quá sát thì chọn mép xa/target kế tiếp.
+    for role in ("near", "main", "deep"):
+        z = zones.get(f"upper_{role}")
+        if z and z[0] is not None and z[1] is not None:
+            add(float(z[0]), f"liq trên {role} mép gần")
+            add(float(z[1]), f"liq trên {role} mép xa")
+        z = zones.get(f"lower_{role}")
+        if z and z[0] is not None and z[1] is not None:
+            add(float(z[1]), f"liq dưới {role} mép gần")
+            add(float(z[0]), f"liq dưới {role} mép xa")
+
+    def compact(items: list[tuple[float, str]], side: str) -> str:
+        if not items:
+            return f"{side}: N/A"
+        # Dedup mức gần nhau để prompt không loãng.
+        items = sorted(items, key=lambda x: abs(x[0] - price))
+        unique: list[tuple[float, str]] = []
+        tol = max(price * 0.0005, 1e-9)
+        for val, name in items:
+            if any(abs(val - old_val) <= tol for old_val, _ in unique):
+                continue
+            unique.append((val, name))
+            if len(unique) >= 12:
+                break
+
+        def item_text(v: float, name: str) -> str:
+            dist = abs(v - price)
+            pct = dist / max(price, 1e-12) * 100.0
+            return f"{fmt(v)} ({name}, cách {fmt(dist)} / {pct:.2f}%)"
+
+        return side + ": " + "; ".join(item_text(v, name) for v, name in unique)
+
+    return "\n".join([
+        "BẢN ĐỒ LEVEL CHO MODEL LẬP ENTRY/SL/TP — dùng nội bộ, không show user:",
+        compact(above, "- Mức phía trên giá hiện tại: ứng viên TP LONG / SL SHORT / Entry SHORT"),
+        compact(below, "- Mức phía dưới giá hiện tại: ứng viên TP SHORT / SL LONG / Entry LONG"),
+        f"- Nguyên tắc chọn target: không lấy level gần nhất làm TP nếu nó chỉ là nhiễu nhỏ quanh Entry. Hãy chọn target ở kháng cự/hỗ trợ/Fibonacci/đỉnh đáy/vùng quét kế tiếp có ý nghĩa; nếu target gần nhất quá sát, bỏ qua và chọn bậc kế tiếp hoặc đổi sang lệnh chờ để có Entry tốt hơn.",
+    ])
+
+
+def _format_model_plan_contract(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    price: float,
+) -> str:
+    """Hợp đồng lập lệnh cho model: Python không tự sửa TP/SL nên model phải tự tính đúng.
+
+    Block này không chốt lệnh thay model. Nó chỉ đưa ra quy trình và ngưỡng thực dụng
+    để model tự chọn Entry/SL/TP từ các level đã có, tránh TP/SL quá sát hoặc bịa số.
+    """
+    main_label, structure_label, _ = _mode_labels(mode)
+    trigger_label = _mode_trigger_label(mode)
+    atr_trigger = _current_atr(timeframe_data.get(trigger_label)) or 0.0
+    atr_main = _current_atr(timeframe_data.get(main_label)) or 0.0
+    atr_structure = _current_atr(timeframe_data.get(structure_label)) or 0.0
+    min_stop = _minimum_stop_distance(timeframe_data, mode, price)
+    sl_buf = _structural_sl_buffer(timeframe_data, mode, price)
+    risk_ref = _risk_floor(timeframe_data, mode, price)
+
+    if mode == "short":
+        # TP sát hơn mức này thường không đáng với phí/trượt giá/nhiễu scalp.
+        tp1_noise_floor = max(price * 0.0018, atr_main * 0.45, min_stop * 0.80)
+        tp2_noise_floor = max(price * 0.0035, atr_main * 0.90, min_stop * 1.25)
+        entry_width_hint = max(price * 0.0007, atr_main * 0.20)
+        label = "SCALP"
+    else:
+        tp1_noise_floor = max(price * 0.0060, atr_main * 0.60, min_stop * 0.85)
+        tp2_noise_floor = max(price * 0.0120, atr_main * 1.10, min_stop * 1.35)
+        entry_width_hint = max(price * 0.0020, atr_main * 0.25)
+        label = "SWING"
+
+    return "\n".join([
+        "HỢP ĐỒNG LẬP LỆNH CHO MODEL — dùng nội bộ, không show user:",
+        f"- Mode {label}: Python không tự cứu TP/SL mặc định. Nếu bạn xuất TP/SL quá sát hoặc sai cấu trúc, Python có thể đổi thành NO TRADE.",
+        f"- Vai trò timeframe: {_mode_role_text(mode)}",
+        f"- ATR tham chiếu: trigger {trigger_label}={fmt(atr_trigger)}, setup {main_label}={fmt(atr_main)}, structure {structure_label}={fmt(atr_structure)} | min_stop≈{fmt(min_stop)} | SL buffer cấu trúc≈{fmt(sl_buf)} | risk tham chiếu≈{fmt(risk_ref)}.",
+        f"- Độ rộng Entry gợi ý: khoảng {fmt(entry_width_hint)}–{fmt(entry_width_hint * 2.2)} USDT tùy biến động; không làm Entry quá rộng để che sai điểm vào.",
+        f"- TP1 không nên chỉ cách Entry vài tick. Trừ khi có cấu trúc cực rõ và SL rất ngắn, TP1 nên cách mép Entry bất lợi ít nhất khoảng max({fmt(tp1_noise_floor)} USDT, {fmt(MIN_TP1_R)}R) và phải trùng/tiệm cận một level thực tế.",
+        f"- TP2 nên là bậc cấu trúc kế tiếp, tối thiểu khoảng max({fmt(tp2_noise_floor)} USDT, {fmt(MIN_TP2_R)}R). TP2 không phải số trang trí; nếu không có bậc kế tiếp, chọn TP2 theo biên lớn/Fib kế tiếp hoặc NO TRADE.",
+        "- Quy trình bắt buộc: (1) chọn hướng; (2) chọn Entry; (3) chọn invalidation/SL ngoài đỉnh đáy hoặc râu quét; (4) tính risk theo mép Entry bất lợi; (5) chọn TP1/TP2 từ target ladder đủ xa và có lý do; (6) nếu RR xấu, ưu tiên đổi Entry thành lệnh chờ tốt hơn trước khi NO TRADE.",
+        "- Không bịa SL/TP chỉ để đủ tỷ lệ. Nếu target thực tế không đủ xa hoặc SL cấu trúc làm kèo không đáng, hãy chọn NO TRADE thay vì đặt TP sát.",
+    ])
 
 def build_feature_engineering_block(
     timeframe_data: dict[str, pd.DataFrame | None],
@@ -3933,14 +4271,17 @@ def build_feature_engineering_block(
     current_price: float | None,
 ) -> str:
     main_label, structure_label, big_label = _mode_labels(mode)
+    trigger_label = _mode_trigger_label(mode)
     price = current_price or _last_close_from_data(timeframe_data)
     if price is None:
         return "Dữ liệu kỹ thuật: Không đủ dữ liệu để tính cấu trúc, Fibonacci, ATR và vùng quét. Không được tự bịa các phần này."
 
     main_df = timeframe_data.get(main_label)
+    trigger_df = timeframe_data.get(trigger_label)
     structure_df = timeframe_data.get(structure_label)
     if structure_df is None or structure_df.empty:
         structure_df = main_df
+    atr_trigger = _current_atr(trigger_df)
     atr_main = _current_atr(main_df)
     atr_structure = _current_atr(structure_df)
     zones = _liquidity_zones_by_windows(timeframe_data, mode, price)
@@ -3949,19 +4290,26 @@ def build_feature_engineering_block(
 
     fib = structure.get("fib", {})
 
+    level_map = _format_model_level_map(timeframe_data, mode, price, zones, structure)
+    plan_contract = _format_model_plan_contract(timeframe_data, mode, price)
+
     lines = [
         "Dữ liệu kỹ thuật do Python tính sẵn:",
-        f"- Mode: {'SCALP' if mode == 'short' else 'SWING'} | Khung vào lệnh: {main_label} | Khung cấu trúc: {structure_label} | Khung lớn: {big_label}",
+        f"- Mode: {'SCALP' if mode == 'short' else 'SWING'} | Trigger: {trigger_label} | Khung setup/chính: {main_label} | Khung cấu trúc/xác nhận: {structure_label} | Khung lớn: {big_label}",
+        f"- Vai trò timeframe: {_mode_role_text(mode)}",
         build_market_regime_block(timeframe_data, mode),
-        f"- ATR14 {main_label}: {fmt(atr_main)} | ATR14 {structure_label}: {fmt(atr_structure)} | Rủi ro tham chiếu: {fmt(risk)} USDT",
-        f"- Chuỗi nến {main_label}: {_consecutive_candles(main_df)} | Nến cuối: {_wick_body_info(main_df)}",
+        level_map,
+        plan_contract,
+        f"- ATR14 {trigger_label}: {fmt(atr_trigger)} | ATR14 {main_label}: {fmt(atr_main)} | ATR14 {structure_label}: {fmt(atr_structure)} | Rủi ro tham chiếu: {fmt(risk)} USDT",
+        f"- Trigger {trigger_label} đã đóng: {_consecutive_candles(trigger_df)} | {_wick_body_info(trigger_df)}",
+        f"- Setup {main_label} đã đóng: {_consecutive_candles(main_df)} | {_wick_body_info(main_df)}",
         f"- Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}–{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}–{fmt(structure.get('major_high'))}",
         f"- Fibonacci {structure_label}: 0.382={fmt(fib.get('0.382'))}; 0.5={fmt(fib.get('0.5'))}; 0.618={fmt(fib.get('0.618'))}",
         _format_liquidity_window_line("Vùng thanh khoản dưới giá ước lượng", zones, "lower", price),
         _format_liquidity_window_line("Vùng thanh khoản trên giá ước lượng", zones, "upper", price),
         "- Vai trò vùng quét: Entry có thể tham khảo vùng gần/chính nếu hợp xu hướng và có xác nhận. Với SCALP, không dùng vùng thanh khoản dưới làm Entry LONG hoặc vùng thanh khoản trên làm Entry SHORT theo kiểu chạm-là-fill. Nếu cần thêm xác nhận, có thể ghi lệnh chờ kèm điều kiện rõ; chỉ chọn NO TRADE khi SL/TP, động lượng hoặc vùng vào không đạt.",
-        "- TP không bị ép bám sát mép box thanh khoản ước lượng. Nếu box đối diện quá gần làm RR xấu, hãy dùng swing high/low kế tiếp, Fibonacci hoặc vùng cấu trúc kế tiếp làm TP; Python cũng sẽ thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp trước khi reject. Nếu vẫn không đủ RR thì chọn NO TRADE. Không tạo TP quá gần chỉ vì box thanh khoản rất hẹp.",
-        "- Quy tắc rủi ro: SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; nếu setup dựa vào cú quét đáy/đỉnh mới nhất thì wick extreme của cú quét đó là invalidation trực tiếp và SL phải nằm ngoài wick đó. Python sẽ tự chuẩn hóa SL theo cấu trúc này, tính RR theo SL cấu trúc gốc, rồi mới nới thêm phần trăm cấu hình để ra SL cuối cùng cho user/tracking. Phần nới SL thêm là phong cách quản trị rủi ro và mặc định không làm đổi LONG/SHORT thành NO TRADE vì RR xấu đi. Sau đó Python thử chuẩn hóa TP1/TP2 sang target cấu trúc kế tiếp nếu TP quá sát. RR guard nội bộ dùng SL cấu trúc gốc: TP1 nên >= 0.40R, TP2 nên >= 0.50R; nếu sau khi thử target cấu trúc vẫn không đạt thì chọn NO TRADE.",
+        "- TP không được ép bám sát mép box thanh khoản ước lượng. Nếu box đối diện quá gần làm RR xấu, chính model phải chủ động dùng swing high/low kế tiếp, Fibonacci, EMA/vùng cấu trúc kế tiếp hoặc vùng quét đối diện có ý nghĩa. Nếu không có target đủ đáng thì chọn NO TRADE. Không tạo TP quá gần chỉ vì box thanh khoản rất hẹp.",
+        "- Quy tắc rủi ro V32: model là nguồn chính lập Entry/SL/TP. SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; nếu setup dựa vào cú quét đáy/đỉnh mới nhất thì wick extreme của cú quét đó là invalidation trực tiếp và SL phải nằm ngoài wick đó. Python mặc định không tự sửa SL/TP sang mức khác; Python chỉ kiểm tra lỗi cứng rồi mới áp phần trăm buffer theo sở thích user nếu có. Vì vậy model phải chọn TP/SL hợp lý ngay từ đầu: TP1 nên >= 0.40R, TP2 nên >= 0.50R, nhưng ưu tiên target thực tế theo kháng cự/hỗ trợ/Fibonacci/swing/vùng quét thay vì target quá sát hoặc bịa.",
         "- Ghi chú: Vùng quét là vùng thanh khoản kỹ thuật ước lượng theo cửa sổ thời gian, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật nội bộ, không phải lệnh giao dịch chốt sẵn. Không show trực tiếp các vùng thanh khoản/thanh lý/heatmap ra user; chỉ dùng chúng để lập quyết định, Entry/SL/TP, lý do và rủi ro.",
     ]
     return "\n".join(lines)
@@ -4080,7 +4428,10 @@ def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
 
     vol_lbl = "CAO" if last["vol_ratio"] > 1.5 else ("THẤP" if last["vol_ratio"] < 0.7 else "BÌNH THƯỜNG")
 
-    window    = df.tail(50)
+    closed_df = _closed_candles(df)
+    if closed_df is None or closed_df.empty:
+        closed_df = df
+    window    = closed_df.tail(50)
     key_high  = window["high"].max()
     key_low   = window["low"].min()
 
@@ -4088,7 +4439,7 @@ def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
         f"  {str(row['timestamp'])[:16]} O:{fmt(row['open'])} H:{fmt(row['high'])} "
         f"L:{fmt(row['low'])} C:{fmt(row['close'])} "
         f"RSI14:{fmt(row['rsi_14'],1)} Vol:{fmt(row['vol_ratio'],2)}x"
-        for _, row in df.tail(10).iterrows()
+        for _, row in closed_df.tail(10).iterrows()
     )
 
     return "\n".join([
@@ -4099,9 +4450,9 @@ def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
         f"  MACD={fmt(last['macd_line'],4)} Signal={fmt(last['macd_signal'],4)}; {macd_momentum_text(last['macd_hist'])} → {macd_dir}{macd_cross}",
         f"  ATR14={fmt(last.get('atr_14'))} ({fmt(last.get('atr_pct'),2)}%)",
         f"  Volume={fmt(last['vol_ratio'],2)}x → {vol_lbl}",
-        f"  Nến hiện tại: {_consecutive_candles(df)} | {_wick_body_info(df)}",
+        f"  Nến đã đóng: {_consecutive_candles(df)} | {_wick_body_info(df)}",
         f"  High/Low 50 nến: {fmt(key_high)} / {fmt(key_low)}",
-        f"  10 nến gần nhất:",
+        f"  10 nến đã đóng gần nhất:",
         candles,
     ])
 
@@ -4221,15 +4572,16 @@ def build_user_prompt(
 ) -> str:
     mode_label = "SCALP (ngắn hạn)" if mode == "short" else "SWING (dài hạn)"
     focus      = (
-        "Dùng 15M để timing entry, 1H để xác nhận momentum, 4H để xác định xu hướng chính."
+        "SCALP: dùng 1H làm setup/chính, 4H xác nhận xu hướng, 1D làm bối cảnh lớn; 15M chỉ timing entry/sweep, không đảo bias một mình."
         if mode == "short" else
-        "Dùng 4H để timing entry, 1D để xác nhận xu hướng, 1W để xác định big picture."
+        "SWING: dùng 1D làm xu hướng/chính, 4H làm setup/vùng vào, 1W làm bối cảnh lớn; 1H chỉ timing entry phụ."
     )
 
     history_block = format_prediction_history(history)
     open_signal_context = open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có kế hoạch đang chờ/đã khớp cho user này ở cùng coin và mode."
     tf_blocks     = "".join(summarize_timeframe(lbl, df) for lbl, df in timeframe_data.items())
     raw_candle_block = build_raw_candle_context(timeframe_data, mode)
+    live_candle_block = build_live_candle_context(timeframe_data, mode)
     feature_block = feature_block or build_feature_engineering_block(timeframe_data, mode, None)
 
     return f"""YÊU CẦU PHÂN TÍCH {mode_label} CHO {symbol}
@@ -4247,6 +4599,8 @@ Phương pháp: {focus}
 ═══════════════════════════════
 {raw_candle_block}
 ═══════════════════════════════
+{live_candle_block}
+═══════════════════════════════
 {tf_blocks}
 ═══════════════════════════════
 
@@ -4254,12 +4608,12 @@ Yêu cầu:
 1. Python chỉ cung cấp dữ liệu cứng: EMA/RSI/MACD/ATR, market regime, cấu trúc, Fibonacci, vùng quét thanh khoản ước lượng, raw candle context, rủi ro tham chiếu. Không có kế hoạch LONG/SHORT chốt sẵn. Vùng quét/thanh khoản là dữ liệu nội bộ, không liệt kê ra user.
 2. Model phải tự phân tích và tự lập Entry/SL/TP dựa trên dữ liệu cứng đó. Không được tự tạo thêm Fibonacci/vùng quét nếu block Python ghi N/A hoặc không đủ dữ liệu.
 3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO TRADE theo xu hướng đa khung, vị trí giá, vùng quét ước lượng theo cửa sổ thời gian, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user, không in mục thanh khoản/heatmap/vùng thanh lý.
-4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và tỷ lệ lời/lỗ đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO TRADE. Không dùng NO TRADE chỉ vì giá chưa chạm Entry; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.
+4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và tỷ lệ lời/lỗ đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO TRADE. Không dùng NO TRADE chỉ vì giá chưa chạm Entry; nếu Entry là vùng tốt nhưng giá chưa tới, hãy đưa lệnh chờ. Dùng nến đã đóng làm cơ sở xác nhận; nến live chỉ tham khảo.
 5. Cách dùng vùng quét: Entry ưu tiên vùng gần/chính nếu hợp hướng setup và có xác nhận. Với SCALP, không được LONG chỉ vì giá chạm vùng thanh khoản dưới và không được SHORT chỉ vì giá chạm vùng thanh khoản trên; cần có lợi thế rõ như quét thanh khoản/rút râu/đóng nến xác nhận, hoặc một vùng chờ hợp lý với SL/TP đạt tỷ lệ. Nếu còn thiếu xác nhận, được phép đưa lệnh chờ với điều kiện kích hoạt rõ; chỉ chọn NO TRADE khi cả Entry, SL/TP hoặc động lượng đều không đủ.
-6. TP dùng vùng đối diện nhưng không được ép bám sát mép box hẹp: với LONG nhìn vùng thanh khoản trên/swing high/Fibonacci phía trên, với SHORT nhìn vùng thanh khoản dưới/swing low/Fibonacci phía dưới. Nếu TP1 quá gần Entry làm RR < 0.40R, hãy chọn target cấu trúc kế tiếp; nếu không có target hợp lý thì NO TRADE. SL đặt ngoài vùng Entry + buffer ATR, không đặt ngay sát vùng quét; Python sẽ còn nới SL thêm theo biến cấu hình để ra SL cuối cùng cho user; phần nới thêm mặc định không tính vào RR guard. Với SCALP, SL cuối cùng vẫn không được sai hình học hoặc quá sát Entry.
+6. TP/SL do model tự chọn từ dữ liệu cứng: Fibonacci, swing high/low, EMA/vùng cấu trúc, vùng quét ước lượng và raw candle context. Python mặc định không tự “cứu” TP/SL bằng cách nhảy sang số khác; nếu model đặt TP quá gần Entry, SL sai cấu trúc hoặc target không đáng đánh thì plan sẽ bị NO TRADE. Với LONG, TP1 nên là kháng cự/vùng hồi hợp lý phía trên; với SHORT, TP1 nên là hỗ trợ/vùng hút phía dưới. Không đặt TP1 quá sát chỉ để có lệnh. Ví dụ ETH entry 1700 mà TP1 1710 chỉ hợp lý nếu risk rất nhỏ và có cấu trúc rõ; nếu không, phải chọn target xa hơn như 1730–1750 theo kháng cự/Fibonacci/swing/vùng quét, hoặc NO TRADE. Sau khi model lập plan, Python chỉ áp buffer % theo biến Railway nếu user muốn.
 7. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”. Nếu Entry chưa chạm giá hiện tại nhưng vẫn là vùng đẹp, giữ quyết định LONG/SHORT dạng lệnh chờ và ghi rõ “Chưa vào ngay, chờ giá về vùng Entry...”, không chọn NO TRADE chỉ vì chưa chạm Entry.
 8. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
-9. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát; nếu phải đặt SL quá sát mới có tỷ lệ đẹp thì chọn NO TRADE. Không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp.
+9. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát; nếu phải đặt SL quá sát mới có tỷ lệ đẹp thì chọn NO TRADE. Không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp, nhưng cũng không đặt TP quá gần khiến lợi nhuận không đáng so với phí/trượt giá/rủi ro nhiễu. SCALP không được bị 15M live làm đảo quyết định nếu 1H/4H chưa xác nhận; SWING không được bị 1H live làm đảo bias nếu 1D/1W chưa đổi.
 10. Nếu chọn NO TRADE: không cần Entry/SL/TP; trả quyết định NO TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Được chọn NO TRADE khi lợi thế chưa đủ rõ, kể cả khi vẫn có thể vẽ ra một vùng Entry hợp lệ nhưng kèo không đáng vào.
 11. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
 12. Đọc kỹ KẾ HOẠCH ĐANG MỞ nếu có. Không được hiểu vùng Entry của một lệnh chờ LONG là mục tiêu TP cho lệnh SHORT ngược lại, hoặc vùng Entry của lệnh chờ SHORT là mục tiêu TP cho lệnh LONG ngược lại.
@@ -4318,6 +4672,8 @@ def _anthropic_create_once(
     timeout: int,
     reasoning_effort: str | None = None,
 ) -> dict:
+    if anthropic is None:
+        raise RuntimeError("Anthropic SDK is not installed. This build is intended to run with AI_PROVIDER=zai.")
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     kwargs = {
         "model": CLAUDE_MODEL,
@@ -5002,7 +5358,7 @@ def _validate_actionable_trade_plan(
             errors.append("SHORT sai hình học: TP2 không được cao hơn TP1.")
         final_risk = max(sl - entry_low, 0.0)
 
-    rr_guard = _plan_worst_case_risk_reward(pred, use_rr_guard_sl=True)
+    rr_guard = _plan_worst_case_risk_reward(pred, use_rr_guard_sl=True, use_rr_guard_tp=True)
     risk = float(rr_guard.get("risk") or 0.0)
     reward1 = float(rr_guard.get("reward1") or 0.0)
     reward2 = float(rr_guard.get("reward2") or 0.0)
@@ -5259,15 +5615,20 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
 
     pred = parse_prediction_from_output(output)
 
-    # Sonnet-trust mode:
-    # - Không dùng Python risk/format validator để ẩn phản hồi của Claude nữa.
-    # - Model trả gì thì gửi user đúng nội dung đó.
-    # - Python chỉ parse tối thiểu Entry/SL/TP để lưu auto-check nếu đủ số.
+    # V32 model-authoritative flow:
+    # - Model tự chọn Entry/SL/TP từ dữ liệu Binance + level map Python cung cấp.
+    # - Python mặc định KHÔNG tự nhảy SL/TP sang mức khác, để output cuối giữ đúng phân tích model.
+    # - Python chỉ validate lỗi cứng và áp buffer SL/TP theo sở thích user nếu user set biến Railway.
+    # - Có thể bật lại auto-adjust bằng TEOPARD_PYTHON_ADJUST_SL=1 hoặc TEOPARD_PYTHON_ADJUST_TP=1.
     direction = (pred.get("direction") or "").upper()
 
     if direction in ("LONG", "SHORT"):
-        pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
-        pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
+        if _python_adjusts_model_sl():
+            pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
+        if _python_adjusts_model_tp():
+            pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
+        pred, output = _apply_extra_sl_buffer_to_plan(pred, output)
+        pred, output = _apply_extra_tp_buffers_to_plan(pred, output)
         output = _normalize_pending_entry_activation(output, pred, current_price)
 
     if direction == "NO_TRADE":
@@ -5394,15 +5755,20 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     pred = parse_prediction_from_output(output)
 
-    # Sonnet-trust mode:
-    # - Không dùng Python risk/format validator để ẩn phản hồi của Claude nữa.
-    # - Model trả gì thì gửi user đúng nội dung đó.
-    # - Python chỉ parse tối thiểu Entry/SL/TP để lưu auto-check nếu đủ số.
+    # V32 model-authoritative flow:
+    # - Model tự chọn Entry/SL/TP từ dữ liệu Binance + level map Python cung cấp.
+    # - Python mặc định KHÔNG tự nhảy SL/TP sang mức khác, để output cuối giữ đúng phân tích model.
+    # - Python chỉ validate lỗi cứng và áp buffer SL/TP theo sở thích user nếu user set biến Railway.
+    # - Có thể bật lại auto-adjust bằng TEOPARD_PYTHON_ADJUST_SL=1 hoặc TEOPARD_PYTHON_ADJUST_TP=1.
     direction = (pred.get("direction") or "").upper()
 
     if direction in ("LONG", "SHORT"):
-        pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
-        pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
+        if _python_adjusts_model_sl():
+            pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
+        if _python_adjusts_model_tp():
+            pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
+        pred, output = _apply_extra_sl_buffer_to_plan(pred, output)
+        pred, output = _apply_extra_tp_buffers_to_plan(pred, output)
         output = _normalize_pending_entry_activation(output, pred, current_price)
 
     if direction == "NO_TRADE":

@@ -1,307 +1,64 @@
-# Teopard Bot V4 Lifecycle
+# Teopard Bot — GLM Native / Z.AI build
 
-Bản này dùng lifecycle mới cho prediction:
+Bản này chốt dùng GLM native qua Z.AI.
 
-```text
-PENDING_ENTRY -> ENTRY_FILLED -> WIN / LOSS / EXPIRED / AMBIGUOUS
-PENDING_ENTRY -> NOT_FILLED
-```
+## Flow phân tích
 
-## Logic kiểm tra
+- Bot lấy dữ liệu nến từ Binance.
+- Python tính dữ liệu cứng: EMA, RSI, MACD, ATR, Fibonacci, cấu trúc, vùng stop/liquidity ước lượng.
+- Model GLM tự phân tích và tự chọn Entry / SL / TP.
+- Python mặc định không tự nhảy SL/TP sang số khác.
+- Python chỉ validate lỗi hình học/risk tối thiểu, xử lý lệnh chờ, và chỉ lưu history khi user bấm xác nhận đã trade theo bot.
 
-Scalp:
-- Chờ Entry tối đa 12h.
-- Sau khi khớp Entry, theo dõi tối đa 72h.
-- Job check mỗi 1h.
-- Chấm TP/SL bằng nến 15M.
+## Timeframe roles V33
 
-Swing:
-- Chờ Entry tối đa 24h.
-- Sau khi khớp Entry, theo dõi tối đa 7 ngày.
-- Job check mỗi 12h.
-- Chấm TP/SL bằng nến 1H.
+SCALP:
+- 15M = trigger/timing, sweep/wick, chỉ tham khảo để vào lệnh.
+- 1H = khung setup/chính.
+- 4H = xác nhận xu hướng.
+- 1D = bối cảnh lớn.
 
-Auto-check chỉ cập nhật DB, không gửi kết quả tự động cho user/admin. User muốn xem kết quả thì dùng /history, /stats hoặc /dashboard. Admin muốn xem tổng hệ thống thì dùng /historyall, /statsall hoặc /dashboardall; muốn ép kiểm tra toàn bộ prediction đang mở ngay dùng /checknow.
+SWING:
+- 1H = trigger/timing phụ.
+- 4H = setup/vùng vào.
+- 1D = khung xu hướng/chính.
+- 1W = bối cảnh lớn.
 
-## Lệnh user
+## Nến đã đóng vs nến đang chạy
 
-- `/start`
-- `/whoami`
-- `/help`
-- `/listsymbols`
-- `/stats` — thống kê của chính user đang dùng lệnh
-- `/stats BTC` — thống kê BTCUSDT của chính user đang dùng lệnh
-- `/history` — lịch sử của chính user đang dùng lệnh
-- `/history BTC` — lịch sử BTCUSDT của chính user đang dùng lệnh
-- `/dashboard` — dashboard của chính user đang dùng lệnh
+- Indicator, structure, Fibonacci, raw candle chính và market regime dùng nến đã đóng.
+- Nến đang chạy được tách riêng trong LIVE_CANDLE_CONTEXT và chỉ dùng tham khảo.
+- Model không được dùng nến live để xác nhận Entry/đảo chiều.
 
-Lưu ý: Telegram menu không hiển thị command kèm tham số, nên `/stats BTC` và `/history BTC` phải gõ tay.
+## Railway variables cần thiết
 
-## Lệnh admin
-
-Admin có toàn bộ lệnh user. Từ bản này, `/stats`, `/history`, `/dashboard` của admin cũng chỉ xem dữ liệu của chính admin để tránh rối.
-
-Admin muốn xem toàn hệ thống dùng lệnh riêng:
-
-- `/statsall`
-- `/statsall BTC`
-- `/historyall`
-- `/historyall BTC`
-- `/dashboardall`
-
-Lệnh quản trị:
-
-- `/adduser 123456789`
-- `/removeuser 123456789`
-- `/listusers`
-- `/setlimit 123456789 10`
-- `/resetusage 123456789`
-- `/addsymbol BTC`
-- `/removesymbol BTC`
-- `/checknow`
-- `/clearhistory CONFIRM`
-
-Menu riêng của admin đã được set bằng `BotCommandScopeChat`, nên admin sẽ thấy đủ các lệnh quản trị trong menu Telegram sau khi bot restart/redeploy.
-
-## Feature engineering V4.2
-
-Bot tính sẵn bằng Python trước khi gửi Claude:
-- EMA7/25/50, RSI6/14, MACD, Volume ratio, ATR14.
-- Chuỗi nến, wick/body của nến cuối.
-- Market structure, đỉnh/đáy gần/biên lớn.
-- Fibonacci 0.382/0.5/0.618 từ swing đã tính.
-- Vùng quét Long/Short gần và sâu từ pivot/equal high/equal low.
-- Rủi ro tham chiếu theo ATR/giá.
-
-Cấu trúc Hybrid AI Engine:
-- Python chỉ tính dữ liệu cứng và bản đồ kỹ thuật.
-- Claude tự phân tích, tự chọn LONG/SHORT và tự đặt Entry/SL/TP.
-- Python không còn chặn risk/format trước khi gửi user. Claude trả phản hồi thế nào thì bot gửi user phản hồi đó. Python chỉ parse Entry/SL/TP để lưu auto-check nếu đủ số.
-- Nếu kế hoạch chưa hợp lệ, bot KHÔNG tự sửa và KHÔNG gọi Claude sửa lại; bot ẩn tín hiệu đó và lưu hidden REJECTED_PLAN để học/debug.
-
-Prompt đã chặn Claude tự bịa Fibonacci/vùng quét nếu Python không gửi dữ liệu.
-
-## Railway env
-
-- `BOT_TOKEN`
-- `ANTHROPIC_API_KEY`
-- `ADMIN_USER_IDS=5920124635`
-- `DB_PATH=/data/bot.db`
-
-Không commit `.env` hoặc `bot.db`.
-
-
-V4.1 privacy/history reset update:
-- User thường chỉ xem /stats, /history, /dashboard của chính mình.
-- Admin xem được thống kê/lịch sử toàn hệ thống bằng /statsall, /historyall, /dashboardall.
-- Thêm /clearhistory CONFIRM cho admin để xóa toàn bộ prediction/history nhưng giữ whitelist và allowed_symbols.
-
-V4.3 Hybrid AI Engine update:
-- Bỏ kế hoạch tham chiếu LONG/SHORT cứng khỏi prompt.
-- Python cung cấp dữ liệu cứng: ATR/Fibonacci/structure/liquidity/risk floor.
-- Claude tự ra chiến lược và tự đặt Entry/SL/TP.
-- Python không kiểm tra logic/risk để ẩn tín hiệu nữa. Claude tự chịu trách nhiệm phân tích Entry/SL/TP; bot chỉ parse số để auto-check nếu có đủ Entry/SL/TP.
-- Nếu output chưa hợp lệ, bot KHÔNG tự sửa và KHÔNG gọi Claude sửa lại; bot ẩn tín hiệu đó để tránh gửi plan thiếu/không an toàn cho user.
-
-V4.4 per-user learning update:
-- Claude learning history được lọc theo user đang phân tích.
-- User A phân tích thì Claude chỉ nhận lịch sử của User A cho cùng symbol/mode.
-- User B không bị ảnh hưởng bởi lịch sử của User A.
-- Admin khi tự phân tích cũng chỉ dùng lịch sử của chính admin, không dùng lịch sử toàn hệ thống.
-
-V4.5 admin self/global history update:
-- `/history`, `/stats`, `/dashboard` luôn xem dữ liệu của chính người dùng lệnh, kể cả admin.
-- Admin muốn xem toàn hệ thống dùng `/historyall`, `/statsall`, `/dashboardall`.
-- `/historyall` và `/historyall BTC` hiện User ID / Chat ID để biết lệnh thuộc user nào.
-
-V4.6 feature snapshot learning update:
-- Thêm cột feature_snapshot trong bảng predictions.
-- Mỗi prediction lưu thêm snapshot kỹ thuật ngắn gọn tại lúc phân tích: EMA/RSI/MACD/ATR/volume, cấu trúc, Fibonacci, vùng quét Long/Short, risk floor, chuỗi nến/wick.
-- Khi Claude học từ 5 lịch sử gần nhất của chính user, prompt giờ có thêm Feature then để biết lệnh cũ WIN/LOSS trong bối cảnh cấu trúc/Fib/liquidity nào.
-- market_snapshot được giữ gọn cho dữ liệu thị trường cơ bản, feature_snapshot tách riêng để tránh prompt history quá rối.
-
-V4.8 rejected plan learning update:
-- Nếu Claude trả LONG/SHORT, bot hiển thị trực tiếp cho user. Nếu parse đủ Entry/SL/TP thì bot lưu prediction để auto-check. Nếu không parse đủ số thì bot vẫn hiển thị phản hồi nhưng chỉ lưu hidden record để learning/debug, không auto-check.
-- Bot vẫn lưu hidden record `REJECTED_PLAN` để Claude học/debug, nhưng không auto-check và không hiện trong /history, /stats, /dashboard.
-
-
-Cập nhật format phản hồi:
-- Bắt buộc có đủ các mục Thanh khoản, Quyết định, Entry/SL/TP, Kịch bản chính và Rủi ro.
-- Bot không dùng cụm “swing gần/swing lớn” trong output cho user; thay bằng “đỉnh/đáy gần/biên lớn”.
-- Nếu Claude trả thiếu format, Python không tự sửa nội dung; bot ẩn phản hồi đó, trả thông báo “chưa đủ dữ liệu hợp lệ để tạo phân tích” cho user và lưu hidden REJECTED_PLAN để học/debug.
-
-V4.8 compact output guard update:
-- Output cho user dùng format rút gọn: không hiện riêng “Bối cảnh” và “Cấu trúc”.
-- Bot vẫn gửi dữ liệu EMA/RSI/MACD/ATR/Fibonacci/cấu trúc/vùng quét cho Claude để phân tích nội bộ.
-- Prompt vẫn yêu cầu Claude trả đủ Thanh khoản, Quyết định, Entry/SL/TP, Kịch bản chính và Rủi ro, nhưng Python không ẩn phản hồi nếu Claude thiếu format.
-
-
-Bản cập nhật thông báo lỗi:
-- Bot không còn dùng Python validator để ẩn phản hồi. Claude trả thế nào thì user thấy thế đó. Chỉ khi không parse đủ Entry/SL/TP thì bot không đưa vào auto-check.
-- Lỗi vẫn được lưu hidden dạng REJECTED_PLAN để phục vụ learning/debug, không xuất hiện trong history/stats/dashboard.
-
-V4.9 Sonnet Analyst Mode update:
-- Thêm quyền quyết định `NO_TRADE`: Claude không còn bị ép phải chọn LONG/SHORT khi setup xấu.
-- Python gửi thêm `MARKET_REGIME_DO_PYTHON_PHAN_LOAI` để Claude biết thị trường đang trend, range/nhiễu, thanh khoản thấp hay biến động cao.
-- Python gửi thêm `RAW_CANDLE_CONTEXT_CHON_LOC` gồm nến thô có body%, râu trên/dưới, volume và taker-buy ratio nếu có để Sonnet đọc hành vi giá tốt hơn.
-- Claude phải so sánh nội bộ LONG / SHORT / NO_TRADE trước khi quyết định, nhưng không in bảng so sánh ra user.
-- Nếu Claude chọn NO_TRADE, bot hiển thị phản hồi NO_TRADE của Claude cho user và lưu hidden learning record; NO_TRADE không auto-check và không hiện trong /history/stats/dashboard.
-
-
-Ghi chú bản LLM/OpenRouter:
-- Bot không dùng Python risk/format guard để sửa hoặc chặn lệnh AI.
-- Phân tích chính vẫn có continuation nếu provider trả finish_reason/stop_reason=length.
-- Call tóm tắt reasoning không continuation để tránh GLM lặp length do reasoning token.
-- Có thể chỉnh LLM_MAX_OUTPUT_TOKENS trong Railway, mặc định 8000.
-
-
-## Chuyển sang GLM 5.2 qua OpenRouter
-
-Bản này hỗ trợ 2 provider AI:
-
-### 1) Claude / Anthropic (mặc định)
-```text
-AI_PROVIDER=anthropic
-ANTHROPIC_API_KEY=...
-CLAUDE_MODEL=claude-sonnet-5
-LLM_MAX_OUTPUT_TOKENS=8000
-LLM_MAX_CONTINUATIONS=2
-# Effort cho phân tích chính. Bot mặc định max nếu không khai báo.
-ANTHROPIC_EFFORT=max
-# Effort riêng cho call summary learning. Không ảnh hưởng Entry/SL/TP.
-ANTHROPIC_SUMMARY_EFFORT=high
-```
-
-### 2) GLM 5.2 qua OpenRouter
-```text
-AI_PROVIDER=openrouter
-OPENROUTER_API_KEY=...
-OPENROUTER_MODEL=z-ai/glm-5.2
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-LLM_MAX_OUTPUT_TOKENS=8000
-LLM_MAX_CONTINUATIONS=2
-# Tuỳ chọn: reasoning effort cho phân tích chính. Nếu dùng GLM và không khai báo biến này, code mặc định xhigh.
-OPENROUTER_REASONING_EFFORT=xhigh
-# Summary mặc định tắt reasoning để không đốt token ẩn
-LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
-OPENROUTER_SUMMARY_REASONING_EFFORT=off
-```
-
-Khi dùng OpenRouter/GLM thì không cần `ANTHROPIC_API_KEY`. Bot vẫn giữ cùng flow: Python tính dữ liệu kỹ thuật, model tự phân tích LONG/SHORT/NO_TRADE, Python chỉ parse Entry/SL/TP để auto-check nếu đủ số.
-
-
-=== GLM 5.2 / OpenRouter setup ===
-Bản này đã tương thích GLM 5.2 qua OpenRouter. Khi AI_PROVIDER=openrouter, bot dùng Chat Completions API với:
-- messages system/user kiểu OpenAI-compatible
-- max_completion_tokens cho output token
-- finish_reason=length để gọi continuation nếu bị cắt
-
-Railway Variables để chạy GLM 5.2:
-AI_PROVIDER=openrouter
-OPENROUTER_API_KEY=sk-or-...
-OPENROUTER_MODEL=z-ai/glm-5.2
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-LLM_MAX_OUTPUT_TOKENS=8000
-LLM_MAX_CONTINUATIONS=2
-OPENROUTER_REASONING_EFFORT=xhigh
-LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
-OPENROUTER_SUMMARY_REASONING_EFFORT=off
-
-Ghi chú:
-- OPENROUTER_REASONING_EFFORT chỉ dùng cho phân tích chính Entry/SL/TP.
-- summarize_reasoning dùng LLM_SUMMARY_MAX_OUTPUT_TOKENS và mặc định tắt reasoning/continuation để tránh log length lặp lại.
-
-Các biến Telegram/DB giữ nguyên:
+```env
 BOT_TOKEN=...
 ADMIN_USER_IDS=5920124635
 DB_PATH=/data/bot.db
 
-Muốn quay lại Anthropic-native / Claude Sonnet 5:
-AI_PROVIDER=anthropic
-ANTHROPIC_API_KEY=...
-CLAUDE_MODEL=claude-sonnet-5
-LLM_MAX_OUTPUT_TOKENS=8000
-LLM_MAX_CONTINUATIONS=2
-ANTHROPIC_EFFORT=max
-ANTHROPIC_SUMMARY_EFFORT=high
-
-Các biến provider không dùng có thể để dư trên Railway, code chỉ đọc provider tương ứng theo AI_PROVIDER.
-
-V4.11 Claude effort + OpenRouter/GLM logging update:
-- Khi AI_PROVIDER=anthropic, bot dùng Claude native Messages API.
-- CLAUDE_MODEL mặc định là claude-sonnet-5.
-- ANTHROPIC_EFFORT mặc định max cho phân tích chính Entry/SL/TP. Có thể đổi high/xhigh/max trên Railway.
-- ANTHROPIC_SUMMARY_EFFORT mặc định high cho call tóm tắt learning.
-- Khi AI_PROVIDER=openrouter và model có chữ "glm", nếu Railway chưa set OPENROUTER_REASONING_EFFORT thì bot mặc định dùng xhigh cho phân tích chính.
-- Log LLM_RESPONSE có thêm call_type=main hoặc call_type=summary và effort=... để dễ phân biệt chi phí phân tích chính/tóm tắt learning.
-- PREDICTION_HISTORY_COUNT vẫn giữ 5 để Claude/GLM có đủ lịch sử học lại.
-
-
-V4.11 prediction retention update:
-- Mỗi user chỉ giữ 10 lệnh hiển thị gần nhất trong DB; lệnh thứ 11 sẽ làm bot xóa lệnh hiển thị cũ nhất của user đó.
-- `/history` và `/history BTC` vẫn hiển thị tối đa 10 lệnh gần nhất.
-- Learning prompt vẫn chỉ lấy 5 lịch sử gần nhất của chính user cho cùng symbol/mode.
-- Bản ghi học ẩn `NO_TRADE`/`REJECTED_PLAN` cũng được giới hạn riêng để DB không phình lâu dài.
-- Thêm index nhẹ cho user history, per-symbol learning và auto-check để DB chạy ổn hơn trên Railway Volume.
-
-V4.12 pending-plan awareness update:
-- Khi user phân tích lại cùng coin/mode, prompt nhận thêm KẾ HOẠCH ĐANG MỞ nếu đang có PENDING_ENTRY hoặc ENTRY_FILLED.
-- Model phải đánh giá kế hoạch cũ còn hiệu lực / bị hủy / cần thay thế trước khi ra kế hoạch mới.
-- Entry của lệnh chờ LONG không được hiểu là TP cho lệnh SHORT ngược lại; Entry của lệnh chờ SHORT không được hiểu là TP cho lệnh LONG ngược lại.
-- Nếu giá chạy theo hướng dự báo nhưng không hồi về Entry cũ, model không được đuổi giá trừ khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu không thì ưu tiên NO_TRADE hoặc chờ kiểm tra lại.
-
-
-=== V16 Z.AI native / OpenRouter / Claude provider switch ===
-Bản này hỗ trợ 3 đường gọi model, chọn bằng AI_PROVIDER:
-
-1) Z.AI native/chính chủ — khuyên dùng nếu muốn giảm latency so với OpenRouter:
 AI_PROVIDER=zai
 ZAI_API_KEY=...
 ZAI_MODEL=glm-5.2
 ZAI_BASE_URL=https://api.z.ai/api/paas/v4
 ZAI_REASONING_EFFORT=high
 ZAI_SUMMARY_REASONING_EFFORT=none
+ZAI_APP_NAME=Teopard Bot
+
 LLM_MAX_OUTPUT_TOKENS=8000
 LLM_MAX_CONTINUATIONS=2
 LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
 
-2) OpenRouter — giữ lại để chuyển về GLM qua OpenRouter hoặc DeepSeek:
-AI_PROVIDER=openrouter
-OPENROUTER_API_KEY=...
-OPENROUTER_MODEL=z-ai/glm-5.2
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-OPENROUTER_REASONING_EFFORT=xhigh
-OPENROUTER_SUMMARY_REASONING_EFFORT=off
-LLM_MAX_OUTPUT_TOKENS=8000
-LLM_MAX_CONTINUATIONS=2
-LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
+TEOPARD_PYTHON_ADJUST_SL=0
+TEOPARD_PYTHON_ADJUST_TP=0
 
-Ví dụ đổi sang DeepSeek trên OpenRouter:
-AI_PROVIDER=openrouter
-OPENROUTER_MODEL=deepseek/deepseek-v4-pro
-OPENROUTER_REASONING_EFFORT=high
+TEOPARD_EXTRA_SL_BUFFER_PCT=0
+TEOPARD_EXTRA_TP1_BUFFER_PCT=0
+TEOPARD_EXTRA_TP2_BUFFER_PCT=0
+TEOPARD_EXTRA_TP_BUFFER_PCT=0
+TEOPARD_RR_USE_EXTRA_SL_BUFFER=0
+TEOPARD_RR_USE_EXTRA_TP_BUFFER=0
 
-3) Claude native / Anthropic:
-AI_PROVIDER=anthropic
-ANTHROPIC_API_KEY=...
-CLAUDE_MODEL=claude-sonnet-5
-ANTHROPIC_EFFORT=max
-ANTHROPIC_SUMMARY_EFFORT=high
-LLM_MAX_OUTPUT_TOKENS=8000
-LLM_MAX_CONTINUATIONS=2
-
-Ghi chú chuyển provider:
-- Các biến provider không dùng có thể để dư trong Railway, code chỉ đọc bộ biến tương ứng với AI_PROVIDER.
-- Nếu muốn dùng Z.AI chính chủ, đặt AI_PROVIDER=zai, không dùng AI_PROVIDER=glm. AI_PROVIDER=glm được giữ tương thích cũ và vẫn route sang OpenRouter.
-- Z.AI native dùng endpoint OpenAI-compatible /chat/completions và truyền reasoning_effort trực tiếp.
-- ZAI_REASONING_EFFORT mặc định high để giảm lag; đổi max/xhigh nếu muốn suy luận sâu hơn nhưng có thể chậm hơn.
-- ZAI_SUMMARY_REASONING_EFFORT mặc định none để summary không đốt token reasoning.
-
-## Railway guard variables hiện tại
-
-Các biến guard có thể chỉnh trên Railway mà không cần sửa code:
-
-```env
 TEOPARD_GUARD_PROFILE=loose
 TEOPARD_MIN_TP1_R=0.40
 TEOPARD_MIN_TP2_R=0.50
@@ -311,16 +68,41 @@ TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE=52
 TEOPARD_WEAK_CONFIRM_VOLUME=0.45
 ```
 
-Biến SL thêm:
+## Có thể xóa khỏi Railway
+
+Nếu đã chốt chỉ dùng Z.AI native thì có thể xóa:
 
 ```env
-TEOPARD_EXTRA_SL_BUFFER_PCT=1.2
-TEOPARD_RR_USE_EXTRA_SL_BUFFER=0
+OPENROUTER_API_KEY
+OPENROUTER_MODEL
+OPENROUTER_BASE_URL
+OPENROUTER_REASONING_EFFORT
+OPENROUTER_SUMMARY_REASONING_EFFORT
+OPENROUTER_SITE_URL
+OPENROUTER_APP_NAME
+
+ANTHROPIC_API_KEY
+CLAUDE_MODEL
+ANTHROPIC_EFFORT
+ANTHROPIC_SUMMARY_EFFORT
+CLAUDE_MAX_TOKENS
+
+GLM_MODEL
+GLM_REASONING_EFFORT
+Z_AI_API_KEY
+TEOPARD_SL_EXTRA_BUFFER_PCT
+TEOPARD_TP1_EXTRA_BUFFER_PCT
+TEOPARD_TP2_EXTRA_BUFFER_PCT
 ```
 
-Ý nghĩa: sau khi Python chuẩn hóa SL theo swing/invalidation + ATR buffer, bot nới thêm SL theo phần trăm giá SL trước khi gửi user.
+## Lệnh chính
 
-- LONG: `SL cuối = SL cấu trúc × (1 - pct)`
-- SHORT: `SL cuối = SL cấu trúc × (1 + pct)`
+- `/start`
+- `/help`
+- `/listsymbols`
+- `/history`
+- `/stats`
+- `/dashboard`
+- `/clearhistory CONFIRM`
 
-Ví dụ SHORT SL cấu trúc `1,783.99`, `TEOPARD_EXTRA_SL_BUFFER_PCT=2` thì SL cuối khoảng `1,819.67`. Nếu SL cuối làm RR quá xấu, Python sẽ đổi thành `NO TRADE` thay vì gửi lệnh rủi ro xấu.
+History chỉ lưu lệnh khi user bấm xác nhận đã trade theo bot.
