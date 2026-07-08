@@ -104,5 +104,6 @@ TEOPARD_TP2_EXTRA_BUFFER_PCT
 - `/stats`
 - `/dashboard`
 - `/clearhistory CONFIRM`
+- `/cleardrafts CONFIRM`
 
-History chỉ lưu lệnh khi user bấm xác nhận đã trade theo bot.
+History chỉ lưu lệnh khi user bấm xác nhận đã trade theo bot. `/cleardrafts CONFIRM` chỉ xóa lệnh nháp/candidate và giữ nguyên history.

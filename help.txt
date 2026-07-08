@@ -69,6 +69,8 @@ Lệnh quản trị:
 /removesymbol BTC - Xóa symbol
 /checknow - Admin: ép kiểm tra toàn bộ prediction đang mở ngay lập tức; chỉ cập nhật DB và báo số lượng, không gửi kết quả cho user/admin
 /clearhistory CONFIRM - Xóa toàn bộ lịch sử prediction, giữ whitelist và symbol
+/cleardrafts CONFIRM - Xóa riêng lệnh nháp của bạn, giữ nguyên history
+/cleardrafts ALL CONFIRM - Admin: xóa lệnh nháp toàn hệ thống, giữ nguyên history
 
 Telegram menu không hiện lệnh có tham số, nên các lệnh như /stats BTC, /history BTC, /adduser 123456789 phải gõ tay.
 
@@ -142,3 +144,4 @@ Cập nhật V19 - lưu history theo xác nhận user:
 - NO TRADE, REJECTED_PLAN và phân tích chưa xác nhận không còn được đưa vào /history hoặc learning prompt.
 - /history đánh số lại từ #1 đến #10 theo danh sách đang hiển thị, không dùng ID DB nhảy số.
 - /clearhistory báo riêng số lệnh đã trade/đang theo dõi, tổng dòng predictions cũ và số lệnh nháp bị xóa.
+- /cleardrafts chỉ xóa bảng lệnh nháp/candidate, không đụng lịch sử đã trade.

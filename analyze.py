@@ -18,6 +18,18 @@ load_dotenv()
 
 BINANCE_API_URL   = "https://api.binance.com/api/v3/klines"
 
+
+def _env_float(name: str, default: float) -> float:
+    """Parse float env safely; supports values like 0.1, 1.2."""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        return default
+
+
 # ─── AI provider config ───────────────────────────────────────────────────────
 # V33: chốt dùng GLM/Z.AI native làm provider chính.
 # OpenRouter/Claude code vẫn còn để không làm vỡ import cũ, nhưng Railway không cần set các biến đó nữa.
@@ -65,6 +77,8 @@ ZAI_BASE_URL = os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4").rstrip(
 ZAI_REASONING_EFFORT = os.getenv("ZAI_REASONING_EFFORT", "high").strip()
 ZAI_SUMMARY_REASONING_EFFORT = os.getenv("ZAI_SUMMARY_REASONING_EFFORT", "none").strip()
 ZAI_APP_NAME = os.getenv("ZAI_APP_NAME", "Teopard Bot")
+# Trading output cần ổn định, không sáng tạo quá nhiều. Railway có thể override bằng ZAI_TEMPERATURE.
+ZAI_TEMPERATURE = _env_float("ZAI_TEMPERATURE", 0.10)
 
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "8000"))
 LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "2"))
@@ -1447,6 +1461,62 @@ def clear_prediction_history() -> dict:
         "visible_count": visible_count,
         "total_prediction_count": total_prediction_count,
         "draft_count": draft_count,
+    }
+
+
+def clear_trade_candidates(user_id: int | None = None) -> dict:
+    """Xóa riêng bảng lệnh nháp/candidate, không đụng predictions/history.
+
+    - user_id != None: xóa toàn bộ candidate của user đó.
+    - user_id == None: admin xóa toàn bộ candidate của mọi user.
+
+    Lưu ý: candidate chỉ là lớp nháp/xác nhận. Lệnh đã xác nhận đã được copy đầy đủ
+    sang bảng predictions, nên xóa candidate không làm mất /history hay auto-check.
+    """
+    init_prediction_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        params: tuple = ()
+        where = ""
+        if user_id is not None:
+            where = " WHERE user_id=?"
+            params = (user_id,)
+
+        def count_status(status: str) -> int:
+            return int(conn.execute(
+                f"SELECT COUNT(*) FROM trade_candidates{where}{' AND' if where else ' WHERE'} status=?",
+                (*params, status),
+            ).fetchone()[0])
+
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM trade_candidates{where}",
+            params,
+        ).fetchone()[0])
+        draft_count = count_status('DRAFT')
+        expired_count = count_status('EXPIRED')
+        discarded_count = count_status('DISCARDED')
+        confirming_count = count_status('CONFIRMING')
+        confirmed_count = count_status('CONFIRMED')
+
+        conn.execute(f"DELETE FROM trade_candidates{where}", params)
+
+        remaining = int(conn.execute("SELECT COUNT(*) FROM trade_candidates").fetchone()[0])
+        if remaining == 0:
+            try:
+                conn.execute("DELETE FROM sqlite_sequence WHERE name='trade_candidates'")
+            except sqlite3.Error:
+                pass
+        conn.commit()
+
+    return {
+        "deleted_count": total,
+        "draft_count": draft_count,
+        "expired_count": expired_count,
+        "discarded_count": discarded_count,
+        "confirming_count": confirming_count,
+        "confirmed_count": confirmed_count,
+        "history_untouched": True,
+        "sequence_reset": remaining == 0,
+        "scope": "all" if user_id is None else "user",
     }
 
 
@@ -4794,6 +4864,7 @@ def _zai_create_once(
         "model": ZAI_MODEL,
         "messages": payload_messages,
         "max_tokens": max_tokens,
+        "temperature": ZAI_TEMPERATURE,
     }
 
     # Z.AI dùng top-level reasoning_effort + thinking.
@@ -4835,6 +4906,7 @@ def _zai_create_once(
         "stop_reason": choice.get("finish_reason"),
         "usage": data.get("usage"),
         "effort": effective_effort_for_log,
+        "temperature": ZAI_TEMPERATURE,
     }
 
 

@@ -449,6 +449,51 @@ async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
+async def cleardrafts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Xóa riêng lệnh nháp/candidate, giữ nguyên history đã trade theo bot."""
+    from auth import is_admin
+    from analyze import clear_trade_candidates
+
+    user = update.effective_user
+    if not user:
+        return
+
+    args_upper = [arg.upper() for arg in (context.args or [])]
+    clear_all = "ALL" in args_upper
+
+    if clear_all and not is_admin(user.id):
+        await update.effective_message.reply_text("Bạn không có quyền xóa lệnh nháp của toàn hệ thống.")
+        return
+
+    if "CONFIRM" not in args_upper:
+        if clear_all:
+            await update.effective_message.reply_text(
+                "Lệnh này chỉ xóa lệnh nháp/candidate của toàn hệ thống, KHÔNG xóa /history.\n"
+                "Gõ: /cleardrafts ALL CONFIRM"
+            )
+        else:
+            await update.effective_message.reply_text(
+                "Lệnh này chỉ xóa lệnh nháp/candidate của bạn, KHÔNG xóa /history.\n"
+                "Gõ: /cleardrafts CONFIRM\n"
+                "Admin muốn xóa toàn hệ thống: /cleardrafts ALL CONFIRM"
+            )
+        return
+
+    payload = await asyncio.to_thread(clear_trade_candidates, None if clear_all else user.id)
+    scope_text = "toàn hệ thống" if clear_all else "của bạn"
+    reset_text = "Có" if payload.get("sequence_reset") else "Không, vì vẫn còn candidate của user khác"
+    await update.effective_message.reply_text(
+        f"Đã xóa lệnh nháp {scope_text}. History đã trade vẫn được giữ nguyên.\n"
+        f"Tổng candidate đã xóa: {payload.get('deleted_count', 0)}\n"
+        f"- Nháp còn chờ: {payload.get('draft_count', 0)}\n"
+        f"- Đã hết hạn: {payload.get('expired_count', 0)}\n"
+        f"- Đã bỏ qua: {payload.get('discarded_count', 0)}\n"
+        f"- Đang xác nhận: {payload.get('confirming_count', 0)}\n"
+        f"- Đã xác nhận/copy sang history: {payload.get('confirmed_count', 0)}\n"
+        f"Reset ID lệnh nháp: {reset_text}"
+    )
+
+
 async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from auth import is_admin
     from analyze import auto_check_pending_predictions
@@ -500,6 +545,7 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CommandHandler("dashboardall", dashboardall_command))
     app.add_handler(CommandHandler("clearhistory", clearhistory_command))
+    app.add_handler(CommandHandler("cleardrafts", cleardrafts_command))
     app.add_handler(CommandHandler("checknow", checknow_command))
     app.add_handler(CommandHandler("confirmtrade", confirmtrade_command))
     app.add_handler(CallbackQueryHandler(
@@ -531,4 +577,5 @@ def symbol_control_commands() -> list[BotCommand]:
         BotCommand("history", "Xem lịch sử, có thể gõ /history BTC"),
         BotCommand("dashboard", "Xem dashboard nhanh"),
         BotCommand("confirmtrade", "Lưu lệnh nháp để theo dõi"),
+        BotCommand("cleardrafts", "Xóa lệnh nháp, giữ history"),
     ]
