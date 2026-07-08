@@ -100,7 +100,7 @@ def is_actionable_trade_response(text: str | None) -> bool:
 
 def trade_candidate_keyboard(candidate_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Tôi đã trade theo lệnh này", callback_data=f"{CONFIRM_TRADE_CALLBACK_PREFIX}:{candidate_id}")],
+        [InlineKeyboardButton("✅ Tôi đã đặt lệnh theo phân tích này", callback_data=f"{CONFIRM_TRADE_CALLBACK_PREFIX}:{candidate_id}")],
         [InlineKeyboardButton("Bỏ qua, không lưu history", callback_data=f"{DISCARD_TRADE_CALLBACK_PREFIX}:{candidate_id}")],
     ])
 
@@ -258,7 +258,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         is_last = idx == len(chunks) - 1
         if is_last and show_trade_confirm_button:
             await query.message.reply_text(
-                chunk + "\n\nNếu bạn thật sự vào lệnh theo phân tích này, bấm nút bên dưới để bot lưu vào history và theo dõi WIN/LOSS.",
+                chunk + "\n\nNếu bạn đã đặt lệnh theo phân tích này, bấm nút bên dưới để bot lưu kế hoạch và theo dõi. Nếu Entry chưa khớp, bot sẽ giữ PENDING_ENTRY đến khi giá chạm vùng Entry rồi mới tính WIN/LOSS.",
                 reply_markup=trade_candidate_keyboard(int(candidate_id)),
             )
         else:
@@ -322,7 +322,7 @@ async def confirmtrade_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not user:
         return
     if not context.args:
-        await update.effective_message.reply_text("Cú pháp: /confirmtrade <mã_lệnh_nháp>. Thường bạn chỉ cần bấm nút dưới phân tích.")
+        await update.effective_message.reply_text("Cú pháp: /confirmtrade <mã_lệnh_nháp>. Thường bạn chỉ cần bấm nút dưới phân tích sau khi đã đặt lệnh/chọn theo dõi kế hoạch.")
         return
     try:
         candidate_id = int(context.args[0])

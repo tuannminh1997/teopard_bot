@@ -496,7 +496,12 @@ def confirm_trade_candidate(candidate_id: int, user_id: int | None = None) -> di
 
     try:
         live_price = get_current_price_raw(candidate["symbol"])
-        entry_price = _candidate_entry_price(candidate, live_price)
+        entry_is_live = _price_in_entry_range(
+            live_price,
+            candidate.get("entry_low"),
+            candidate.get("entry_high"),
+        )
+        entry_price = _candidate_entry_price(candidate, live_price) if entry_is_live else None
 
         prediction_id = save_prediction(
             symbol=candidate["symbol"],
@@ -515,7 +520,9 @@ def confirm_trade_candidate(candidate_id: int, user_id: int | None = None) -> di
             chat_id=candidate.get("chat_id"),
         )
 
-        # Vì user bấm "đã trade", bắt đầu theo dõi như lệnh đã khớp thay vì chờ Entry lần nữa.
+        # V36: user bấm nút nghĩa là "đã đặt lệnh/chọn theo dõi kế hoạch này".
+        # Nếu giá hiện tại chưa nằm trong vùng Entry thì vẫn giữ PENDING_ENTRY để auto-check chờ khớp.
+        # Chỉ mark ENTRY_FILLED ngay khi live price thật sự đang nằm trong Entry tại lúc xác nhận.
         if entry_price is not None:
             mark_entry_filled(prediction_id, float(entry_price), utc_now(), candidate["mode"])
 
@@ -530,14 +537,39 @@ def confirm_trade_candidate(candidate_id: int, user_id: int | None = None) -> di
             )
             conn.commit()
 
+        entry_low = candidate.get("entry_low")
+        entry_high = candidate.get("entry_high")
+        entry_text = f"{fmt(entry_low)}–{fmt(entry_high)}" if entry_low is not None and entry_high is not None else "N/A"
+        if entry_price is not None:
+            message = (
+                f"Đã lưu lệnh nháp #{candidate_id} thành lệnh theo dõi #{prediction_id}. "
+                f"Giá hiện tại đang nằm trong vùng Entry nên bot đánh dấu ENTRY_FILLED tại {fmt(entry_price)}."
+            )
+        else:
+            if live_price is None:
+                relation = "Bot chưa lấy được giá hiện tại để kiểm tra khớp Entry."
+            else:
+                low_f, high_f = _range_low_high(entry_low, entry_high)
+                if low_f is not None and high_f is not None:
+                    if float(live_price) < low_f:
+                        relation = f"Giá hiện tại {fmt(live_price)} còn thấp hơn vùng Entry {entry_text}."
+                    elif float(live_price) > high_f:
+                        relation = f"Giá hiện tại {fmt(live_price)} còn cao hơn vùng Entry {entry_text}."
+                    else:
+                        relation = f"Giá hiện tại {fmt(live_price)} đang ở gần vùng Entry {entry_text}."
+                else:
+                    relation = f"Giá hiện tại {fmt(live_price)}; vùng Entry không đủ dữ liệu."
+            message = (
+                f"Đã lưu lệnh nháp #{candidate_id} thành lệnh chờ #{prediction_id}. "
+                f"Entry chưa khớp. {relation} Bot sẽ theo dõi đến khi giá chạm vùng Entry rồi mới tính WIN/LOSS."
+            )
+
         return {
             "ok": True,
             "prediction_id": int(prediction_id),
             "entry_price": entry_price,
-            "message": (
-                f"Đã lưu lệnh nháp #{candidate_id} thành lệnh theo dõi #{prediction_id}. "
-                f"Giá vào theo dõi: {fmt(entry_price)}."
-            ),
+            "entry_status": "ENTRY_FILLED" if entry_price is not None else "PENDING_ENTRY",
+            "message": message,
         }
     except Exception as exc:
         # Nếu lỗi sau khi claim, mở lại DRAFT để user có thể bấm lại sau khi lỗi tạm thời qua đi.
