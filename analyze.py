@@ -5081,23 +5081,41 @@ def build_user_prompt(
     feature_block: str | None = None,
     open_signal_context: str | None = None,
 ) -> str:
-    payload = build_model_input_payload(
-        symbol=symbol,
-        mode=mode,
-        timeframe_data=timeframe_data,
-        fear_greed_info=fear_greed_info,
-        current_price_str=current_price_str,
-        history=history,
-        feature_block=feature_block,
-        open_signal_context=open_signal_context,
-    )
-    payload_json = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    return (
-        "DỮ LIỆU ĐẦU VÀO CHO MODEL Ở DẠNG JSON. "
-        "Hãy đọc JSON này như nguồn dữ liệu duy nhất cho lần phân tích hiện tại. "
-        "Không trả lời theo JSON input; hãy trả về JSON output đúng contract được Python nối thêm phía sau.\n"
-        + payload_json
-    )
+    """Text prompt input cho model chính.
+
+    Bản này cố ý KHÔNG dùng JSON input. LLM nhận dữ liệu như một report kỹ thuật
+    giống các bản ổn định trước đây để giảm token và giữ độ mượt khi phân tích.
+    """
+    mode_label = "SCALP" if mode == "short" else "SWING"
+    timeframe_reports = []
+    for label, df in timeframe_data.items():
+        timeframe_reports.append(summarize_timeframe(label, df))
+
+    parts = [
+        f"PHÂN TÍCH {symbol} — {mode_label}",
+        current_price_str,
+        fear_greed_info,
+        "",
+        "VAI TRÒ TIMEFRAME:",
+        _mode_role_text(mode),
+        "",
+        feature_block or "Dữ liệu kỹ thuật do Python tính sẵn: không có.",
+        "",
+        open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có.",
+        "",
+        format_prediction_history(history),
+        "",
+        "DỮ LIỆU CÁC KHUNG NẾN ĐÃ ĐÓNG:",
+        "\n".join(timeframe_reports),
+        "",
+        "YÊU CẦU OUTPUT:",
+        "- Trả lời bằng text tiếng Việt theo format cũ của bot, KHÔNG trả JSON.",
+        "- Quyết định cuối cùng chỉ là LONG, SHORT hoặc NO TRADE.",
+        "- Nếu LONG/SHORT phải có đủ Entry, SL, TP1, TP2 là số cụ thể.",
+        "- Không in riêng danh sách thanh khoản/heatmap/vùng quét; chỉ dùng nội bộ để chọn Entry/SL/TP và giải thích ngắn.",
+        "- Nếu chưa đủ setup hợp lý thì chọn NO TRADE.",
+    ]
+    return "\n".join(str(x) for x in parts if x is not None)
 
 
 # ─── Tóm tắt reasoning bằng call Haiku thứ 2 (rất ngắn, rẻ) ─────────────────
@@ -6210,6 +6228,21 @@ def sanitize_user_output(output: str) -> str:
 
 
 
+
+def ensure_current_price_line(output: str, current_price: float | None) -> str:
+    """Chèn Giá hiện tại dưới dòng QUYẾT ĐỊNH nếu model text cũ chưa có."""
+    text = output or ""
+    if re.search(r"^\s*Giá\s+hiện\s+tại\s*:", text, flags=re.IGNORECASE | re.MULTILINE):
+        return text
+    price_line = f"Giá hiện tại: {fmt(current_price)} USDT" if current_price is not None else "Giá hiện tại: N/A"
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if re.search(r"QUYẾT\s+ĐỊNH\s*:", line, flags=re.IGNORECASE):
+            lines.insert(i + 1, price_line)
+            return "\n".join(lines)
+    return price_line + "\n" + text
+
+
 def build_no_trade_summary(output: str) -> str:
     text = (output or "").strip().replace("\n", " ")
     if not text:
@@ -6311,8 +6344,9 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         open_signal_context=open_signal_context,
     )
 
-    raw_output = request_json_analysis(system_prompt, user_prompt)
-    output, pred, json_payload = model_output_to_user_text_and_pred(raw_output, binance_symbol, mode, current_price=current_price)
+    raw_output = request_claude_analysis(system_prompt, user_prompt)
+    output = ensure_current_price_line(sanitize_user_output(raw_output), current_price)
+    pred = parse_prediction_from_output(output)
 
     # V32 model-authoritative flow:
     # - Model tự chọn Entry/SL/TP từ dữ liệu Binance + level map Python cung cấp.
@@ -6450,8 +6484,9 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     )
 
     # AI API đang sync, nên gọi trong worker thread để không block bot.
-    raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, user_prompt)
-    output, pred, json_payload = model_output_to_user_text_and_pred(raw_output, binance_symbol, mode, current_price=current_price)
+    raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
+    output = ensure_current_price_line(sanitize_user_output(raw_output), current_price)
+    pred = parse_prediction_from_output(output)
 
     # V32 model-authoritative flow:
     # - Model tự chọn Entry/SL/TP từ dữ liệu Binance + level map Python cung cấp.
@@ -6882,85 +6917,72 @@ def get_auto_scan_runtime_status(user_id: int) -> dict:
     }
 
 
-def _compact_timeframe_for_deepseek(label: str, tf: dict, limit: int) -> dict:
-    candles = tf.get("recent_closed_candles") or []
-    if limit > 0:
-        candles = candles[-limit:]
-    return {
-        "label": label,
-        "role": tf.get("role"),
-        "role_description": tf.get("role_description"),
-        "has_data": tf.get("has_data"),
-        "analysis_closed_candle": tf.get("analysis_closed_candle"),
-        "indicators": tf.get("indicators"),
-        "price_structure_50_closed_candles": tf.get("price_structure_50_closed_candles"),
-        "recent_closed_candles": candles,
-        "live_candle_reference_only": tf.get("live_candle_reference_only"),
-    }
+def build_deepseek_prefilter_text(
+    symbol: str,
+    mode: str,
+    current_price_str: str,
+    feature_snapshot: str | None,
+    feature_block: str | None,
+    history: list[dict],
+    open_signal_context: str | None,
+) -> str:
+    """Text input rút gọn cho DeepSeek prefilter, không dùng JSON.
+
+    DeepSeek chỉ chấm sơ bộ LONG/SHORT score để quyết định có gọi GLM không.
+    Không tạo Entry/SL/TP và không gửi user.
+    """
+    mode_label = "SCALP" if mode == "short" else "SWING"
+    history_text = format_prediction_history(history[:3]) if history else "Không có lịch sử đã trade cho coin/mode này."
+    compact_feature = (feature_snapshot or feature_block or "Không có feature snapshot.")
+    return "\n".join([
+        f"AUTO SCAN PREFILTER — {symbol} {mode_label}",
+        current_price_str,
+        "Nhiệm vụ: chỉ lọc nhanh xem có đáng gọi GLM phân tích sâu không.",
+        "Không chốt lệnh, không tạo Entry/SL/TP, không gửi user.",
+        "Hãy so sánh LONG và SHORT rồi chấm điểm từng hướng từ 0-100.",
+        "Nếu cả hai yếu, vẫn ghi điểm thấp cho cả hai; không dùng NO TRADE để chặn cứng.",
+        "",
+        "SNAPSHOT KỸ THUẬT RÚT GỌN:",
+        compact_feature,
+        "",
+        open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có.",
+        "",
+        "LỊCH SỬ USER RÚT GỌN:",
+        history_text,
+        "",
+        "FORMAT TRẢ VỀ BẮT BUỘC, KHÔNG JSON:",
+        "LONG_SCORE: <số 0-100>",
+        "SHORT_SCORE: <số 0-100>",
+        "BEST: LONG hoặc SHORT",
+        "REASON: <một câu rất ngắn>",
+    ])
 
 
-def build_deepseek_prefilter_payload(payload: dict) -> dict:
-    """Rút gọn input cho DeepSeek: đủ để lọc sơ bộ, không tốn như GLM full."""
-    mode_internal = ((payload.get("task") or {}).get("mode_internal") or "short").lower()
-    candle_limits = {"15M": 40, "1H": 40, "4H": 30, "1D": 20, "1W": 20} if mode_internal == "short" else {"1H": 40, "4H": 50, "1D": 50, "1W": 30}
-    timeframes = payload.get("timeframes") or {}
-    compact_tfs = {
-        label: _compact_timeframe_for_deepseek(label, tf, candle_limits.get(label, 20))
-        for label, tf in timeframes.items()
-        if isinstance(tf, dict)
-    }
-    features = payload.get("python_calculated_features") or {}
-    history = payload.get("user_specific_learning") or {}
-    history_items = history.get("items") or []
-    compact_history = {
-        "count": history.get("count"),
-        "closed_count": history.get("closed_count"),
-        "win_rate_pct": history.get("win_rate_pct"),
-        "items": [
-            {
-                "direction": x.get("direction"),
-                "entry_low": x.get("entry_low"),
-                "entry_high": x.get("entry_high"),
-                "sl": x.get("sl"),
-                "tp1": x.get("tp1"),
-                "tp2": x.get("tp2"),
-                "result": x.get("result"),
-                "result_reason": x.get("result_reason"),
-            }
-            for x in history_items[:3]
-        ],
-    }
+def _parse_deepseek_prefilter_text(text: str | None) -> dict:
+    raw = text or ""
+    def score(name: str) -> int:
+        m = re.search(rf"{name}\s*[:=]\s*(\d+(?:\.\d+)?)", raw, flags=re.IGNORECASE)
+        if not m:
+            return 0
+        try:
+            return max(0, min(100, int(float(m.group(1)))))
+        except Exception:
+            return 0
+    long_score = score("LONG_SCORE")
+    short_score = score("SHORT_SCORE")
+    best_match = re.search(r"BEST\s*[:=]\s*(LONG|SHORT)", raw, flags=re.IGNORECASE)
+    best = (best_match.group(1).upper() if best_match else ("LONG" if long_score >= short_score else "SHORT"))
+    reason_match = re.search(r"REASON\s*[:=]\s*(.+)", raw, flags=re.IGNORECASE | re.DOTALL)
+    reason = reason_match.group(1).strip()[:300] if reason_match else raw.strip()[:300]
     return {
-        "schema_version": "teopard_deepseek_prefilter_v2_compact",
-        "task": {
-            **(payload.get("task") or {}),
-            "auto_scan_prefilter": True,
-            "min_signal_score_to_call_glm": AUTO_SCAN_MIN_PREFILTER_CONFIDENCE,
-            "instruction": "Fast prefilter only. You MUST always choose candidate_direction as LONG or SHORT whenever Binance data is readable. Never answer NO_TRADE in normal market conditions; weak setup must be LONG/SHORT with a low signal_score.",
-        },
-        "market": payload.get("market"),
-        "python_calculated_features": {
-            "risk_reference": features.get("risk_reference"),
-            "minimum_stop_distance": features.get("minimum_stop_distance"),
-            "structural_sl_buffer": features.get("structural_sl_buffer"),
-            "structure": features.get("structure"),
-            "liquidity_zones_estimated_from_ohlcv": features.get("liquidity_zones_estimated_from_ohlcv"),
-        },
-        "timeframes": compact_tfs,
-        "raw_candle_context": {
-            "closed_candles_only_rule": (payload.get("raw_candle_context") or {}).get("closed_candles_only_rule"),
-        },
-        "user_specific_learning": compact_history,
-        "open_signal_context": payload.get("open_signal_context"),
-        "deepseek_rules": [
-            "This is not the final analysis. Do not create Entry/SL/TP for user.",
-            "You must compare LONG and SHORT and pick the better candidate_direction as LONG or SHORT whenever market data is readable.",
-            "Weak setup is still a LONG/SHORT candidate with a low signal_score; do not convert weak setup into NO_TRADE.",
-            "signal_score means strength of the best LONG/SHORT candidate, not confidence of NO TRADE.",
-            "should_call_glm=true when candidate_direction is LONG/SHORT and signal_score >= min_signal_score_to_call_glm.",
-            "Do not use NO_TRADE. If both sides are weak, choose the less weak side and give a low signal_score.",
-        ],
+        "long_score": long_score,
+        "short_score": short_score,
+        "best_direction": best,
+        "best_score": max(long_score, short_score),
+        "reason": reason,
+        "raw_text": raw[:1000],
     }
+
 
 def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEEPSEEK_TIMEOUT_SECONDS) -> dict:
     if not DEEPSEEK_API_KEY:
@@ -6994,29 +7016,24 @@ def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEE
     return {"text": content, "usage": data.get("usage"), "stop_reason": choice.get("finish_reason")}
 
 
-def request_deepseek_prefilter(payload: dict) -> dict:
-    """DeepSeek chỉ lọc sơ bộ, không tạo tín hiệu gửi user."""
-    compact_payload = build_deepseek_prefilter_payload(payload)
+def request_deepseek_prefilter(prefilter_text: str) -> dict:
+    """DeepSeek lọc sơ bộ bằng text input/output, không dùng JSON contract."""
     prompt = (
-        "Bạn là bộ lọc nhanh cho Teopard Auto Scan. Chỉ đọc JSON input, không bịa dữ liệu. "
-        "Nhiệm vụ của bạn KHÔNG phải chốt lệnh, mà là chấm xem có đáng gọi GLM phân tích sâu không. "
-        "Hãy luôn so sánh nhanh LONG và SHORT, rồi BẮT BUỘC chọn hướng nhỉnh hơn làm candidate_direction. "
-        "Không được trả NO_TRADE. Nếu tín hiệu yếu thì vẫn chọn LONG hoặc SHORT và cho signal_score thấp. "
-        ""
-        "Trả về DUY NHẤT một JSON object hợp lệ, không markdown. "
-        "Schema bắt buộc: {\"long_score\":0-100,\"short_score\":0-100,\"best_direction\":\"LONG|SHORT\",\"best_score\":0-100,"
-        "\"long_score\":0-100,\"short_score\":0-100,\"should_call_glm\":true/false,\"reason\":\"lý do rất ngắn\"}. "
-        f"should_call_glm=true khi best_score >= {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}. "
-        "Nếu cả LONG và SHORT đều yếu, vẫn chấm điểm cả hai thấp; không dùng NO_TRADE. best_direction là hướng có điểm cao hơn.\n"
-        + json.dumps(compact_payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        "Bạn là bộ lọc nhanh cho Teopard Auto Scan. Không bịa dữ liệu. "
+        "Bạn KHÔNG chốt lệnh, chỉ chấm điểm sơ bộ LONG/SHORT để quyết định có gọi GLM không. "
+        "Bắt buộc trả đúng 4 dòng text, không JSON, không markdown:\n"
+        "LONG_SCORE: <số 0-100>\n"
+        "SHORT_SCORE: <số 0-100>\n"
+        "BEST: LONG hoặc SHORT\n"
+        "REASON: <một câu rất ngắn>\n\n"
+        + prefilter_text
     )
     retry_count = max(0, LLM_API_RETRIES)
     last_exc = None
     for retry_idx in range(retry_count + 1):
         try:
             result = _deepseek_create_once(system=None, messages=[{"role": "user", "content": prompt}])
-            parsed = _extract_json_object(result.get("text") or "") or {}
-            return parsed if isinstance(parsed, dict) else {}
+            return _parse_deepseek_prefilter_text(result.get("text") or "")
         except Exception as exc:
             last_exc = exc
             if retry_idx >= retry_count or not _is_transient_llm_error(exc):
@@ -7028,8 +7045,7 @@ def request_deepseek_prefilter(payload: dict) -> dict:
                 pass
     if last_exc:
         raise last_exc
-    return {}
-
+    return {"long_score": 0, "short_score": 0, "best_direction": "LONG", "best_score": 0, "reason": "DeepSeek không trả được kết quả."}
 
 def _payload_confidence(payload: dict | None) -> int | None:
     try:
@@ -7086,18 +7102,17 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
     market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
     open_signal_context = format_open_signal_context(open_signals, current_price)
-    payload = build_model_input_payload(
+    prefilter_text = build_deepseek_prefilter_text(
         symbol=binance_symbol,
         mode=mode,
-        timeframe_data=timeframe_data,
-        fear_greed_info=fear_greed_info,
         current_price_str=current_price_str,
-        history=history,
+        feature_snapshot=feature_snapshot,
         feature_block=feature_block,
+        history=history,
         open_signal_context=open_signal_context,
     )
 
-    prefilter = await asyncio.to_thread(request_deepseek_prefilter, payload)
+    prefilter = await asyncio.to_thread(request_deepseek_prefilter, prefilter_text)
 
     # DeepSeek prefilter V3: score both sides, then threshold decides whether to call GLM.
     # This avoids fake logs like "LONG 0%" when DeepSeek did not really find a LONG setup.
@@ -7161,10 +7176,11 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         feature_block=feature_block,
         open_signal_context=open_signal_context,
     )
-    raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, user_prompt)
-    output, pred, json_payload = model_output_to_user_text_and_pred(raw_output, binance_symbol, mode, current_price=current_price)
+    raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
+    output = ensure_current_price_line(sanitize_user_output(raw_output), current_price)
+    pred = parse_prediction_from_output(output)
     direction = (pred.get("direction") or "").upper()
-    final_conf = _payload_confidence(json_payload) or _payload_confidence({"confidence": pred.get("confidence")}) or 0
+    final_conf = int(pred.get("confidence") or _extract_confidence_from_output(output) or 0)
 
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:

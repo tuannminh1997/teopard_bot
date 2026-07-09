@@ -146,46 +146,12 @@ Cập nhật V19 - lưu history theo xác nhận user:
 - /clearhistory báo riêng số lệnh đã trade/đang theo dõi, tổng dòng predictions cũ và số lệnh nháp bị xóa.
 - /cleardrafts chỉ xóa bảng lệnh nháp/candidate, không đụng lịch sử đã trade.
 
-
-Ghi chú JSON nội bộ:
-- Bot hiện yêu cầu model trả JSON nội bộ để giảm lỗi parse Entry/SL/TP.
-- Người dùng vẫn thấy format phân tích cũ trên Telegram, không thấy JSON thô.
-- Nếu JSON lỗi, bot fallback parser cũ để hạn chế gián đoạn.
-
-Ghi chú kỹ thuật mới:
-- Bot đã chuyển dữ liệu đầu vào gửi vào model sang JSON nội bộ.
-- User vẫn thấy format phân tích như cũ.
-- Việc dùng JSON input/output giúp giảm lỗi parse, giảm hiểu nhầm giữa dữ liệu kỹ thuật, history, kế hoạch đang mở và output gửi user.
-
-Cập nhật hiển thị:
-- Mỗi phân tích hiện in thêm `Giá hiện tại: ... USDT` ngay dưới dòng `QUYẾT ĐỊNH`, áp dụng cho cả LONG/SHORT và NO TRADE.
-
-Cập nhật JSON input data contract V2:
-- SCALP: 15M gửi 120 nến để canh Entry/timing; 1H gửi 200 nến làm setup; 4H gửi 150 nến làm bias; 1D gửi 80 nến làm bối cảnh.
-- SWING: 1H gửi 120 nến làm timing phụ; 4H gửi 220 nến làm setup/Entry; 1D gửi 220 nến làm trend chính; 1W gửi 120 nến làm macro.
-- Bot gửi rõ role từng timeframe trong JSON cho model để tránh nhầm 15M/1H thành xu hướng chính sai vai trò.
-
-Ghi chú timeout AI:
-Nếu bot báo `Read timed out` khi gọi Z.AI/OpenRouter, thường là provider phản hồi chậm tạm thời. Bản này có retry tự động trước khi báo lỗi. Nếu lỗi xảy ra nhiều, admin có thể giảm ZAI_REASONING_EFFORT hoặc LLM_MAX_OUTPUT_TOKENS trên Railway.
-
 6. Auto Scan Mode
-/autoscanon BTC - Bật Auto Scan cho BTC. Có thể dùng /autoscanon BTC
+/autoscanon BTC - Bật Auto Scan cho BTCUSDT
 /autoscanoff - Tắt Auto Scan
 /autoscanstatus - Xem trạng thái Auto Scan
+/autoscanlog - Xem log các lần quét gần nhất
 
-Auto Scan chạy riêng với phân tích thủ công. Mặc định mỗi 15 phút bot lấy data Binance, dùng DeepSeek lọc nhanh trước. Nếu tín hiệu đủ tốt, bot mới gọi GLM/Z.AI phân tích đầy đủ. Nếu kết quả cuối đủ confidence, bot sẽ tự gửi tín hiệu và tự lưu theo dõi, không cần bấm nút “Tôi đã đặt lệnh theo phân tích này”.
+Auto Scan là mode riêng, quét theo nến đã đóng. DeepSeek lọc nhanh trước; nếu tín hiệu đủ tốt mới gọi GLM phân tích đầy đủ như mode thủ công. Nếu GLM đủ ngưỡng confidence thì bot tự gửi tín hiệu và tự lưu theo dõi, không cần bấm nút xác nhận.
 
-Auto Scan V2:
-/autoscanon BTC - Bật Auto Scan cho 1 symbol.
-/autoscanoff - Tắt Auto Scan.
-/autoscanstatus - Xem lần quét gần nhất, lần quét kế tiếp và kết quả pipeline gần nhất.
-/autoscanlog - Xem log các lần quét gần nhất.
-
-Auto Scan quét theo nhịp nến đã đóng, ví dụ 00/15/30/45 nếu chu kỳ là 15 phút. DeepSeek chỉ nhận payload rút gọn để lọc nhanh; GLM nhận full data như mode thủ công.
-
-Ghi chú Auto Scan scheduler:
-- AUTO_SCAN_SCHEDULER_TICK_SECONDS="60" nghĩa là bot chỉ wake-up kiểm tra slot mỗi 60 giây.
-- AUTO_SCAN_DEBUG="0" sẽ ẩn log skip lặp lại trên Railway.
-- Bot vẫn chỉ gọi Binance/DeepSeek/GLM khi tới slot nến đóng mới.
-
-Ghi chú kỹ thuật: JSON input đã được tối ưu token bằng dạng nến compact columns/rows. Format hiển thị cho user không đổi.
+Auto Scan chỉ cho 1 symbol/tài khoản để tiết kiệm tài nguyên. Ví dụ: /autoscanon BTC
