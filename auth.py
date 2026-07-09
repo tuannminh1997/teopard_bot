@@ -17,7 +17,7 @@ VERIFY_CALLBACK = "verify_account"
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 KNOWN_COMMAND_PATTERN = (
     r"^/(start|whoami|adduser|removeuser|listusers|help|"
-    r"addsymbol|removesymbol|listsymbols|setlimit|resetusage|stats|statsall|history|historyall|dashboard|dashboardall|clearhistory|cleardrafts|checknow)(@\w+)?(\s|$)"
+    r"addsymbol|removesymbol|listsymbols|setlimit|resetusage|stats|statsall|history|historyall|dashboard|dashboardall|clearhistory|cleardrafts|checknow|autoscanon|autoscanoff|autoscanstatus|autoscanlog)(@\w+)?(\s|$)"
 )
 
 verified_users: set[int] = set()

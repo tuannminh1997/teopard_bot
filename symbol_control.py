@@ -530,6 +530,245 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from auth import is_account_activated
+    from analyze import (
+        set_auto_scan_enabled, _normalize_auto_scan_modes, AUTO_SCAN_INTERVAL_SECONDS,
+        AUTO_SCAN_MIN_PREFILTER_CONFIDENCE, AUTO_SCAN_MIN_FINAL_CONFIDENCE, normalize_auto_scan_symbol
+    )
+
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    if not is_account_activated(user.id):
+        from auth import show_start_menu, verified_users
+        verified_users.discard(user.id)
+        await show_start_menu(update)
+        return
+
+    if not context.args:
+        await message.reply_text(
+            "Cú pháp: /autoscanon BTC\n"
+            "Ví dụ: /autoscanon btc\n"
+            "Auto Scan chỉ chạy 1 symbol tại một thời điểm cho mỗi tài khoản."
+        )
+        return
+
+    raw_symbols = context.args
+    symbols = []
+    seen = set()
+    for raw in raw_symbols:
+        for part in str(raw).replace(",", " ").split():
+            sym = normalize_auto_scan_symbol(part)
+            if sym and sym not in seen:
+                symbols.append(sym)
+                seen.add(sym)
+
+    if not symbols:
+        await message.reply_text("Không đọc được symbol. Ví dụ đúng: /autoscanon BTC")
+        return
+    if len(symbols) > 1:
+        await message.reply_text(
+            "Auto Scan chỉ cho quét 1 symbol tại một thời điểm để tiết kiệm tài nguyên.\n"
+            "Ví dụ đúng: /autoscanon BTC\n"
+            "Muốn đổi symbol thì gõ lại /autoscanon <symbol_mới>."
+        )
+        return
+
+    # Chỉ cho bật auto scan symbol đã nằm trong danh sách được phép.
+    not_allowed = []
+    for sym in symbols:
+        base = sym[:-4] if sym.endswith("USDT") else sym
+        if not is_allowed_symbol(base) and not is_allowed_symbol(sym):
+            not_allowed.append(base)
+    if not_allowed:
+        await message.reply_text(
+            "Symbol chưa có trong danh sách được phép: " + ", ".join(not_allowed) +
+            "\nAdmin cần thêm bằng /addsymbol <symbol> trước."
+        )
+        return
+
+    await asyncio.to_thread(set_auto_scan_enabled, user.id, message.chat_id, True, symbols)
+    modes = ", ".join("SCALP" if m == "short" else "SWING" for m in _normalize_auto_scan_modes())
+    await message.reply_text(
+        "Đã bật Auto Scan cho tài khoản của bạn.\n"
+        f"Symbol đang quét: {symbols[0]}.\n"
+        f"Chu kỳ quét: mỗi {int(AUTO_SCAN_INTERVAL_SECONDS // 60)} phút.\n"
+        f"Mode đang quét: {modes}.\n"
+        f"DeepSeek lọc nhanh tối thiểu: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}%.\n"
+        f"GLM gửi tín hiệu tối thiểu: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%.\n"
+        "Khi có tín hiệu đủ tốt, bot sẽ tự gửi và tự lưu theo dõi, không cần bấm xác nhận."
+    )
+
+async def autoscanoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import set_auto_scan_enabled
+
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    await asyncio.to_thread(set_auto_scan_enabled, user.id, message.chat_id, False)
+    await message.reply_text("Đã tắt Auto Scan cho tài khoản của bạn.")
+
+
+
+
+def _display_scan_direction(value) -> str:
+    raw = str(value or "-").strip().upper().replace("_", " ")
+    if raw in {"", "-"}:
+        return "-"
+    if raw in {"NO TRADE", "NO  TRADE", "NOTRADE"}:
+        return "NO TRADE"
+    return raw
+
+
+
+
+def _display_scan_stage(stage, status=None) -> str:
+    stage_raw = str(stage or "-").lower()
+    status_raw = str(status or "-").lower()
+    stage_map = {
+        "deepseek": "DeepSeek",
+        "glm": "GLM",
+        "binance": "Binance",
+        "cooldown": "Cooldown",
+        "sent": "Đã gửi",
+        "error": "Lỗi",
+    }
+    status_map = {
+        "rejected": "bỏ qua",
+        "skipped": "bỏ qua",
+        "error": "lỗi",
+        "sent": "đã gửi",
+        "ok": "đã gửi",
+    }
+    return f"{stage_map.get(stage_raw, stage_raw.upper() if stage_raw != '-' else '-')} → {status_map.get(status_raw, status_raw)}"
+
+
+def _display_scan_reason(reason) -> str:
+    text = str(reason or "-").strip()
+    if not text or text == "-":
+        return "-"
+    lower = text.lower()
+    replacements = {
+        "prefilter rejected: no actionable long/short signal": "DeepSeek bỏ qua vì tín hiệu chưa đạt ngưỡng.",
+        "prefilter rejected: no actionable long/short structure": "DeepSeek bỏ qua vì tín hiệu chưa đạt ngưỡng.",
+        "deepseek không chọn được hướng long/short để gửi glm.": "DeepSeek bỏ qua vì tín hiệu chưa đạt ngưỡng.",
+        "glm returned no trade": "GLM chọn NO TRADE sau phân tích đầy đủ.",
+        "cooldown": "Đang trong thời gian chờ, chưa gửi lại tín hiệu cùng symbol/mode.",
+        "direction cooldown": "Đang trong thời gian chờ, chưa gửi lại tín hiệu cùng hướng.",
+        "no binance data": "Không lấy được dữ liệu Binance.",
+    }
+    if lower in replacements:
+        return replacements[lower]
+    # Clean older English prefixes if any remain.
+    text = text.replace("prefilter rejected:", "DeepSeek bỏ qua:").replace("final rejected:", "GLM bỏ qua:")
+    text = text.replace("signal score", "điểm tín hiệu").replace("below", "dưới ngưỡng")
+    return text
+
+def _display_scan_score(direction, confidence, *, source: str) -> str:
+    label = _display_scan_direction(direction)
+    if label == "-":
+        return "Chưa gọi" if source == "glm" else "-"
+    if label == "NO TRADE":
+        return "NO TRADE"
+    if confidence is None:
+        return f"{label} -%"
+    return f"{label} {confidence}%"
+
+async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import (
+        get_auto_scan_runtime_status, _parse_auto_scan_symbols_text, _auto_scan_symbols_from_env_or_db,
+        _normalize_auto_scan_modes, AUTO_SCAN_INTERVAL_SECONDS, AUTO_SCAN_MIN_PREFILTER_CONFIDENCE,
+        AUTO_SCAN_MIN_FINAL_CONFIDENCE, AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES, DEEPSEEK_MODEL,
+        _auto_scan_format_dt,
+    )
+
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    status = await asyncio.to_thread(get_auto_scan_runtime_status, user.id)
+    symbols = _parse_auto_scan_symbols_text(status.get("symbols")) or await asyncio.to_thread(_auto_scan_symbols_from_env_or_db)
+    modes = ", ".join("SCALP" if m == "short" else "SWING" for m in _normalize_auto_scan_modes())
+    last_log = status.get("last_log") or {}
+    last_line = "Chưa có log scan."
+    if last_log:
+        pre = _display_scan_score(last_log.get('pre_direction'), last_log.get('pre_confidence'), source="deepseek")
+        final = _display_scan_score(last_log.get('final_direction'), last_log.get('final_confidence'), source="glm")
+        last_line = (
+            f"{_auto_scan_format_dt(last_log.get('scanned_at'))} | "
+            f"{last_log.get('symbol')} {'SCALP' if last_log.get('mode') == 'short' else 'SWING'} | "
+            f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
+            f"DeepSeek: {pre} | GLM: {final} | {_display_scan_reason(last_log.get('reason'))}"
+        )
+    await message.reply_text(
+        "🤖 Auto Scan status:\n"
+        f"Trạng thái: {'🟢 ĐANG BẬT' if status.get('enabled') else '🔴 ĐANG TẮT'}\n"
+        f"Symbol: {', '.join(symbols) if symbols else 'chưa chọn'}\n"
+        f"Chu kỳ nến: {int(AUTO_SCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng\n"
+        f"Mode: {modes}\n"
+        "Giới hạn: 1 symbol/tài khoản\n"
+        f"DeepSeek model: {DEEPSEEK_MODEL}\n"
+        f"Ngưỡng lọc nhanh: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}%\n"
+        f"Ngưỡng gửi tín hiệu: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%\n"
+        f"Cooldown cùng symbol/mode: {AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES} phút\n"
+        f"Lần quét gần nhất: {_auto_scan_format_dt(status.get('last_scan_at'))}\n"
+        f"Lần quét kế tiếp: {_auto_scan_format_dt(status.get('next_scan_at'))}\n"
+        f"Log gần nhất: {last_line}"
+    )
+
+
+async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import get_auto_scan_logs, _auto_scan_format_dt
+
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    logs = await asyncio.to_thread(get_auto_scan_logs, user.id, 20)
+    if not logs:
+        await message.reply_text("Chưa có log Auto Scan nào. Bot sẽ có log sau lần quét đầu tiên theo nến đóng.")
+        return
+    lines = ["🧾 Auto Scan log gần nhất:"]
+    for item in reversed(logs):
+        mode_label = "SCALP" if item.get("mode") == "short" else "SWING"
+        pre = _display_scan_score(item.get('pre_direction'), item.get('pre_confidence'), source="deepseek")
+        final = _display_scan_score(item.get('final_direction'), item.get('final_confidence'), source="glm")
+        pid = f" | prediction #{item.get('prediction_id')}" if item.get("prediction_id") else ""
+        lines.append(
+            f"\n{_auto_scan_format_dt(item.get('scanned_at'))}\n"
+            f"{item.get('symbol')} {mode_label}\n"
+            f"Kết quả: {_display_scan_stage(item.get('stage'), item.get('status'))}\n"
+            f"DeepSeek: {pre}\n"
+            f"GLM: {final}\n"
+            f"Ghi chú: {_display_scan_reason(item.get('reason'))}{pid}"
+        )
+    await message.reply_text("\n".join(lines))
+
+
+async def job_auto_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    from analyze import run_auto_scan_once
+
+    try:
+        payload = await run_auto_scan_once(bot=context.bot)
+        if payload.get("skipped"):
+            from analyze import AUTO_SCAN_DEBUG
+            if AUTO_SCAN_DEBUG:
+                print(f"[AUTO_SCAN] skipped: {payload.get('reason')} next={payload.get('next_scan_at')}", flush=True)
+        else:
+            print(
+                "[AUTO_SCAN] Done: "
+                f"users={payload.get('users', 0)}, symbols={payload.get('symbols', 0)}, "
+                f"checked={payload.get('checked', 0)}, sent={payload.get('sent', 0)}, errors={payload.get('errors', 0)}, "
+                f"next={payload.get('next_scan_at')}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[AUTO_SCAN] Job failed: {exc}", flush=True)
+
+
 # ─── Register ────────────────────────────────────────────────────────────────
 
 def register_symbol_handlers(app: Application) -> None:
@@ -547,6 +786,10 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("clearhistory", clearhistory_command))
     app.add_handler(CommandHandler("cleardrafts", cleardrafts_command))
     app.add_handler(CommandHandler("checknow", checknow_command))
+    app.add_handler(CommandHandler("autoscanon", autoscanon_command))
+    app.add_handler(CommandHandler("autoscanoff", autoscanoff_command))
+    app.add_handler(CommandHandler("autoscanstatus", autoscanstatus_command))
+    app.add_handler(CommandHandler("autoscanlog", autoscanlog_command))
     app.add_handler(CommandHandler("confirmtrade", confirmtrade_command))
     app.add_handler(CallbackQueryHandler(
         confirm_trade_callback,
@@ -568,6 +811,17 @@ def register_symbol_handlers(app: Application) -> None:
         print("JobQueue is not available. Install python-telegram-bot[job-queue].")
     else:
         app.job_queue.run_repeating(job_check_predictions, interval=3600, first=300)
+        try:
+            # Job chỉ wake-up để kiểm tra slot nến đóng; không gọi Binance/LLM nếu slot đã scan.
+            from analyze import AUTO_SCAN_SCHEDULER_TICK_SECONDS
+            app.job_queue.run_repeating(
+                job_auto_scan,
+                interval=AUTO_SCAN_SCHEDULER_TICK_SECONDS,
+                first=10,
+                job_kwargs={"misfire_grace_time": 60},
+            )
+        except Exception as exc:
+            print(f"Auto Scan job was not started: {exc}", flush=True)
 
 
 def symbol_control_commands() -> list[BotCommand]:
@@ -578,4 +832,8 @@ def symbol_control_commands() -> list[BotCommand]:
         BotCommand("dashboard", "Xem dashboard nhanh"),
         BotCommand("confirmtrade", "Lưu lệnh nháp để theo dõi"),
         BotCommand("cleardrafts", "Xóa lệnh nháp, giữ history"),
+        BotCommand("autoscanon", "Bật Auto Scan"),
+        BotCommand("autoscanoff", "Tắt Auto Scan"),
+        BotCommand("autoscanstatus", "Trạng thái Auto Scan"),
+        BotCommand("autoscanlog", "Log Auto Scan"),
     ]

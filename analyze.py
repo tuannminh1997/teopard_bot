@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -82,6 +83,39 @@ ZAI_TEMPERATURE = _env_float("ZAI_TEMPERATURE", 0.10)
 
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "8000"))
 LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "2"))
+# Timeout/retry cho provider AI. Z.AI/OpenRouter thỉnh thoảng timeout tạm thời,
+# nên retry ngắn giúp bot không chết chỉ vì một request bị treo.
+LLM_MAIN_TIMEOUT_SECONDS = int(os.getenv("LLM_MAIN_TIMEOUT_SECONDS", "180"))
+LLM_SUMMARY_TIMEOUT_SECONDS = int(os.getenv("LLM_SUMMARY_TIMEOUT_SECONDS", "60"))
+LLM_API_RETRIES = int(os.getenv("LLM_API_RETRIES", "2"))
+LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
+
+# ─── Auto Scan mode config ──────────────────────────────────────────────────
+# Auto Scan là mode riêng: DeepSeek lọc nhanh mỗi 15 phút, GLM/Z.AI phân tích sâu
+# chỉ khi prefilter thấy tín hiệu đủ tốt.
+AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
+AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
+AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "62"))
+AUTO_SCAN_MIN_FINAL_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", "60"))
+AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES", "180"))
+AUTO_SCAN_MAX_SYMBOLS_PER_RUN = 1  # Auto Scan chỉ cho 1 symbol/user để tránh lãng phí tài nguyên.
+AUTO_SCAN_SEND_NO_TRADE = os.getenv("AUTO_SCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
+AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS", "5"))
+# Job scheduler only wakes up to check whether a candle-close slot is due.
+# It does NOT call Binance/LLM unless should_run_auto_scan_now() returns true.
+AUTO_SCAN_SCHEDULER_TICK_SECONDS = max(30, int(os.getenv("AUTO_SCAN_SCHEDULER_TICK_SECONDS", "60") or "60"))
+AUTO_SCAN_LOG_LIMIT = int(os.getenv("AUTO_SCAN_LOG_LIMIT", "20"))
+AUTO_SCAN_DEBUG = os.getenv("AUTO_SCAN_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+# DeepSeek filter: dùng OpenAI-compatible Chat Completions. Mặc định trỏ OpenRouter
+# để bạn có thể dùng deepseek/deepseek-v4-flash hoặc model tương đương trên Railway.
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek/deepseek-v4-flash")
+DEEPSEEK_APP_NAME = os.getenv("DEEPSEEK_APP_NAME", "Teopard Auto Scan")
+DEEPSEEK_TIMEOUT_SECONDS = int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "60"))
+DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "700"))
+DEEPSEEK_TEMPERATURE = _env_float("DEEPSEEK_TEMPERATURE", 0.05)
 # Call tóm tắt reasoning dùng token riêng và KHÔNG continuation để tránh model đốt token reasoning ẩn.
 LLM_SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_SUMMARY_MAX_OUTPUT_TOKENS", "600"))
 # Mặc định tắt reasoning cho summary. Phân tích chính vẫn dùng provider-specific reasoning effort nếu bạn set.
@@ -4662,6 +4696,381 @@ def format_prediction_history(history: list[dict]) -> str:
     return "\n".join(lines)
 
 
+
+def _json_safe_value(value):
+    """Convert numpy/pandas values into strict JSON-safe Python primitives."""
+    try:
+        if value is None:
+            return None
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating,)):
+            value = float(value)
+        if isinstance(value, float):
+            return value if np.isfinite(value) else None
+        if isinstance(value, (datetime, pd.Timestamp)):
+            return value.isoformat()
+    except Exception:
+        pass
+    return value
+
+
+def _json_float(value, decimals: int | None = None):
+    try:
+        if value is None or pd.isna(value):
+            return None
+        v = float(value)
+        if not np.isfinite(v):
+            return None
+        return round(v, decimals) if decimals is not None else v
+    except Exception:
+        return None
+
+
+def _json_candle(row) -> dict:
+    open_ = _json_float(row.get("open"))
+    high = _json_float(row.get("high"))
+    low = _json_float(row.get("low"))
+    close = _json_float(row.get("close"))
+    volume = _json_float(row.get("volume"))
+    rng = None
+    body_pct = upper_pct = lower_pct = None
+    if None not in (open_, high, low, close):
+        rng = max(float(high) - float(low), 1e-12)
+        body_pct = abs(float(close) - float(open_)) / rng * 100
+        upper_pct = (float(high) - max(float(open_), float(close))) / rng * 100
+        lower_pct = (min(float(open_), float(close)) - float(low)) / rng * 100
+    taker_buy_ratio_pct = None
+    try:
+        if volume and volume > 0:
+            taker_buy_ratio_pct = float(row.get("taker_buy_volume", 0) or 0) / float(volume) * 100
+    except Exception:
+        taker_buy_ratio_pct = None
+    return {
+        "timestamp": str(row.get("timestamp"))[:19] if row.get("timestamp") is not None else None,
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": volume,
+        "volume_ratio": _json_float(row.get("vol_ratio"), 4),
+        "taker_buy_ratio_pct": _json_float(taker_buy_ratio_pct, 2),
+        "body_pct": _json_float(body_pct, 2),
+        "upper_wick_pct": _json_float(upper_pct, 2),
+        "lower_wick_pct": _json_float(lower_pct, 2),
+        "direction": "green" if close is not None and open_ is not None and close > open_ else "red" if close is not None and open_ is not None and close < open_ else "doji",
+    }
+
+
+def _short_ts(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    # YYYY-MM-DD HH:MM is enough for model ordering and saves tokens vs full ISO.
+    return text[:16]
+
+
+def _json_candle_row(row) -> list:
+    """Compact candle row for LLM input.
+
+    Repeating JSON keys per candle can explode prompt tokens. This row format
+    keeps one shared columns list per timeframe and stores each candle as an
+    array: [t,o,h,l,c,v,vr,tb,body,uw,lw,d].
+    """
+    candle = _json_candle(row)
+    direction = candle.get("direction")
+    d = "g" if direction == "green" else "r" if direction == "red" else "d"
+    return [
+        _short_ts(candle.get("timestamp")),
+        candle.get("open"),
+        candle.get("high"),
+        candle.get("low"),
+        candle.get("close"),
+        candle.get("volume"),
+        candle.get("volume_ratio"),
+        candle.get("taker_buy_ratio_pct"),
+        candle.get("body_pct"),
+        candle.get("upper_wick_pct"),
+        candle.get("lower_wick_pct"),
+        d,
+    ]
+
+
+def _truncate_text(text: str | None, limit: int = 600) -> str | None:
+    if not text:
+        return None
+    text = str(text).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+TIMEFRAME_DATA_CONTRACT = {
+    "short": {
+        "15M": {"role": "entry_timing", "description": "Entry timing, candle confirmation, sweep/wick behavior. Do not use as main trend.", "closed_candle_limit": 120},
+        "1H":  {"role": "main_setup", "description": "Main scalp setup, local structure, momentum, pullback quality.", "closed_candle_limit": 200},
+        "4H":  {"role": "trend_filter", "description": "Higher-timeframe bias and structural filter for scalp.", "closed_candle_limit": 150},
+        "1D":  {"role": "macro_context", "description": "Large context only; avoid scalp against very clear daily context.", "closed_candle_limit": 80},
+    },
+    "long": {
+        "1H":  {"role": "secondary_timing", "description": "Secondary timing only for swing; do not build swing bias from 1H alone.", "closed_candle_limit": 120},
+        "4H":  {"role": "entry_setup", "description": "Primary swing setup and entry zone planning.", "closed_candle_limit": 220},
+        "1D":  {"role": "main_trend", "description": "Main swing trend and decision frame.", "closed_candle_limit": 220},
+        "1W":  {"role": "macro_context", "description": "Macro context, major structure, large risk areas.", "closed_candle_limit": 120},
+    },
+}
+
+
+def _timeframe_contract(mode: str, label: str) -> dict:
+    return dict(TIMEFRAME_DATA_CONTRACT.get(mode, {}).get(label, {
+        "role": "reference",
+        "description": "Reference timeframe.",
+        "closed_candle_limit": 80,
+    }))
+
+
+def _timeframe_contract_summary(mode: str) -> dict:
+    contract = TIMEFRAME_DATA_CONTRACT.get(mode, {})
+    return {
+        label: {
+            "role": item.get("role"),
+            "description": item.get("description"),
+            "closed_candle_limit": item.get("closed_candle_limit"),
+        }
+        for label, item in contract.items()
+    }
+
+
+def _json_timeframe_summary(label: str, df: pd.DataFrame | None, mode: str, candle_limit: int | None = None) -> dict:
+    contract = _timeframe_contract(mode, label)
+    if candle_limit is None:
+        candle_limit = int(contract.get("closed_candle_limit") or 80)
+    if df is None or df.empty:
+        return {"label": label, "has_data": False, "role": contract.get("role"), "closed_candle_limit": candle_limit}
+    last = _analysis_row(df)
+    if last is None:
+        return {"label": label, "has_data": False}
+    last_pos = df.index.get_loc(last.name) if hasattr(last, "name") else len(df) - 1
+    prev = df.iloc[max(0, int(last_pos) - 1)] if len(df) >= 2 else last
+    closed_df = _closed_candles(df)
+    if closed_df is None or closed_df.empty:
+        closed_df = df
+    window = closed_df.tail(50)
+    ema_align = "mixed"
+    try:
+        if last["ema_7"] > last["ema_25"] > last["ema_50"]:
+            ema_align = "bullish"
+        elif last["ema_7"] < last["ema_25"] < last["ema_50"]:
+            ema_align = "bearish"
+    except Exception:
+        pass
+    macd_cross = None
+    try:
+        if prev["macd_hist"] < 0 <= last["macd_hist"]:
+            macd_cross = "bullish_cross"
+        elif prev["macd_hist"] > 0 >= last["macd_hist"]:
+            macd_cross = "bearish_cross"
+    except Exception:
+        pass
+    sent_candles = closed_df.tail(candle_limit)
+    return {
+        "label": label,
+        "has_data": True,
+        "role": contract.get("role"),
+        "closed_candle_limit": candle_limit,
+        "available_closed_candle_count": int(len(closed_df)),
+        "sent_closed_candle_count": int(len(sent_candles)),
+        "analysis_closed_candle": _json_candle(last),
+        "previous_closed_candle_close": _json_float(prev.get("close")),
+        "indicators": {
+            "ema_7": _json_float(last.get("ema_7")),
+            "ema_25": _json_float(last.get("ema_25")),
+            "ema_50": _json_float(last.get("ema_50")),
+            "ema_alignment": ema_align,
+            "rsi_6": _json_float(last.get("rsi_6"), 2),
+            "rsi_14": _json_float(last.get("rsi_14"), 2),
+            "macd_line": _json_float(last.get("macd_line"), 8),
+            "macd_signal": _json_float(last.get("macd_signal"), 8),
+            "macd_hist": _json_float(last.get("macd_hist"), 8),
+            "macd_cross": macd_cross,
+            "atr_14": _json_float(last.get("atr_14")),
+            "atr_pct": _json_float(last.get("atr_pct"), 4),
+            "volume_ratio": _json_float(last.get("vol_ratio"), 4),
+        },
+        "price_structure_50_closed_candles": {
+            "high": _json_float(window["high"].max()) if window is not None and not window.empty else None,
+            "low": _json_float(window["low"].min()) if window is not None and not window.empty else None,
+            "consecutive_candles_text": _consecutive_candles(df),
+            "wick_body_text": _wick_body_info(df),
+        },
+        "recent_closed_candles_compact": {
+            "columns": ["t", "o", "h", "l", "c", "v", "vr", "tb", "body", "uw", "lw", "d"],
+            "direction_legend": {"g": "green", "r": "red", "d": "doji"},
+            "rows": [_json_candle_row(row) for _, row in sent_candles.iterrows()],
+        },
+        "live_candle_reference_only_compact": _json_candle_row(df.iloc[-1]) if len(df) >= 2 else None,
+    }
+
+
+def _zone_to_json(zone: tuple | None) -> dict | None:
+    if not zone or len(zone) < 2 or zone[0] is None or zone[1] is None:
+        return None
+    meta = zone[3] if len(zone) > 3 and isinstance(zone[3], dict) else {}
+    return {
+        "low": _json_float(zone[0]),
+        "high": _json_float(zone[1]),
+        "hits": int(zone[2]) if len(zone) > 2 and zone[2] is not None else 0,
+        "meta": {str(k): _json_safe_value(v) for k, v in meta.items()},
+    }
+
+
+def _structure_to_json(structure: dict | None) -> dict:
+    structure = structure or {}
+    return {
+        "trend": structure.get("trend"),
+        "recent_low": _json_float(structure.get("recent_low")),
+        "recent_high": _json_float(structure.get("recent_high")),
+        "major_low": _json_float(structure.get("major_low")),
+        "major_high": _json_float(structure.get("major_high")),
+        "fib": {str(k): _json_float(v) for k, v in (structure.get("fib") or {}).items()},
+    }
+
+
+def _history_to_json(history: list[dict]) -> dict:
+    finished = [p for p in history if p.get("result") in ("WIN", "LOSS")]
+    wins = sum(1 for p in finished if p.get("result") == "WIN")
+    return {
+        "count": len(history),
+        "closed_count": len(finished),
+        "wins": wins,
+        "losses": sum(1 for p in finished if p.get("result") == "LOSS"),
+        "win_rate_pct": round(wins / len(finished) * 100, 2) if finished else None,
+        "items": [
+            {
+                "created_at": p.get("created_at"),
+                "direction": p.get("direction"),
+                "entry_low": _json_float(p.get("entry_low")),
+                "entry_high": _json_float(p.get("entry_high")),
+                "sl": _json_float(p.get("sl")),
+                "tp1": _json_float(p.get("tp1")),
+                "tp2": _json_float(p.get("tp2")),
+                "result": p.get("result"),
+                "result_price": _json_float(p.get("result_price")),
+                "result_reason": _truncate_text(p.get("result_reason"), 260),
+                "reasoning_summary": _truncate_text(p.get("reasoning_summary"), 420),
+                # Keep history compact; full market/feature snapshots are very token-heavy
+                # and can make JSON input larger than the old text prompt.
+                "market_snapshot_summary": _truncate_text(p.get("market_snapshot"), 300),
+                "feature_snapshot_summary": _truncate_text(p.get("feature_snapshot"), 300),
+            }
+            for p in history[:PREDICTION_HISTORY_COUNT]
+        ],
+        "rule": "Use only this user-specific traded-only history for the same symbol/mode. Do not use global history.",
+    }
+
+
+def build_model_input_payload(
+    symbol: str,
+    mode: str,
+    timeframe_data: dict[str, pd.DataFrame | None],
+    fear_greed_info: str,
+    current_price_str: str,
+    history: list[dict],
+    feature_block: str | None = None,
+    open_signal_context: str | None = None,
+) -> dict:
+    """Build a strict JSON payload for model input instead of one large loose text prompt."""
+    mode_label = "SCALP" if mode == "short" else "SWING"
+    focus = (
+        "SCALP: 15M timing only, 1H setup/main, 4H trend filter, 1D macro context."
+        if mode == "short" else
+        "SWING: 1H secondary timing only, 4H setup, 1D main trend/decision, 1W macro context."
+    )
+    price = _last_close_from_data(timeframe_data)
+    try:
+        m = re.search(r"([0-9][0-9,]*(?:\.\d+)?)", current_price_str or "")
+        if m:
+            price = float(m.group(1).replace(",", ""))
+    except Exception:
+        pass
+
+    main_label, structure_label, big_label = _mode_labels(mode)
+    trigger_label = _mode_trigger_label(mode)
+    zones = _liquidity_zones_by_windows(timeframe_data, mode, price) if price else {}
+    structure_df = timeframe_data.get(structure_label)
+    if structure_df is None or structure_df.empty:
+        structure_df = timeframe_data.get(main_label)
+    structure = _structure_info(structure_df, price) if price else {}
+
+    return {
+        "schema_version": "teopard_model_input_v3_compact_candles_json",
+        "task": {
+            "symbol": symbol,
+            "mode": mode_label,
+            "mode_internal": mode,
+            "focus": focus,
+            "timeframe_data_contract": _timeframe_contract_summary(mode),
+            "compact_candle_format": "recent_closed_candles_compact.rows use columns [t,o,h,l,c,v,vr,tb,body,uw,lw,d].",
+            "decision_allowed_values": ["LONG", "SHORT", "NO_TRADE"],
+            "output_must_follow_json_contract_appended_by_python": True,
+        },
+        "market": {
+            "current_price_text": current_price_str,
+            "current_price": _json_float(price),
+            "fear_greed_text": fear_greed_info,
+            "timeframe_roles": {
+                "trigger": trigger_label,
+                "main_setup": main_label,
+                "structure_confirmation": structure_label,
+                "big_context": big_label,
+                "role_text": _mode_role_text(mode),
+                "data_contract_note": "See task.timeframe_data_contract.",
+            },
+            "regime_text": build_market_regime_block(timeframe_data, mode),
+        },
+        "python_calculated_features": {
+            "risk_reference": _json_float(_risk_floor(timeframe_data, mode, price), 4) if price else None,
+            "minimum_stop_distance": _json_float(_minimum_stop_distance(timeframe_data, mode, price), 4) if price else None,
+            "structural_sl_buffer": _json_float(_structural_sl_buffer(timeframe_data, mode, price), 4) if price else None,
+            "structure": _structure_to_json(structure),
+            "liquidity_zones_estimated_from_ohlcv": {
+                "method": zones.get("liquidity_method"),
+                "labels": {"near": zones.get("label_near"), "main": zones.get("label_main"), "deep": zones.get("label_deep")},
+                "lower": {role: _zone_to_json(zones.get(f"lower_{role}")) for role in ("near", "main", "deep")},
+                "upper": {role: _zone_to_json(zones.get(f"upper_{role}")) for role in ("near", "main", "deep")},
+                "important_note": "These are estimated stop/liquidity pools from OHLCV, not real liquidation heatmap. Do not list them to user.",
+            },
+                    },
+        "timeframes": {
+            label: _json_timeframe_summary(label, df, mode, candle_limit=_timeframe_contract(mode, label).get("closed_candle_limit"))
+            for label, df in timeframe_data.items()
+        },
+        "raw_candle_context": {
+            "closed_candles_only_rule": "Use closed candles for confirmation. Live candle is reference only.",
+            "compact_note": "Detailed closed candles are in timeframes.*.recent_closed_candles_compact. Live candle compact row is reference only.",
+        },
+        "user_specific_learning": _history_to_json(history),
+        "open_signal_context": {
+            "text": _truncate_text(open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có kế hoạch đang chờ/đã khớp cho user này ở cùng coin và mode.", 1200),
+            "rule": "If an old LONG is waiting for pullback, its Entry is not a SHORT TP. If an old SHORT is waiting for pullback, its Entry is not a LONG TP.",
+        },
+        "model_instructions": [
+            "Use only data inside this JSON payload and the system prompt. Do not invent news, order book, funding, open interest, or real liquidation heatmap.",
+            "Respect timeframe_data_contract strictly: SCALP uses 15M for entry/timing, 1H for setup, 4H for bias, 1D for macro; SWING uses 1H for secondary timing, 4H for setup/entry, 1D for main trend, 1W for macro.",
+            "Compare LONG, SHORT, and NO_TRADE internally before deciding. Do not print the comparison.",
+            "If choosing LONG/SHORT, provide concrete Entry/SL/TP numbers in the required output JSON. If choosing NO_TRADE, omit trade levels or set them null.",
+            "Do not show liquidity zones, heatmap, raw feature blocks, or internal labels to the user. Python will render your JSON into the old Telegram format.",
+            "If current price is inside a valid Entry and confirmation is enough, mark activation as immediate. Otherwise make it a waiting plan with clear confirmation conditions.",
+            "Do not chase price when an old plan exists and price has already moved far away from its Entry. Keep, cancel, or replace it with a clear reason.",
+        ],
+    }
+
+
 def build_user_prompt(
     symbol: str,
     mode: str,
@@ -4672,59 +5081,23 @@ def build_user_prompt(
     feature_block: str | None = None,
     open_signal_context: str | None = None,
 ) -> str:
-    mode_label = "SCALP (ngắn hạn)" if mode == "short" else "SWING (dài hạn)"
-    focus      = (
-        "SCALP: dùng 1H làm setup/chính, 4H xác nhận xu hướng, 1D làm bối cảnh lớn; 15M chỉ timing entry/sweep, không đảo bias một mình."
-        if mode == "short" else
-        "SWING: dùng 1D làm xu hướng/chính, 4H làm setup/vùng vào, 1W làm bối cảnh lớn; 1H chỉ timing entry phụ."
+    payload = build_model_input_payload(
+        symbol=symbol,
+        mode=mode,
+        timeframe_data=timeframe_data,
+        fear_greed_info=fear_greed_info,
+        current_price_str=current_price_str,
+        history=history,
+        feature_block=feature_block,
+        open_signal_context=open_signal_context,
     )
-
-    history_block = format_prediction_history(history)
-    open_signal_context = open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có kế hoạch đang chờ/đã khớp cho user này ở cùng coin và mode."
-    tf_blocks     = "".join(summarize_timeframe(lbl, df) for lbl, df in timeframe_data.items())
-    raw_candle_block = build_raw_candle_context(timeframe_data, mode)
-    live_candle_block = build_live_candle_context(timeframe_data, mode)
-    feature_block = feature_block or build_feature_engineering_block(timeframe_data, mode, None)
-
-    return f"""YÊU CẦU PHÂN TÍCH {mode_label} CHO {symbol}
-
-{current_price_str}
-{fear_greed_info}
-Phương pháp: {focus}
-
-═══════════════════════════════
-{feature_block}
-═══════════════════════════════
-{history_block}
-═══════════════════════════════
-{open_signal_context}
-═══════════════════════════════
-{raw_candle_block}
-═══════════════════════════════
-{live_candle_block}
-═══════════════════════════════
-{tf_blocks}
-═══════════════════════════════
-
-Yêu cầu:
-1. Python chỉ cung cấp dữ liệu cứng: EMA/RSI/MACD/ATR, market regime, cấu trúc, Fibonacci, vùng quét thanh khoản ước lượng, raw candle context, rủi ro tham chiếu. Không có kế hoạch LONG/SHORT chốt sẵn. Vùng quét/thanh khoản là dữ liệu nội bộ, không liệt kê ra user.
-2. Model phải tự phân tích và tự lập Entry/SL/TP dựa trên dữ liệu cứng đó. Không được tự tạo thêm Fibonacci/vùng quét nếu block Python ghi N/A hoặc không đủ dữ liệu.
-3. Trước khi quyết định, hãy so sánh NỘI BỘ 3 lựa chọn LONG / SHORT / NO TRADE theo xu hướng đa khung, vị trí giá, vùng quét ước lượng theo cửa sổ thời gian, Fibonacci, nến thô, volume và lịch sử cùng user. Không in bảng so sánh này ra user, không in mục thanh khoản/heatmap/vùng thanh lý.
-4. Chỉ chọn LONG hoặc SHORT khi một hướng có lợi thế rõ hơn hướng còn lại, Entry hợp lý và tỷ lệ lời/lỗ đạt yêu cầu. Nếu thị trường nhiễu, xác suất chỉ ngang nhau, vùng vào lệnh không rõ, hoặc Entry/SL/TP bị gượng ép → chọn NO TRADE. Không dùng NO TRADE chỉ vì giá chưa chạm Entry; nếu Entry là vùng tốt nhưng giá chưa tới, hãy đưa lệnh chờ. Dùng nến đã đóng làm cơ sở xác nhận; nến live chỉ tham khảo.
-5. Cách dùng vùng quét: Entry ưu tiên vùng gần/chính nếu hợp hướng setup và có xác nhận. Với SCALP, không được LONG chỉ vì giá chạm vùng thanh khoản dưới và không được SHORT chỉ vì giá chạm vùng thanh khoản trên; cần có lợi thế rõ như quét thanh khoản/rút râu/đóng nến xác nhận, hoặc một vùng chờ hợp lý với SL/TP đạt tỷ lệ. Nếu còn thiếu xác nhận, được phép đưa lệnh chờ với điều kiện kích hoạt rõ; chỉ chọn NO TRADE khi cả Entry, SL/TP hoặc động lượng đều không đủ.
-6. TP/SL do model tự chọn từ dữ liệu cứng: Fibonacci, swing high/low, EMA/vùng cấu trúc, vùng quét ước lượng và raw candle context. Python mặc định không tự “cứu” TP/SL bằng cách nhảy sang số khác; nếu model đặt TP quá gần Entry, SL sai cấu trúc hoặc target không đáng đánh thì plan sẽ bị NO TRADE. Với LONG, TP1 nên là kháng cự/vùng hồi hợp lý phía trên; với SHORT, TP1 nên là hỗ trợ/vùng hút phía dưới. Không đặt TP1 quá sát chỉ để có lệnh. Ví dụ ETH entry 1700 mà TP1 1710 chỉ hợp lý nếu risk rất nhỏ và có cấu trúc rõ; nếu không, phải chọn target xa hơn như 1730–1750 theo kháng cự/Fibonacci/swing/vùng quét, hoặc NO TRADE. Sau khi model lập plan, Python chỉ áp buffer % theo biến Railway nếu user muốn.
-7. Không mặc định mọi tín hiệu thành lệnh chờ. Nếu giá hiện tại đang nằm trong vùng Entry hợp lý và tín hiệu xác nhận đã đủ, hãy đặt Entry bao quanh/sát giá hiện tại và ghi “Có thể vào ngay trong vùng Entry...”. Nếu Entry chưa chạm giá hiện tại nhưng vẫn là vùng đẹp, giữ quyết định LONG/SHORT dạng lệnh chờ và ghi rõ “Chưa vào ngay, chờ giá về vùng Entry...”, không chọn NO TRADE chỉ vì chưa chạm Entry.
-8. Nếu giá hiện tại chưa vào vùng Entry hoặc còn thiếu xác nhận, mới ghi “Lệnh chờ, chưa vào ngay...” và nêu rõ điều kiện chờ.
-9. Nếu chọn LONG/SHORT: Entry/SL/TP phải hợp logic với hướng giao dịch và tham chiếu ATR/giá. Không đặt SL quá sát; nếu phải đặt SL quá sát mới có tỷ lệ đẹp thì chọn NO TRADE. Không kéo SL/TP quá xa chỉ để đạt tỷ lệ lời/lỗ đẹp, nhưng cũng không đặt TP quá gần khiến lợi nhuận không đáng so với phí/trượt giá/rủi ro nhiễu. SCALP không được bị 15M live làm đảo quyết định nếu 1H/4H chưa xác nhận; SWING không được bị 1H live làm đảo bias nếu 1D/1W chưa đổi.
-10. Nếu chọn NO TRADE: không cần Entry/SL/TP; trả quyết định NO TRADE và lý do ngắn. Python sẽ không gửi plan đó thành tín hiệu. Được chọn NO TRADE khi lợi thế chưa đủ rõ, kể cả khi vẫn có thể vẽ ra một vùng Entry hợp lệ nhưng kèo không đáng vào.
-11. Đọc kỹ RECENT LEARNING SUMMARY, đặc biệt Decision why, Outcome, Market then và Feature then, nhưng không hiện mục “Nhìn lại lịch sử” trong câu trả lời.
-12. Đọc kỹ KẾ HOẠCH ĐANG MỞ nếu có. Không được hiểu vùng Entry của một lệnh chờ LONG là mục tiêu TP cho lệnh SHORT ngược lại, hoặc vùng Entry của lệnh chờ SHORT là mục tiêu TP cho lệnh LONG ngược lại.
-13. Nếu đang có kế hoạch cũ PENDING_ENTRY mà giá đã chạy xa khỏi Entry theo đúng hướng dự báo, không được đuổi giá chỉ vì giá chạy. Chỉ cho vào ngay khi có vùng Entry mới bao quanh giá hiện tại và xác nhận rõ; nếu Entry còn tốt nhưng chưa tới giá thì ghi lệnh chờ, không ép thành NO TRADE chỉ vì Entry xa.
-14. Nếu kế hoạch mới thay thế kế hoạch cũ, ghi ngắn trong “📊 Kịch bản chính” lý do kế hoạch cũ bị hủy/thay thế.
-15. Không copy phân tích cũ. Chỉ dùng summary để tránh lặp lại lỗi.
-16. QUYẾT ĐỊNH cuối cùng chỉ được là LONG, SHORT hoặc NO TRADE. Không dùng “CHỜ” làm quyết định cuối cùng.
-17. Format output cho user chỉ giữ quyết định, Entry/SL/TP nếu có, Lý do và Rủi ro. Không in mục “💧 Thanh khoản”, không liệt kê vùng dưới/trên/gần/chính/sâu.
-"""
+    payload_json = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    return (
+        "DỮ LIỆU ĐẦU VÀO CHO MODEL Ở DẠNG JSON. "
+        "Hãy đọc JSON này như nguồn dữ liệu duy nhất cho lần phân tích hiện tại. "
+        "Không trả lời theo JSON input; hãy trả về JSON output đúng contract được Python nối thêm phía sau.\n"
+        + payload_json
+    )
 
 
 # ─── Tóm tắt reasoning bằng call Haiku thứ 2 (rất ngắn, rẻ) ─────────────────
@@ -4963,31 +5336,72 @@ def _is_length_stop(stop_reason) -> bool:
     return str(stop_reason).lower() in ("max_tokens", "length", "token_limit", "output_limit")
 
 
+def _is_transient_llm_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    transient_markers = (
+        "timeout", "timed out", "read timed out", "connection aborted",
+        "connection reset", "temporarily unavailable", "bad gateway",
+        "gateway timeout", "502", "503", "504",
+    )
+    return isinstance(exc, requests.exceptions.RequestException) or any(m in text for m in transient_markers)
+
+
 def create_with_continuation(
     *,
     system: str | None,
     messages: list,
     max_tokens: int = LLM_MAX_OUTPUT_TOKENS,
-    timeout: int = 300,
+    timeout: int = LLM_MAIN_TIMEOUT_SECONDS,
     allow_continuation: bool = True,
     reasoning_effort: str | None = None,
     call_type: str = "main",
 ) -> str:
     """
     Gọi model hiện tại; nếu provider báo bị cắt vì max token thì gọi tiếp để nối output.
+    Có retry cho lỗi mạng/timeout tạm thời của provider AI.
     Không dùng Python sửa nội dung chiến lược, chỉ yêu cầu model viết tiếp phần bị ngắt.
     """
     convo = list(messages)
     full_text = ""
     max_attempts = LLM_MAX_CONTINUATIONS + 1 if allow_continuation else 1
+    retry_count = max(0, LLM_API_RETRIES)
+
     for attempt in range(max_attempts):
-        result = llm_create_once(
-            system,
-            convo,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            reasoning_effort=reasoning_effort,
-        )
+        result = None
+        last_exc: Exception | None = None
+        for retry_idx in range(retry_count + 1):
+            try:
+                result = llm_create_once(
+                    system,
+                    convo,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                    reasoning_effort=reasoning_effort,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                if retry_idx >= retry_count or not _is_transient_llm_error(exc):
+                    raise
+                try:
+                    print(
+                        f"[LLM_RETRY] call_type={call_type} provider={get_ai_provider_label()} "
+                        f"model={get_ai_model_name()} attempt={attempt + 1} retry={retry_idx + 1}/{retry_count} "
+                        f"error={exc}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                try:
+                    import time
+                    time.sleep(max(0.0, LLM_RETRY_SLEEP_SECONDS) * (retry_idx + 1))
+                except Exception:
+                    pass
+        if result is None:
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("LLM call failed without response.")
+
         chunk = result.get("text") or ""
         full_text += chunk
         stop_reason = result.get("stop_reason")
@@ -5050,7 +5464,7 @@ def summarize_reasoning(full_response: str) -> str:
                 ),
             }],
             max_tokens=LLM_SUMMARY_MAX_OUTPUT_TOKENS,
-            timeout=60,
+            timeout=LLM_SUMMARY_TIMEOUT_SECONDS,
             allow_continuation=False,
             reasoning_effort=summary_effort,
             call_type="summary",
@@ -5059,6 +5473,187 @@ def summarize_reasoning(full_response: str) -> str:
     except Exception as exc:
         print(f"Lỗi summarize_reasoning: {exc}", flush=True)
         return ""
+
+# ─── JSON model output layer ────────────────────────────────────────────────
+
+JSON_OUTPUT_CONTRACT = r"""
+
+TRẢ VỀ JSON NỘI BỘ BẮT BUỘC:
+- Chỉ trả về 1 JSON object hợp lệ.
+- Không markdown, không ```json, không giải thích ngoài JSON.
+- User sẽ KHÔNG thấy JSON này; Python sẽ render lại format cũ cho Telegram.
+- decision chỉ được là "LONG", "SHORT" hoặc "NO_TRADE".
+- Nếu decision là LONG/SHORT: entry_low, entry_high, sl, tp1, tp2 bắt buộc là số.
+- Nếu decision là NO_TRADE: entry_low, entry_high, sl, tp1, tp2 để null.
+- current_price nên copy đúng từ JSON input; nếu thiếu, Python sẽ tự chèn giá hiện tại lấy từ Binance.
+
+Schema:
+{
+  "symbol": "BTCUSDT",
+  "mode": "SCALP hoặc SWING",
+  "decision": "LONG | SHORT | NO_TRADE",
+  "confidence": 55,
+  "current_price": 61266.4,
+  "entry_low": 61250.0,
+  "entry_high": 61350.0,
+  "sl": 59884.11,
+  "tp1": 62064.0,
+  "tp2": 62750.0,
+  "risk_text": "~1,465.89 USDT",
+  "activation": "Có thể vào ngay... hoặc Lệnh chờ, chưa vào ngay...",
+  "reason": ["Lý do kỹ thuật 1", "Lý do kỹ thuật 2"],
+  "main_scenario": "Kịch bản chính ngắn gọn.",
+  "risk_note": "Rủi ro và điều kiện hủy lệnh ngắn gọn."
+}
+"""
+
+
+def request_json_analysis(system_prompt: str, user_prompt: str) -> str:
+    """Gọi model và yêu cầu JSON nội bộ. Không để user thấy JSON thô."""
+    return create_with_continuation(
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt + JSON_OUTPUT_CONTRACT}],
+        timeout=LLM_MAIN_TIMEOUT_SECONDS,
+        call_type="main_json",
+    )
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Trích JSON object từ output model, kể cả khi model lỡ bọc ```json."""
+    if not text:
+        return None
+    raw = text.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"\s*```$", "", raw).strip()
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            obj = json.loads(raw[start:end + 1])
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _num_or_none(value) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.replace(",", "").strip()
+        return float(value)
+    except Exception:
+        return None
+
+
+def _clean_decision(value: str | None) -> str:
+    raw = str(value or "").upper().replace("-", "_").replace(" ", "_")
+    if raw in {"NO_TRADE", "NOTRADE", "NO__TRADE", "KHONG_VAO_LENH", "KHÔNG_VÀO_LỆNH"}:
+        return "NO_TRADE"
+    if raw in {"LONG", "SHORT"}:
+        return raw
+    return "WAIT"
+
+
+def parse_prediction_from_json_payload(payload: dict | None) -> dict:
+    if not isinstance(payload, dict):
+        return {"direction": "WAIT", "confidence": None, "entry_low": None, "entry_high": None, "sl": None, "tp1": None, "tp2": None}
+    decision = _clean_decision(payload.get("decision"))
+    confidence = _num_or_none(payload.get("confidence"))
+    return {
+        "direction": decision,
+        "confidence": confidence,
+        "entry_low": _num_or_none(payload.get("entry_low")),
+        "entry_high": _num_or_none(payload.get("entry_high")),
+        "sl": _num_or_none(payload.get("sl")),
+        "tp1": _num_or_none(payload.get("tp1")),
+        "tp2": _num_or_none(payload.get("tp2")),
+    }
+
+
+def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mode: str, fallback_current_price: float | None = None) -> str:
+    """Render JSON nội bộ thành format text cũ để user không thấy thay đổi."""
+    mode_label = "SCALP" if mode == "short" else "SWING"
+    symbol = str(payload.get("symbol") or fallback_symbol).upper()
+    decision = _clean_decision(payload.get("decision"))
+    confidence = _num_or_none(payload.get("confidence"))
+    conf_text = f" — {confidence:.0f}%" if confidence is not None else ""
+    current_price = _num_or_none(payload.get("current_price"))
+    if current_price is None:
+        current_price = fallback_current_price
+    current_price_line = f"Giá hiện tại: {fmt(current_price)} USDT" if current_price is not None else "Giá hiện tại: N/A"
+
+    activation = str(payload.get("activation") or "").strip()
+    main_scenario = str(payload.get("main_scenario") or "").strip()
+    risk_note = str(payload.get("risk_note") or "").strip()
+    risk_text = str(payload.get("risk_text") or "").strip()
+    reasons = payload.get("reason")
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    if not isinstance(reasons, list):
+        reasons = []
+    reasons = [str(x).strip() for x in reasons if str(x).strip()]
+
+    lines = [
+        f"🎯 {symbol} — {mode_label}",
+        f"🏆 QUYẾT ĐỊNH: {decision.replace('_', ' ')}{conf_text}",
+        current_price_line,
+    ]
+
+    if decision in ("LONG", "SHORT"):
+        emoji = "📈" if decision == "LONG" else "📉"
+        entry_low = _num_or_none(payload.get("entry_low"))
+        entry_high = _num_or_none(payload.get("entry_high"))
+        sl = _num_or_none(payload.get("sl"))
+        tp1 = _num_or_none(payload.get("tp1"))
+        tp2 = _num_or_none(payload.get("tp2"))
+        lines += [
+            "",
+            f"{emoji} {decision}{conf_text}",
+            f"Entry: {fmt(entry_low)}–{fmt(entry_high)}",
+            f"SL: {fmt(sl)}",
+            f"TP1: {fmt(tp1)}",
+            f"TP2: {fmt(tp2)}",
+        ]
+        if risk_text:
+            lines.append(f"Rủi ro mỗi lệnh: {risk_text}")
+        if activation:
+            lines.append(f"Kích hoạt: {activation}")
+    else:
+        if activation:
+            lines += ["", f"Kích hoạt: {activation}"]
+
+    if main_scenario:
+        lines += ["", f"Lý do: {main_scenario}"]
+    elif reasons:
+        lines += ["", "Lý do:"]
+    if reasons:
+        if main_scenario:
+            lines.append("")
+        for item in reasons[:5]:
+            lines.append(f"- {item}")
+    if risk_note:
+        lines += ["", f"⚠️ Rủi ro: {risk_note}"]
+
+    return sanitize_user_output("\n".join(lines).strip())
+
+
+def model_output_to_user_text_and_pred(raw_output: str, symbol: str, mode: str, current_price: float | None = None) -> tuple[str, dict, dict | None]:
+    """Ưu tiên parse JSON; nếu thất bại thì fallback regex text cũ để không làm bot chết."""
+    payload = _extract_json_object(raw_output)
+    if payload is not None:
+        user_text = render_user_output_from_json_payload(payload, symbol, mode, fallback_current_price=current_price)
+        pred = parse_prediction_from_json_payload(payload)
+        return user_text, pred, payload
+    user_text = sanitize_user_output(raw_output)
+    return user_text, parse_prediction_from_output(user_text), None
 
 # ─── Parse prediction từ output ──────────────────────────────────────────────
 
@@ -5502,6 +6097,7 @@ def _guarded_no_trade_output(symbol: str, mode: str, current_price: float | None
     return sanitize_user_output(
         f"🎯 {symbol} — {mode_label}\n"
         f"🏆 QUYẾT ĐỊNH: NO TRADE — 65%\n"
+        f"Giá hiện tại: {fmt(current_price)} USDT\n"
         f"Lý do: {reason}{price_text} Bot không lưu tín hiệu này để tránh trường hợp vừa chạm vùng vào lệnh đã bị quét SL.\n"
         f"⚠️ Rủi ro: Nếu cố vào lệnh, xác suất bị nhiễu hoặc quét SL ngắn hạn còn cao."
     )
@@ -5664,7 +6260,7 @@ def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
     return create_with_continuation(
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
-        timeout=300,
+        timeout=LLM_MAIN_TIMEOUT_SECONDS,
         call_type="main",
     )
 
@@ -5715,9 +6311,8 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         open_signal_context=open_signal_context,
     )
 
-    output = sanitize_user_output(request_claude_analysis(system_prompt, user_prompt))
-
-    pred = parse_prediction_from_output(output)
+    raw_output = request_json_analysis(system_prompt, user_prompt)
+    output, pred, json_payload = model_output_to_user_text_and_pred(raw_output, binance_symbol, mode, current_price=current_price)
 
     # V32 model-authoritative flow:
     # - Model tự chọn Entry/SL/TP từ dữ liệu Binance + level map Python cung cấp.
@@ -5855,9 +6450,8 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     )
 
     # AI API đang sync, nên gọi trong worker thread để không block bot.
-    output = sanitize_user_output(await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt))
-
-    pred = parse_prediction_from_output(output)
+    raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, user_prompt)
+    output, pred, json_payload = model_output_to_user_text_and_pred(raw_output, binance_symbol, mode, current_price=current_price)
 
     # V32 model-authoritative flow:
     # - Model tự chọn Entry/SL/TP từ dữ liệu Binance + level map Python cung cấp.
@@ -5925,3 +6519,743 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         log_hidden_rejection(binance_symbol, mode, pred, missing, output)
 
     return {"text": output, "candidate_id": candidate_id}
+
+
+# ─── Auto Scan Mode: DeepSeek prefilter → GLM full analysis ──────────────────
+
+def init_auto_scan_db() -> None:
+    """DB riêng cho auto scan, tách khỏi manual mode/draft."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auto_scan_settings (
+                user_id     INTEGER PRIMARY KEY,
+                chat_id     INTEGER,
+                enabled     INTEGER NOT NULL DEFAULT 0,
+                symbols     TEXT NOT NULL DEFAULT '',
+                updated_at  TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auto_scan_signals (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER,
+                chat_id       INTEGER,
+                symbol        TEXT NOT NULL,
+                mode          TEXT NOT NULL,
+                direction     TEXT NOT NULL,
+                confidence    INTEGER,
+                sent_at       TEXT NOT NULL,
+                prediction_id INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auto_scan_logs (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id           INTEGER,
+                chat_id           INTEGER,
+                symbol            TEXT NOT NULL,
+                mode              TEXT NOT NULL,
+                scan_slot         TEXT,
+                scanned_at        TEXT NOT NULL,
+                stage             TEXT NOT NULL,
+                status            TEXT NOT NULL,
+                pre_direction     TEXT,
+                pre_confidence    INTEGER,
+                final_direction   TEXT,
+                final_confidence  INTEGER,
+                reason            TEXT,
+                prediction_id     INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auto_scan_state (
+                key        TEXT PRIMARY KEY,
+                value      TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        for col, definition in [
+            ("symbols", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE auto_scan_settings ADD COLUMN {col} {definition}")
+            except sqlite3.OperationalError:
+                pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_settings_enabled ON auto_scan_settings(enabled)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_signals_user_symbol_mode ON auto_scan_signals(user_id, symbol, mode, sent_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_logs_user_id ON auto_scan_logs(user_id, id DESC)")
+        conn.commit()
+
+
+def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: list[str] | None = None) -> None:
+    init_auto_scan_db()
+    normalized_symbols = []
+    if symbols is not None:
+        seen = set()
+        for raw in symbols:
+            sym = normalize_auto_scan_symbol(raw)
+            if sym and sym not in seen:
+                normalized_symbols.append(sym)
+                seen.add(sym)
+    symbols_text = ",".join(normalized_symbols) if symbols is not None else None
+    with sqlite3.connect(DB_PATH) as conn:
+        if symbols_text is None:
+            conn.execute(
+                """
+                INSERT INTO auto_scan_settings (user_id, chat_id, enabled, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    chat_id=excluded.chat_id,
+                    enabled=excluded.enabled,
+                    updated_at=excluded.updated_at
+                """,
+                (user_id, chat_id, 1 if enabled else 0, iso(utc_now())),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO auto_scan_settings (user_id, chat_id, enabled, symbols, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    chat_id=excluded.chat_id,
+                    enabled=excluded.enabled,
+                    symbols=excluded.symbols,
+                    updated_at=excluded.updated_at
+                """,
+                (user_id, chat_id, 1 if enabled else 0, symbols_text, iso(utc_now())),
+            )
+        conn.commit()
+
+def get_auto_scan_status(user_id: int) -> dict:
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT user_id, chat_id, enabled, symbols, updated_at FROM auto_scan_settings WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return {"enabled": False, "chat_id": None, "updated_at": None}
+    return {"user_id": row[0], "chat_id": row[1], "enabled": bool(row[2]), "symbols": row[3] or "", "updated_at": row[4]}
+
+
+def get_auto_scan_enabled_users() -> list[dict]:
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT user_id, chat_id, symbols FROM auto_scan_settings WHERE enabled=1 AND chat_id IS NOT NULL ORDER BY user_id"
+        ).fetchall()
+    return [{"user_id": int(r[0]), "chat_id": int(r[1]), "symbols": r[2] or ""} for r in rows]
+
+
+def _normalize_auto_scan_modes() -> list[str]:
+    result = []
+    for m in AUTO_SCAN_MODES or ["short"]:
+        mm = str(m).strip().lower()
+        if mm in {"scalp", "short", "15m"}:
+            result.append("short")
+        elif mm in {"swing", "long", "4h"}:
+            result.append("long")
+    return result or ["short"]
+
+
+def _auto_scan_symbols_from_env_or_db() -> list[str]:
+    raw = os.getenv("AUTO_SCAN_SYMBOLS", "").strip()
+    if raw:
+        symbols = [normalize_auto_scan_symbol(x) for x in raw.split(",") if x.strip()]
+    else:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                rows = conn.execute("SELECT symbol FROM allowed_symbols ORDER BY symbol").fetchall()
+            symbols = [normalize_auto_scan_symbol(r[0]) for r in rows]
+        except Exception:
+            symbols = []
+    clean = []
+    seen = set()
+    for s in symbols:
+        if s and s not in seen:
+            clean.append(s)
+            seen.add(s)
+    return clean[:1]
+
+
+def _parse_auto_scan_symbols_text(symbols_text: str | None) -> list[str]:
+    raw = (symbols_text or "").strip()
+    if not raw:
+        return []
+    parts = []
+    for chunk in raw.replace(";", ",").split(","):
+        for item in chunk.split():
+            if item.strip():
+                parts.append(item.strip())
+    clean = []
+    seen = set()
+    for item in parts:
+        sym = normalize_auto_scan_symbol(item)
+        if sym and sym not in seen:
+            clean.append(sym)
+            seen.add(sym)
+    return clean[:1]
+
+
+def normalize_auto_scan_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().lstrip("/").upper()
+    if not s:
+        return ""
+    return s if s.endswith("USDT") else f"{s}USDT"
+
+
+def _auto_scan_recently_sent(user_id: int, symbol: str, mode: str, direction: str | None = None) -> bool:
+    cooldown = max(0, AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES)
+    if cooldown <= 0:
+        return False
+    cutoff = utc_now() - timedelta(minutes=cooldown)
+    clauses = ["user_id=?", "symbol=?", "mode=?", "sent_at>=?"]
+    params: list = [user_id, symbol, mode, iso(cutoff)]
+    if direction:
+        clauses.append("direction=?")
+        params.append(direction)
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            f"SELECT 1 FROM auto_scan_signals WHERE {' AND '.join(clauses)} LIMIT 1",
+            params,
+        ).fetchone()
+    return row is not None
+
+
+def _record_auto_scan_signal(user_id: int, chat_id: int, symbol: str, mode: str, direction: str, confidence: int | None, prediction_id: int | None) -> None:
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO auto_scan_signals (user_id, chat_id, symbol, mode, direction, confidence, sent_at, prediction_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, chat_id, symbol, mode, direction, confidence, iso(utc_now()), prediction_id),
+        )
+        conn.commit()
+
+
+
+def _auto_scan_state_get(key: str) -> str | None:
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM auto_scan_state WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _auto_scan_state_set(key: str, value: str) -> None:
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO auto_scan_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (key, value, iso(utc_now())),
+        )
+        conn.commit()
+
+
+def _auto_scan_interval_seconds() -> int:
+    return max(60, int(AUTO_SCAN_INTERVAL_SECONDS or 900))
+
+
+def _auto_scan_slot_info(now: datetime | None = None) -> dict:
+    now = (now or utc_now()).astimezone(timezone.utc)
+    interval = _auto_scan_interval_seconds()
+    delay = max(0, int(AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS or 0))
+    epoch = int(now.timestamp())
+    slot_epoch = (epoch // interval) * interval
+    slot_dt = datetime.fromtimestamp(slot_epoch, tz=timezone.utc)
+    next_slot_dt = datetime.fromtimestamp(slot_epoch + interval, tz=timezone.utc)
+    due = epoch >= slot_epoch + delay
+    return {
+        "slot_epoch": slot_epoch,
+        "slot": iso(slot_dt),
+        "next_slot": iso(next_slot_dt),
+        "due": due,
+        "seconds_after_slot": epoch - slot_epoch,
+        "delay_seconds": delay,
+        "interval_seconds": interval,
+    }
+
+
+def should_run_auto_scan_now() -> tuple[bool, dict]:
+    info = _auto_scan_slot_info()
+    last_slot = _auto_scan_state_get("last_scan_slot")
+    if not info.get("due"):
+        info["skip_reason"] = f"waiting candle close delay {info.get('delay_seconds')}s"
+        return False, info
+    if last_slot == info.get("slot"):
+        info["skip_reason"] = "slot already scanned"
+        return False, info
+    return True, info
+
+
+def mark_auto_scan_slot_done(slot: str) -> None:
+    _auto_scan_state_set("last_scan_slot", slot)
+    _auto_scan_state_set("last_scan_at", iso(utc_now()))
+
+
+def _auto_scan_format_dt(value: str | None) -> str:
+    return format_vn_datetime(value) if value else "-"
+
+
+def _record_auto_scan_log(
+    user_id: int | None,
+    chat_id: int | None,
+    symbol: str,
+    mode: str,
+    *,
+    scan_slot: str | None = None,
+    stage: str,
+    status: str,
+    reason: str | None = None,
+    pre_direction: str | None = None,
+    pre_confidence: int | None = None,
+    final_direction: str | None = None,
+    final_confidence: int | None = None,
+    prediction_id: int | None = None,
+) -> None:
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO auto_scan_logs
+                (user_id, chat_id, symbol, mode, scan_slot, scanned_at, stage, status,
+                 pre_direction, pre_confidence, final_direction, final_confidence, reason, prediction_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, chat_id, symbol, mode, scan_slot, iso(utc_now()), stage, status,
+             pre_direction, pre_confidence, final_direction, final_confidence, reason, prediction_id),
+        )
+        if user_id is not None:
+            conn.execute(
+                """
+                DELETE FROM auto_scan_logs
+                WHERE user_id=? AND id NOT IN (
+                    SELECT id FROM auto_scan_logs WHERE user_id=? ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (user_id, user_id, max(1, AUTO_SCAN_LOG_LIMIT)),
+            )
+        conn.commit()
+    if AUTO_SCAN_DEBUG:
+        print(
+            f"[AUTO_SCAN] log user={user_id} symbol={symbol} mode={mode} stage={stage} "
+            f"status={status} pre={pre_direction}/{pre_confidence} final={final_direction}/{final_confidence} reason={reason}",
+            flush=True,
+        )
+
+
+def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
+    init_auto_scan_db()
+    limit = int(limit or AUTO_SCAN_LOG_LIMIT or 20)
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT scanned_at, symbol, mode, stage, status, pre_direction, pre_confidence,
+                   final_direction, final_confidence, reason, prediction_id
+            FROM auto_scan_logs
+            WHERE user_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+    keys = ["scanned_at", "symbol", "mode", "stage", "status", "pre_direction", "pre_confidence", "final_direction", "final_confidence", "reason", "prediction_id"]
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def get_auto_scan_runtime_status(user_id: int) -> dict:
+    status = get_auto_scan_status(user_id)
+    slot = _auto_scan_slot_info()
+    logs = get_auto_scan_logs(user_id, limit=1)
+    return {
+        **status,
+        "last_scan_slot": _auto_scan_state_get("last_scan_slot"),
+        "last_scan_at": _auto_scan_state_get("last_scan_at"),
+        "current_slot": slot.get("slot"),
+        "next_scan_at": slot.get("next_slot"),
+        "last_log": logs[0] if logs else None,
+    }
+
+
+def _compact_timeframe_for_deepseek(label: str, tf: dict, limit: int) -> dict:
+    candles = tf.get("recent_closed_candles") or []
+    if limit > 0:
+        candles = candles[-limit:]
+    return {
+        "label": label,
+        "role": tf.get("role"),
+        "role_description": tf.get("role_description"),
+        "has_data": tf.get("has_data"),
+        "analysis_closed_candle": tf.get("analysis_closed_candle"),
+        "indicators": tf.get("indicators"),
+        "price_structure_50_closed_candles": tf.get("price_structure_50_closed_candles"),
+        "recent_closed_candles": candles,
+        "live_candle_reference_only": tf.get("live_candle_reference_only"),
+    }
+
+
+def build_deepseek_prefilter_payload(payload: dict) -> dict:
+    """Rút gọn input cho DeepSeek: đủ để lọc sơ bộ, không tốn như GLM full."""
+    mode_internal = ((payload.get("task") or {}).get("mode_internal") or "short").lower()
+    candle_limits = {"15M": 40, "1H": 40, "4H": 30, "1D": 20, "1W": 20} if mode_internal == "short" else {"1H": 40, "4H": 50, "1D": 50, "1W": 30}
+    timeframes = payload.get("timeframes") or {}
+    compact_tfs = {
+        label: _compact_timeframe_for_deepseek(label, tf, candle_limits.get(label, 20))
+        for label, tf in timeframes.items()
+        if isinstance(tf, dict)
+    }
+    features = payload.get("python_calculated_features") or {}
+    history = payload.get("user_specific_learning") or {}
+    history_items = history.get("items") or []
+    compact_history = {
+        "count": history.get("count"),
+        "closed_count": history.get("closed_count"),
+        "win_rate_pct": history.get("win_rate_pct"),
+        "items": [
+            {
+                "direction": x.get("direction"),
+                "entry_low": x.get("entry_low"),
+                "entry_high": x.get("entry_high"),
+                "sl": x.get("sl"),
+                "tp1": x.get("tp1"),
+                "tp2": x.get("tp2"),
+                "result": x.get("result"),
+                "result_reason": x.get("result_reason"),
+            }
+            for x in history_items[:3]
+        ],
+    }
+    return {
+        "schema_version": "teopard_deepseek_prefilter_v2_compact",
+        "task": {
+            **(payload.get("task") or {}),
+            "auto_scan_prefilter": True,
+            "min_signal_score_to_call_glm": AUTO_SCAN_MIN_PREFILTER_CONFIDENCE,
+            "instruction": "Fast prefilter only. You MUST always choose candidate_direction as LONG or SHORT whenever Binance data is readable. Never answer NO_TRADE in normal market conditions; weak setup must be LONG/SHORT with a low signal_score.",
+        },
+        "market": payload.get("market"),
+        "python_calculated_features": {
+            "risk_reference": features.get("risk_reference"),
+            "minimum_stop_distance": features.get("minimum_stop_distance"),
+            "structural_sl_buffer": features.get("structural_sl_buffer"),
+            "structure": features.get("structure"),
+            "liquidity_zones_estimated_from_ohlcv": features.get("liquidity_zones_estimated_from_ohlcv"),
+        },
+        "timeframes": compact_tfs,
+        "raw_candle_context": {
+            "closed_candles_only_rule": (payload.get("raw_candle_context") or {}).get("closed_candles_only_rule"),
+        },
+        "user_specific_learning": compact_history,
+        "open_signal_context": payload.get("open_signal_context"),
+        "deepseek_rules": [
+            "This is not the final analysis. Do not create Entry/SL/TP for user.",
+            "You must compare LONG and SHORT and pick the better candidate_direction as LONG or SHORT whenever market data is readable.",
+            "Weak setup is still a LONG/SHORT candidate with a low signal_score; do not convert weak setup into NO_TRADE.",
+            "signal_score means strength of the best LONG/SHORT candidate, not confidence of NO TRADE.",
+            "should_call_glm=true when candidate_direction is LONG/SHORT and signal_score >= min_signal_score_to_call_glm.",
+            "Do not use NO_TRADE. If both sides are weak, choose the less weak side and give a low signal_score.",
+        ],
+    }
+
+def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEEPSEEK_TIMEOUT_SECONDS) -> dict:
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("Missing DEEPSEEK_API_KEY. Set DEEPSEEK_API_KEY or OPENROUTER_API_KEY in Railway variables.")
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+        "X-OpenRouter-Title": DEEPSEEK_APP_NAME,
+    }
+    payload_messages = []
+    if system:
+        payload_messages.append({"role": "system", "content": system})
+    payload_messages.extend(messages)
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": payload_messages,
+        "max_tokens": DEEPSEEK_MAX_OUTPUT_TOKENS,
+        "temperature": DEEPSEEK_TEMPERATURE,
+    }
+    r = requests.post(f"{DEEPSEEK_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=timeout)
+    try:
+        r.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"DeepSeek API error: {r.status_code} - {r.text[:1000]}") from exc
+    data = r.json()
+    choice = (data.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content = msg.get("content") or ""
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    return {"text": content, "usage": data.get("usage"), "stop_reason": choice.get("finish_reason")}
+
+
+def request_deepseek_prefilter(payload: dict) -> dict:
+    """DeepSeek chỉ lọc sơ bộ, không tạo tín hiệu gửi user."""
+    compact_payload = build_deepseek_prefilter_payload(payload)
+    prompt = (
+        "Bạn là bộ lọc nhanh cho Teopard Auto Scan. Chỉ đọc JSON input, không bịa dữ liệu. "
+        "Nhiệm vụ của bạn KHÔNG phải chốt lệnh, mà là chấm xem có đáng gọi GLM phân tích sâu không. "
+        "Hãy luôn so sánh nhanh LONG và SHORT, rồi BẮT BUỘC chọn hướng nhỉnh hơn làm candidate_direction. "
+        "Không được trả NO_TRADE. Nếu tín hiệu yếu thì vẫn chọn LONG hoặc SHORT và cho signal_score thấp. "
+        ""
+        "Trả về DUY NHẤT một JSON object hợp lệ, không markdown. "
+        "Schema bắt buộc: {\"long_score\":0-100,\"short_score\":0-100,\"best_direction\":\"LONG|SHORT\",\"best_score\":0-100,"
+        "\"long_score\":0-100,\"short_score\":0-100,\"should_call_glm\":true/false,\"reason\":\"lý do rất ngắn\"}. "
+        f"should_call_glm=true khi best_score >= {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}. "
+        "Nếu cả LONG và SHORT đều yếu, vẫn chấm điểm cả hai thấp; không dùng NO_TRADE. best_direction là hướng có điểm cao hơn.\n"
+        + json.dumps(compact_payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    )
+    retry_count = max(0, LLM_API_RETRIES)
+    last_exc = None
+    for retry_idx in range(retry_count + 1):
+        try:
+            result = _deepseek_create_once(system=None, messages=[{"role": "user", "content": prompt}])
+            parsed = _extract_json_object(result.get("text") or "") or {}
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception as exc:
+            last_exc = exc
+            if retry_idx >= retry_count or not _is_transient_llm_error(exc):
+                raise
+            try:
+                import time
+                time.sleep(max(0.0, LLM_RETRY_SLEEP_SECONDS) * (retry_idx + 1))
+            except Exception:
+                pass
+    if last_exc:
+        raise last_exc
+    return {}
+
+
+def _payload_confidence(payload: dict | None) -> int | None:
+    try:
+        if not isinstance(payload, dict):
+            return None
+        v = payload.get("confidence")
+        if v is None:
+            v = payload.get("signal_score")
+        if v is None:
+            v = payload.get("score")
+        if v is None:
+            return None
+        return max(0, min(100, int(float(v))))
+    except Exception:
+        return None
+
+
+def _auto_scan_text_header(symbol: str, mode: str) -> str:
+    mode_label = "SCALP" if mode == "short" else "SWING"
+    return f"🤖 AUTO SCAN — {symbol} — {mode_label}\n"
+
+
+async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_id: int, scan_slot: str | None = None) -> dict:
+    """Run 1 symbol/mode for 1 user. Return {send: bool, text: str}."""
+    init_prediction_db()
+    init_auto_scan_db()
+    binance_symbol = normalize_auto_scan_symbol(symbol)
+    if not binance_symbol:
+        return {"send": False, "reason": "empty symbol"}
+
+    def log_and_return(stage: str, status: str, reason: str, **kwargs) -> dict:
+        _record_auto_scan_log(
+            user_id, chat_id, binance_symbol, mode,
+            scan_slot=scan_slot, stage=stage, status=status, reason=reason, **kwargs,
+        )
+        return {"send": False, "reason": reason, "stage": stage, "status": status, **kwargs}
+
+    if _auto_scan_recently_sent(user_id, binance_symbol, mode):
+        return log_and_return("cooldown", "skipped", "cooldown")
+
+    timeframe_data = await collect_timeframe_data(binance_symbol, mode)
+    if not any(df is not None and not df.empty for df in timeframe_data.values()):
+        return log_and_return("binance", "error", "no binance data")
+
+    fear_greed_info, price_tuple, history, open_signals, system_prompt = await asyncio.gather(
+        asyncio.to_thread(get_fear_greed_index),
+        asyncio.to_thread(get_current_price_str, binance_symbol),
+        asyncio.to_thread(get_recent_predictions, binance_symbol, mode, user_id),
+        asyncio.to_thread(get_open_signal_predictions, binance_symbol, mode, user_id),
+        asyncio.to_thread(load_system_prompt),
+    )
+    current_price_str, current_price = price_tuple
+    feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
+    feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
+    market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
+    open_signal_context = format_open_signal_context(open_signals, current_price)
+    payload = build_model_input_payload(
+        symbol=binance_symbol,
+        mode=mode,
+        timeframe_data=timeframe_data,
+        fear_greed_info=fear_greed_info,
+        current_price_str=current_price_str,
+        history=history,
+        feature_block=feature_block,
+        open_signal_context=open_signal_context,
+    )
+
+    prefilter = await asyncio.to_thread(request_deepseek_prefilter, payload)
+
+    # DeepSeek prefilter V3: score both sides, then threshold decides whether to call GLM.
+    # This avoids fake logs like "LONG 0%" when DeepSeek did not really find a LONG setup.
+    def _score_value(value, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            return max(0, min(100, int(float(value))))
+        except Exception:
+            return default
+
+    long_score = _score_value(prefilter.get("long_score"), 0)
+    short_score = _score_value(prefilter.get("short_score"), 0)
+
+    # Backward compatibility: older DeepSeek schema may return one direction + signal_score.
+    legacy_direction = _clean_decision(str(
+        prefilter.get("best_direction")
+        or prefilter.get("candidate_direction")
+        or prefilter.get("direction")
+        or prefilter.get("decision")
+        or ""
+    ))
+    legacy_score = _payload_confidence(prefilter)
+    if legacy_direction == "LONG" and long_score == 0 and legacy_score is not None:
+        long_score = legacy_score
+    if legacy_direction == "SHORT" and short_score == 0 and legacy_score is not None:
+        short_score = legacy_score
+
+    if long_score > short_score:
+        pre_direction = "LONG"
+        pre_conf = long_score
+    elif short_score > long_score:
+        pre_direction = "SHORT"
+        pre_conf = short_score
+    else:
+        # Tie: keep model's best_direction if valid, otherwise use NEUTRAL for log only.
+        pre_direction = legacy_direction if legacy_direction in {"LONG", "SHORT"} and long_score > 0 else "NEUTRAL"
+        pre_conf = max(long_score, short_score)
+
+    should_call_glm = pre_conf >= AUTO_SCAN_MIN_PREFILTER_CONFIDENCE
+    if not should_call_glm:
+        if pre_direction == "NEUTRAL":
+            pre_label = f"LONG {long_score}% | SHORT {short_score}%"
+            reason_text = f"Cả LONG và SHORT đều dưới ngưỡng lọc nhanh {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}%, nên chưa gọi GLM."
+        else:
+            pre_label = f"LONG {long_score}% | SHORT {short_score}%"
+            reason_text = f"{pre_direction} đang nhỉnh hơn, nhưng điểm chỉ đạt {pre_conf}% dưới ngưỡng lọc nhanh {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}%, nên chưa gọi GLM."
+        return log_and_return(
+            "deepseek", "rejected",
+            reason_text,
+            pre_direction=pre_label, pre_confidence=None,
+        )
+
+    user_prompt = build_user_prompt(
+        symbol=binance_symbol,
+        mode=mode,
+        timeframe_data=timeframe_data,
+        fear_greed_info=fear_greed_info,
+        current_price_str=current_price_str,
+        history=history,
+        feature_block=feature_block,
+        open_signal_context=open_signal_context,
+    )
+    raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, user_prompt)
+    output, pred, json_payload = model_output_to_user_text_and_pred(raw_output, binance_symbol, mode, current_price=current_price)
+    direction = (pred.get("direction") or "").upper()
+    final_conf = _payload_confidence(json_payload) or _payload_confidence({"confidence": pred.get("confidence")}) or 0
+
+    if direction == "NO_TRADE":
+        if AUTO_SCAN_SEND_NO_TRADE:
+            return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
+        return log_and_return("glm", "rejected", "GLM chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+
+    if direction not in {"LONG", "SHORT"} or final_conf < AUTO_SCAN_MIN_FINAL_CONFIDENCE:
+        return log_and_return("glm", "rejected", f"Tín hiệu cuối chỉ đạt {final_conf}%, dưới ngưỡng gửi {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+
+    if _auto_scan_recently_sent(user_id, binance_symbol, mode, direction=direction):
+        return log_and_return("cooldown", "skipped", "direction cooldown", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+
+    if _python_adjusts_model_sl():
+        pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
+    if _python_adjusts_model_tp():
+        pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
+    pred, output = _apply_extra_sl_buffer_to_plan(pred, output)
+    pred, output = _apply_extra_tp_buffers_to_plan(pred, output)
+    output = _normalize_pending_entry_activation(output, pred, current_price)
+
+    guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
+    if guard_errors:
+        log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
+        return log_and_return("guard", "rejected", "guard rejected", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+
+    can_track = all(pred.get(k) is not None for k in ("entry_low", "entry_high", "sl", "tp1", "tp2"))
+    if not can_track:
+        return log_and_return("glm", "rejected", "missing trade levels", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+
+    reasoning_summary = await asyncio.to_thread(summarize_reasoning, output)
+    prediction_id = await asyncio.to_thread(
+        save_prediction,
+        symbol=binance_symbol,
+        mode=mode,
+        direction=direction,
+        entry_low=pred.get("entry_low"),
+        entry_high=pred.get("entry_high"),
+        sl=pred.get("sl"),
+        tp1=pred.get("tp1"),
+        tp2=pred.get("tp2"),
+        market_snapshot=market_snapshot,
+        feature_snapshot=feature_snapshot,
+        reasoning_summary=reasoning_summary,
+        full_response=output,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    try:
+        if _price_in_entry_range(current_price, pred.get("entry_low"), pred.get("entry_high")):
+            entry_price = _entry_price(direction, pred.get("entry_low"), pred.get("entry_high"), current_price)
+            if entry_price is not None:
+                await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
+    except Exception:
+        pass
+
+    _record_auto_scan_signal(user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id))
+    text = _auto_scan_text_header(binance_symbol, mode) + output + "\n\nBot đã tự lưu tín hiệu Auto Scan này để theo dõi. Không cần bấm xác nhận."
+    return {"send": True, "text": text, "prediction_id": int(prediction_id), "direction": direction, "confidence": final_conf}
+
+
+async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
+    """Auto Scan runs near closed-candle slots, not just every N seconds after bot start."""
+    should_run, slot_info = should_run_auto_scan_now()
+    if not force and not should_run:
+        return {"users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(), "sent": 0, "checked": 0, "errors": 0, "skipped": True, "reason": slot_info.get("skip_reason"), "next_scan_at": slot_info.get("next_slot")}
+
+    users = get_auto_scan_enabled_users()
+    modes = _normalize_auto_scan_modes()
+    payload = {"users": len(users), "symbols": 0, "modes": modes, "sent": 0, "checked": 0, "errors": 0, "skipped": False, "slot": slot_info.get("slot"), "next_scan_at": slot_info.get("next_slot")}
+    if not users:
+        mark_auto_scan_slot_done(slot_info.get("slot") or iso(utc_now()))
+        return payload
+    for user in users:
+        symbols = _parse_auto_scan_symbols_text(user.get("symbols")) or _auto_scan_symbols_from_env_or_db()
+        payload["symbols"] += len(symbols)
+        if not symbols:
+            continue
+        for symbol in symbols:
+            for mode in modes:
+                payload["checked"] += 1
+                try:
+                    result = await auto_scan_symbol_for_user(symbol, mode, user["user_id"], user["chat_id"], scan_slot=slot_info.get("slot"))
+                    if result.get("send") and result.get("text") and bot is not None:
+                        await bot.send_message(chat_id=user["chat_id"], text=result["text"])
+                        payload["sent"] += 1
+                except Exception as exc:
+                    payload["errors"] += 1
+                    _record_auto_scan_log(
+                        user.get("user_id"), user.get("chat_id"), symbol, mode,
+                        scan_slot=slot_info.get("slot"), stage="error", status="error", reason=str(exc)[:500],
+                    )
+                    print(f"[AUTO_SCAN] error user={user.get('user_id')} symbol={symbol} mode={mode}: {exc}", flush=True)
+    mark_auto_scan_slot_done(slot_info.get("slot") or iso(utc_now()))
+    return payload
