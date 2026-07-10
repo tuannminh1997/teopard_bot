@@ -97,10 +97,7 @@ AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
 AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
 AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "62"))
 AUTO_SCAN_MIN_FINAL_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", "60"))
-# Mặc định dùng cùng ngưỡng final confidence, nên Railway cũ không cần thêm biến.
-AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH = int(
-    os.getenv("AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH", str(AUTO_SCAN_MIN_FINAL_CONFIDENCE))
-)
+AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH = int(os.getenv("AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH", "62"))
 AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES", "180"))
 AUTO_SCAN_MAX_SYMBOLS_PER_RUN = 1  # Auto Scan chỉ cho 1 symbol/user để tránh lãng phí tài nguyên.
 AUTO_SCAN_SEND_NO_TRADE = os.getenv("AUTO_SCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -3740,15 +3737,28 @@ MIN_TP2_R = _env_float("TEOPARD_MIN_TP2_R", 0.50)
 TP2_MIN_SEPARATION_MULT = _env_float("TEOPARD_TP2_SEPARATION_MULT", 1.00)
 
 MIN_ACTION_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", 48.0)
+MIN_ACTION_CONFIDENCE_SWING = _env_float("TEOPARD_MIN_SWING_CONFIDENCE", MIN_ACTION_CONFIDENCE_SCALP)
+MIN_SETUP_STRENGTH = _env_float("TEOPARD_MIN_SETUP_STRENGTH", 60.0)
 MIN_REVERSAL_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_REVERSAL_CONFIDENCE", 50.0)
 MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = _env_float("TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE", 52.0)
-# Độ mạnh setup là chất lượng cấu trúc kỹ thuật, tách khỏi độ chắc chắn của quyết định.
-# Nếu không khai báo biến mới, mặc định dùng cùng ngưỡng TEOPARD_MIN_SCALP_CONFIDENCE
-# để giữ nguyên danh sách Railway hiện tại.
-MIN_SETUP_STRENGTH = _env_float(
-    "TEOPARD_MIN_SETUP_STRENGTH",
-    MIN_ACTION_CONFIDENCE_SCALP,
-)
+
+# Model chấm từng tiêu chí; Python clamp từng mục và cộng tổng.
+SETUP_SCORE_WEIGHTS = {
+    "xu_huong_da_khung": 10.0,
+    "entry_dung_vung": 25.0,
+    "sl_dung_cau_truc": 20.0,
+    "tp_rr_hop_ly": 25.0,
+    "dong_luong_xac_nhan": 10.0,
+    "volume_nen_xac_nhan": 10.0,
+}
+
+CONFIDENCE_SCORE_WEIGHTS = {
+    "loi_the_quyet_dinh": 30.0,
+    "huong_lon_ro_rang": 25.0,
+    "hanh_dong_gia_dong_thuan": 20.0,
+    "chi_bao_dong_thuan": 15.0,
+    "boi_canh_thi_truong_ung_ho": 10.0,
+}
 
 
 def _dedupe_price_candidates(candidates: list[dict], price_ref: float, risk: float) -> list[dict]:
@@ -5123,6 +5133,8 @@ def build_user_prompt(
         "- Trả lời bằng text tiếng Việt theo format cũ của bot, KHÔNG trả JSON.",
         "- Quyết định cuối cùng chỉ là LONG, SHORT hoặc NO TRADE.",
         "- Nếu LONG/SHORT phải có đủ Entry, SL, TP1, TP2 là số cụ thể.",
+        "- Cuối phản hồi bắt buộc có block [[TEOPARD_RUBRIC]] đúng key và đủ 11 dòng điểm; Python sẽ ẩn block, clamp từng mục và cộng tổng.",
+        "- Không tự in tổng Độ mạnh setup/Độ chắc chắn; Python sẽ tính và chèn hai tổng sau dòng QUYẾT ĐỊNH.",
         "- Không in riêng danh sách thanh khoản/heatmap/vùng quét; chỉ dùng nội bộ để chọn Entry/SL/TP và giải thích ngắn.",
         "- Nếu chưa đủ setup hợp lý thì chọn NO TRADE.",
     ]
@@ -5515,24 +5527,13 @@ TRẢ VỀ JSON NỘI BỘ BẮT BUỘC:
 - Nếu decision là LONG/SHORT: entry_low, entry_high, sl, tp1, tp2 bắt buộc là số.
 - Nếu decision là NO_TRADE: entry_low, entry_high, sl, tp1, tp2 để null.
 - current_price nên copy đúng từ JSON input; nếu thiếu, Python sẽ tự chèn giá hiện tại lấy từ Binance.
-- setup_score_breakdown là bắt buộc. Chấm từng mục độc lập theo đúng điểm tối đa; Python sẽ tự cộng thành setup_strength, nên không được tự bịa tổng.
-- Rubric 100 điểm: xu_huong_da_khung 20, entry_dung_vung 20, sl_dung_cau_truc 15, tp_rr_hop_ly 20, dong_luong_xac_nhan 15, volume_nen_xac_nhan 10.
 
 Schema:
 {
   "symbol": "BTCUSDT",
   "mode": "SCALP hoặc SWING",
   "decision": "LONG | SHORT | NO_TRADE",
-  "setup_score_breakdown": {
-    "xu_huong_da_khung": 15,
-    "entry_dung_vung": 17,
-    "sl_dung_cau_truc": 13,
-    "tp_rr_hop_ly": 16,
-    "dong_luong_xac_nhan": 8,
-    "volume_nen_xac_nhan": 5
-  },
-  "setup_strength": 74,
-  "confidence": 56,
+  "confidence": 55,
   "current_price": 61266.4,
   "entry_low": 61250.0,
   "entry_high": 61350.0,
@@ -5593,6 +5594,142 @@ def _num_or_none(value) -> float | None:
         return None
 
 
+
+
+def _rubric_total(
+    breakdown: dict | None,
+    weights: dict[str, float],
+) -> float | None:
+    """Yêu cầu đủ tất cả mục, clamp từng mục rồi cộng tổng 0-100."""
+    if not isinstance(breakdown, dict):
+        return None
+    total = 0.0
+    for key, maximum in weights.items():
+        raw = _num_or_none(breakdown.get(key))
+        if raw is None:
+            return None
+        total += min(max(float(raw), 0.0), float(maximum))
+    return min(max(total, 0.0), 100.0)
+
+
+def _extract_rubric_breakdowns(output: str | None) -> tuple[dict, dict]:
+    """Đọc block máy [[TEOPARD_RUBRIC]] do model trả ở cuối output."""
+    text = output or ""
+    match = re.search(
+        r"\[\[TEOPARD_RUBRIC\]\]([\s\S]*?)\[\[/TEOPARD_RUBRIC\]\]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return {}, {}
+
+    setup: dict[str, float] = {}
+    confidence: dict[str, float] = {}
+    for raw_line in match.group(1).splitlines():
+        line = raw_line.strip()
+        m = re.fullmatch(
+            r"(SETUP|CONF)\s+([a-z0-9_]+)\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            continue
+        group = m.group(1).upper()
+        key = m.group(2).lower()
+        value = float(m.group(3))
+        if group == "SETUP":
+            setup[key] = value
+        else:
+            confidence[key] = value
+    return setup, confidence
+
+
+def _remove_rubric_block(output: str | None) -> str:
+    return re.sub(
+        r"\n?\s*\[\[TEOPARD_RUBRIC\]\][\s\S]*?\[\[/TEOPARD_RUBRIC\]\]\s*",
+        "\n",
+        output or "",
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def _extract_legacy_confidence(output: str | None) -> float | None:
+    """Chỉ dùng để tương thích output text cũ khi model lỡ thiếu rubric."""
+    text = output or ""
+    patterns = [
+        r"Độ\s+chắc\s+chắn\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"QUYẾT\s+ĐỊNH[:\s]+(?:LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"(?:📈|📉)?\s*(?:LONG|SHORT|NO[_\s-]?TRADE)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return min(max(float(m.group(1)), 0.0), 100.0)
+            except Exception:
+                pass
+    return None
+
+
+def _insert_public_scores(
+    output: str,
+    setup_strength: float | None,
+    confidence: float | None,
+) -> str:
+    """Bỏ % kiểu cũ và chèn hai tổng do Python tính ngay dưới QUYẾT ĐỊNH."""
+    text = output or ""
+    text = re.sub(
+        r"(^\s*🏆\s*QUYẾT\s+ĐỊNH\s*:\s*(?:LONG|SHORT|NO\s+TRADE))\s*[—\-]\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$",
+        r"\1",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    text = re.sub(
+        r"(^\s*(?:📈\s*LONG|📉\s*SHORT))\s*[—\-]\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$",
+        r"\1",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    text = re.sub(r"^\s*Độ\s+mạnh\s+setup\s*:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"^\s*Độ\s+chắc\s+chắn\s*:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
+
+    setup_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
+    confidence_text = f"{confidence:.0f}%" if confidence is not None else "N/A"
+    score_lines = [f"Độ mạnh setup: {setup_text}", f"Độ chắc chắn: {confidence_text}"]
+
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if re.search(r"QUYẾT\s+ĐỊNH\s*:", line, flags=re.IGNORECASE):
+            lines[index + 1:index + 1] = score_lines
+            return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return "\n".join(score_lines + [text]).strip()
+
+
+def finalize_model_scoring_output(output: str | None) -> tuple[str, dict]:
+    """Model chấm từng mục; Python cộng tổng, ẩn rubric và render hai điểm public."""
+    raw_text = output or ""
+    has_rubric_block = bool(re.search(
+        r"\[\[TEOPARD_RUBRIC\]\][\s\S]*?\[\[/TEOPARD_RUBRIC\]\]",
+        raw_text,
+        flags=re.IGNORECASE,
+    ))
+    setup_breakdown, confidence_breakdown = _extract_rubric_breakdowns(raw_text)
+    setup_strength = _rubric_total(setup_breakdown, SETUP_SCORE_WEIGHTS)
+    confidence = _rubric_total(confidence_breakdown, CONFIDENCE_SCORE_WEIGHTS)
+    clean = _remove_rubric_block(raw_text)
+
+    # Chỉ tương thích output hoàn toàn cũ không có block. Block đã có nhưng thiếu mục thì phải reject.
+    if confidence is None and not has_rubric_block:
+        confidence = _extract_legacy_confidence(clean)
+
+    clean = _insert_public_scores(clean, setup_strength, confidence)
+    return clean, {
+        "setup_strength": setup_strength,
+        "confidence": confidence,
+        "setup_score_breakdown": setup_breakdown,
+        "confidence_score_breakdown": confidence_breakdown,
+    }
+
 def _clean_decision(value: str | None) -> str:
     raw = str(value or "").upper().replace("-", "_").replace(" ", "_")
     if raw in {"NO_TRADE", "NOTRADE", "NO__TRADE", "KHONG_VAO_LENH", "KHÔNG_VÀO_LỆNH"}:
@@ -5602,55 +5739,17 @@ def _clean_decision(value: str | None) -> str:
     return "WAIT"
 
 
-SETUP_SCORE_RUBRIC = {
-    "xu_huong_da_khung": 20.0,
-    "entry_dung_vung": 20.0,
-    "sl_dung_cau_truc": 15.0,
-    "tp_rr_hop_ly": 20.0,
-    "dong_luong_xac_nhan": 15.0,
-    "volume_nen_xac_nhan": 10.0,
-}
-
-
-def _setup_strength_from_payload(payload: dict | None) -> tuple[float | None, dict[str, float]]:
-    """Tính Độ mạnh setup từ rubric cố định 100 điểm.
-
-    Model chỉ chấm từng thành phần. Python clamp từng điểm theo trần rubric rồi cộng,
-    tránh trường hợp model tự ghi một tổng không khớp. Với output cũ chưa có breakdown,
-    fallback về setup_strength để giữ tương thích.
-    """
-    if not isinstance(payload, dict):
-        return None, {}
-
-    raw = payload.get("setup_score_breakdown")
-    if isinstance(raw, dict):
-        scores: dict[str, float] = {}
-        complete = True
-        for key, max_score in SETUP_SCORE_RUBRIC.items():
-            value = _num_or_none(raw.get(key))
-            if value is None:
-                complete = False
-                break
-            scores[key] = min(max(float(value), 0.0), float(max_score))
-        if complete:
-            return round(sum(scores.values()), 2), scores
-
-    legacy = _num_or_none(payload.get("setup_strength"))
-    if legacy is None:
-        return None, {}
-    return min(max(float(legacy), 0.0), 100.0), {}
-
-
 def parse_prediction_from_json_payload(payload: dict | None) -> dict:
     if not isinstance(payload, dict):
-        return {"direction": "WAIT", "setup_strength": None, "confidence": None, "entry_low": None, "entry_high": None, "sl": None, "tp1": None, "tp2": None}
+        return {"direction": "WAIT", "confidence": None, "entry_low": None, "entry_high": None, "sl": None, "tp1": None, "tp2": None}
     decision = _clean_decision(payload.get("decision"))
-    setup_strength, setup_score_breakdown = _setup_strength_from_payload(payload)
-    confidence = _num_or_none(payload.get("confidence"))
+    setup_strength = _rubric_total(payload.get("setup_score_breakdown"), SETUP_SCORE_WEIGHTS)
+    confidence = _rubric_total(payload.get("confidence_score_breakdown"), CONFIDENCE_SCORE_WEIGHTS)
+    if confidence is None:
+        confidence = _num_or_none(payload.get("confidence"))
     return {
         "direction": decision,
         "setup_strength": setup_strength,
-        "setup_score_breakdown": setup_score_breakdown,
         "confidence": confidence,
         "entry_low": _num_or_none(payload.get("entry_low")),
         "entry_high": _num_or_none(payload.get("entry_high")),
@@ -5665,10 +5764,10 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
     mode_label = "SCALP" if mode == "short" else "SWING"
     symbol = str(payload.get("symbol") or fallback_symbol).upper()
     decision = _clean_decision(payload.get("decision"))
-    setup_strength, _setup_score_breakdown = _setup_strength_from_payload(payload)
-    confidence = _num_or_none(payload.get("confidence"))
-    strength_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
-    confidence_text = f"{confidence:.0f}%" if confidence is not None else "N/A"
+    setup_strength = _rubric_total(payload.get("setup_score_breakdown"), SETUP_SCORE_WEIGHTS)
+    confidence = _rubric_total(payload.get("confidence_score_breakdown"), CONFIDENCE_SCORE_WEIGHTS)
+    if confidence is None:
+        confidence = _num_or_none(payload.get("confidence"))
     current_price = _num_or_none(payload.get("current_price"))
     if current_price is None:
         current_price = fallback_current_price
@@ -5688,8 +5787,8 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
     lines = [
         f"🎯 {symbol} — {mode_label}",
         f"🏆 QUYẾT ĐỊNH: {decision.replace('_', ' ')}",
-        f"Độ mạnh setup: {strength_text}",
-        f"Độ chắc chắn: {confidence_text}",
+        f"Độ mạnh setup: {setup_strength:.0f}/100" if setup_strength is not None else "Độ mạnh setup: N/A",
+        f"Độ chắc chắn: {confidence:.0f}%" if confidence is not None else "Độ chắc chắn: N/A",
         current_price_line,
     ]
 
@@ -5805,17 +5904,21 @@ def parse_prediction_from_output(output: str) -> dict:
     tp2 = find_price([r"TP2[:\s]+([0-9,\.]+)"], selected_output)
 
     setup_strength = None
-    sm = re.search(r"Độ\s+mạnh\s+setup[:\s]+([0-9]+(?:\.[0-9]+)?)\s*(?:/\s*100|%)?", output, re.IGNORECASE)
-    if sm:
+    setup_match = re.search(
+        r"Độ\s+mạnh\s+setup\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/\s*100)?",
+        output,
+        flags=re.IGNORECASE,
+    )
+    if setup_match:
         try:
-            setup_strength = float(sm.group(1))
+            setup_strength = min(max(float(setup_match.group(1)), 0.0), 100.0)
         except Exception:
-            pass
+            setup_strength = None
 
     confidence = None
-    # Format mới ưu tiên dòng "Độ chắc chắn: 56%"; vẫn đọc format cũ để tương thích.
+    # Ưu tiên tổng rubric do Python đã render; fallback format phần trăm cũ.
     conf_patterns = [
-        r"Độ\s+chắc\s+chắn[:\s]+([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"Độ\s+chắc\s+chắn\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%",
         r"QUYẾT\s+ĐỊNH[:\s]+(?:LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
         r"(?:📈|📉)?\s*(?:LONG|SHORT|NO[_\s-]?TRADE)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
     ]
@@ -6018,6 +6121,32 @@ def _closed_row_momentum_flags(timeframe_data: dict[str, pd.DataFrame | None], d
     return flags
 
 
+def _validate_model_scores(pred: dict, mode: str) -> list[str]:
+    """Cả manual SCALP/SWING đều phải đạt confidence và setup strength tối thiểu."""
+    if _guard_is_off():
+        return []
+
+    errors: list[str] = []
+    setup_strength = _num_or_none(pred.get("setup_strength"))
+    confidence = _num_or_none(pred.get("confidence"))
+    confidence_min = MIN_ACTION_CONFIDENCE_SCALP if mode == "short" else MIN_ACTION_CONFIDENCE_SWING
+
+    if setup_strength is None:
+        errors.append("Model thiếu bảng chấm Độ mạnh setup đầy đủ nên Python không thể cộng tổng.")
+    elif setup_strength < MIN_SETUP_STRENGTH:
+        errors.append(
+            f"Độ mạnh setup chỉ {setup_strength:.1f}/100, dưới ngưỡng tối thiểu {MIN_SETUP_STRENGTH:.1f}/100."
+        )
+
+    if confidence is None:
+        errors.append("Model thiếu bảng chấm Độ chắc chắn đầy đủ nên Python không thể cộng tổng.")
+    elif confidence < confidence_min:
+        errors.append(
+            f"Độ chắc chắn chỉ {confidence:.1f}%, dưới ngưỡng tối thiểu {confidence_min:.1f}% cho mode này."
+        )
+    return errors
+
+
 def _validate_scalp_reversal_quality(
     pred: dict,
     timeframe_data: dict[str, pd.DataFrame | None],
@@ -6046,13 +6175,6 @@ def _validate_scalp_reversal_quality(
         conf_val = None
 
     is_reversal = _output_mentions_reversal_entry(output, direction)
-
-    # Chỉ confidence rất thấp mới bị chặn toàn cục. V17 dùng 58 làm hard floor nên bot quá NO TRADE.
-    if conf_val is not None and conf_val < MIN_ACTION_CONFIDENCE_SCALP:
-        errors.append(
-            f"Tín hiệu SCALP chỉ {conf_val:.1f}%, dưới ngưỡng tối thiểu {MIN_ACTION_CONFIDENCE_SCALP:.1f}% để lưu thành lệnh thật."
-        )
-        return errors
 
     if not is_reversal:
         return errors
@@ -6109,23 +6231,7 @@ def _validate_actionable_trade_plan(
     if direction not in ("LONG", "SHORT"):
         return errors
 
-    # Hai thang điểm có vai trò khác nhau:
-    # - setup_strength: chất lượng kỹ thuật của cấu trúc Entry/SL/TP và sự đồng thuận dữ liệu.
-    # - confidence: mức chắc chắn của model khi chọn LONG/SHORT thay vì hướng còn lại/NO TRADE.
-    # Một tín hiệu chỉ được lưu/theo dõi khi setup đủ mạnh; nếu model quên field mới,
-    # fallback sang confidence để giữ tương thích với output cũ.
-    raw_strength = pred.get("setup_strength")
-    if raw_strength is None:
-        raw_strength = pred.get("confidence")
-    try:
-        strength_val = float(raw_strength) if raw_strength is not None else None
-    except Exception:
-        strength_val = None
-    if strength_val is not None and strength_val < MIN_SETUP_STRENGTH:
-        errors.append(
-            f"Độ mạnh setup chỉ {strength_val:.1f}/100, dưới ngưỡng tối thiểu {MIN_SETUP_STRENGTH:.1f}/100 để lưu thành lệnh thật."
-        )
-
+    errors.extend(_validate_model_scores(pred, mode))
     if mode == "short":
         errors.extend(_validate_scalp_reversal_quality(pred, timeframe_data, output))
 
@@ -6202,15 +6308,27 @@ def _validate_actionable_trade_plan(
     return errors
 
 
-def _guarded_no_trade_output(symbol: str, mode: str, current_price: float | None, errors: list[str]) -> str:
+def _guarded_no_trade_output(
+    symbol: str,
+    mode: str,
+    current_price: float | None,
+    errors: list[str],
+    pred: dict | None = None,
+) -> str:
     mode_label = "SCALP" if mode == "short" else "SWING"
     price_text = f" Giá hiện tại {fmt(current_price)} USDT." if current_price is not None else ""
     reason = errors[0] if errors else "Kế hoạch LONG/SHORT bị bộ lọc rủi ro từ chối."
+    setup_strength = _num_or_none((pred or {}).get("setup_strength"))
+    confidence = _num_or_none((pred or {}).get("confidence"))
+    setup_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
+    confidence_text = f"{confidence:.0f}%" if confidence is not None else "N/A"
     return sanitize_user_output(
         f"🎯 {symbol} — {mode_label}\n"
-        f"🏆 QUYẾT ĐỊNH: NO TRADE — 65%\n"
+        f"🏆 QUYẾT ĐỊNH: NO TRADE\n"
+        f"Độ mạnh setup: {setup_text}\n"
+        f"Độ chắc chắn: {confidence_text}\n"
         f"Giá hiện tại: {fmt(current_price)} USDT\n"
-        f"Lý do: {reason}{price_text} Bot không lưu tín hiệu này để tránh trường hợp vừa chạm vùng vào lệnh đã bị quét SL.\n"
+        f"Lý do: {reason}{price_text} Bot không lưu tín hiệu này.\n"
         f"⚠️ Rủi ro: Nếu cố vào lệnh, xác suất bị nhiễu hoặc quét SL ngắn hạn còn cao."
     )
 
@@ -6332,7 +6450,14 @@ def ensure_current_price_line(output: str, current_price: float | None) -> str:
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if re.search(r"QUYẾT\s+ĐỊNH\s*:", line, flags=re.IGNORECASE):
-            lines.insert(i + 1, price_line)
+            insert_at = i + 1
+            while insert_at < len(lines) and re.search(
+                r"^\s*Độ\s+(?:mạnh\s+setup|chắc\s+chắn)\s*:",
+                lines[insert_at],
+                flags=re.IGNORECASE,
+            ):
+                insert_at += 1
+            lines.insert(insert_at, price_line)
             return "\n".join(lines)
     return price_line + "\n" + text
 
@@ -6439,7 +6564,8 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     )
 
     raw_output = request_claude_analysis(system_prompt, user_prompt)
-    output = ensure_current_price_line(sanitize_user_output(raw_output), current_price)
+    scored_output, _score_meta = finalize_model_scoring_output(raw_output)
+    output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
     pred = parse_prediction_from_output(output)
 
     # V32 model-authoritative flow:
@@ -6464,7 +6590,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
-        guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors)
+        guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred)
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
         # V19: không lưu rejected vào predictions nữa để history chỉ gồm lệnh user thật sự trade.
         return guarded_output
@@ -6579,7 +6705,8 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     # AI API đang sync, nên gọi trong worker thread để không block bot.
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
-    output = ensure_current_price_line(sanitize_user_output(raw_output), current_price)
+    scored_output, _score_meta = finalize_model_scoring_output(raw_output)
+    output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
     pred = parse_prediction_from_output(output)
 
     # V32 model-authoritative flow:
@@ -6604,7 +6731,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
-        guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors)
+        guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred)
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
         # V19: không lưu rejected vào predictions/history nữa.
         return {"text": guarded_output, "candidate_id": None}
@@ -7271,26 +7398,27 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         open_signal_context=open_signal_context,
     )
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
-    output = ensure_current_price_line(sanitize_user_output(raw_output), current_price)
+    scored_output, _score_meta = finalize_model_scoring_output(raw_output)
+    output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
     pred = parse_prediction_from_output(output)
     direction = (pred.get("direction") or "").upper()
-    final_conf = int(pred.get("confidence") or _extract_confidence_from_output(output) or 0)
-    # Nếu model quên field mới, fallback confidence để tương thích output cũ.
-    final_setup_strength = int(pred.get("setup_strength") or final_conf or 0)
+    final_conf = int(pred.get("confidence") or _extract_legacy_confidence(output) or 0)
+    final_setup = int(pred.get("setup_strength") or 0)
 
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:
             return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
         return log_and_return("glm", "rejected", "GLM chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
 
-    if direction not in {"LONG", "SHORT"} or final_conf < AUTO_SCAN_MIN_FINAL_CONFIDENCE:
-        return log_and_return("glm", "rejected", f"Độ chắc chắn chỉ đạt {final_conf}%, dưới ngưỡng gửi {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+    if direction not in {"LONG", "SHORT"}:
+        return log_and_return("glm", "rejected", "GLM không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
 
-    if final_setup_strength < AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH:
+    if final_conf < AUTO_SCAN_MIN_FINAL_CONFIDENCE or final_setup < AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH:
         return log_and_return(
             "glm",
             "rejected",
-            f"Độ mạnh setup chỉ đạt {final_setup_strength}/100, dưới ngưỡng gửi {AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH}/100.",
+            f"Tín hiệu cuối đạt Độ chắc chắn {final_conf}% và Độ mạnh setup {final_setup}/100; "
+            f"ngưỡng gửi là {AUTO_SCAN_MIN_FINAL_CONFIDENCE}% và {AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH}/100.",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
             final_direction=direction,
