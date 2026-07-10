@@ -97,6 +97,10 @@ AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
 AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
 AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "62"))
 AUTO_SCAN_MIN_FINAL_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", "60"))
+# Mặc định dùng cùng ngưỡng final confidence, nên Railway cũ không cần thêm biến.
+AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH = int(
+    os.getenv("AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH", str(AUTO_SCAN_MIN_FINAL_CONFIDENCE))
+)
 AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES", "180"))
 AUTO_SCAN_MAX_SYMBOLS_PER_RUN = 1  # Auto Scan chỉ cho 1 symbol/user để tránh lãng phí tài nguyên.
 AUTO_SCAN_SEND_NO_TRADE = os.getenv("AUTO_SCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -3738,6 +3742,13 @@ TP2_MIN_SEPARATION_MULT = _env_float("TEOPARD_TP2_SEPARATION_MULT", 1.00)
 MIN_ACTION_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", 48.0)
 MIN_REVERSAL_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_REVERSAL_CONFIDENCE", 50.0)
 MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = _env_float("TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE", 52.0)
+# Độ mạnh setup là chất lượng cấu trúc kỹ thuật, tách khỏi độ chắc chắn của quyết định.
+# Nếu không khai báo biến mới, mặc định dùng cùng ngưỡng TEOPARD_MIN_SCALP_CONFIDENCE
+# để giữ nguyên danh sách Railway hiện tại.
+MIN_SETUP_STRENGTH = _env_float(
+    "TEOPARD_MIN_SETUP_STRENGTH",
+    MIN_ACTION_CONFIDENCE_SCALP,
+)
 
 
 def _dedupe_price_candidates(candidates: list[dict], price_ref: float, risk: float) -> list[dict]:
@@ -5510,7 +5521,8 @@ Schema:
   "symbol": "BTCUSDT",
   "mode": "SCALP hoặc SWING",
   "decision": "LONG | SHORT | NO_TRADE",
-  "confidence": 55,
+  "setup_strength": 74,
+  "confidence": 56,
   "current_price": 61266.4,
   "entry_low": 61250.0,
   "entry_high": 61350.0,
@@ -5582,11 +5594,13 @@ def _clean_decision(value: str | None) -> str:
 
 def parse_prediction_from_json_payload(payload: dict | None) -> dict:
     if not isinstance(payload, dict):
-        return {"direction": "WAIT", "confidence": None, "entry_low": None, "entry_high": None, "sl": None, "tp1": None, "tp2": None}
+        return {"direction": "WAIT", "setup_strength": None, "confidence": None, "entry_low": None, "entry_high": None, "sl": None, "tp1": None, "tp2": None}
     decision = _clean_decision(payload.get("decision"))
+    setup_strength = _num_or_none(payload.get("setup_strength"))
     confidence = _num_or_none(payload.get("confidence"))
     return {
         "direction": decision,
+        "setup_strength": setup_strength,
         "confidence": confidence,
         "entry_low": _num_or_none(payload.get("entry_low")),
         "entry_high": _num_or_none(payload.get("entry_high")),
@@ -5601,8 +5615,10 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
     mode_label = "SCALP" if mode == "short" else "SWING"
     symbol = str(payload.get("symbol") or fallback_symbol).upper()
     decision = _clean_decision(payload.get("decision"))
+    setup_strength = _num_or_none(payload.get("setup_strength"))
     confidence = _num_or_none(payload.get("confidence"))
-    conf_text = f" — {confidence:.0f}%" if confidence is not None else ""
+    strength_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
+    confidence_text = f"{confidence:.0f}%" if confidence is not None else "N/A"
     current_price = _num_or_none(payload.get("current_price"))
     if current_price is None:
         current_price = fallback_current_price
@@ -5621,7 +5637,9 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
 
     lines = [
         f"🎯 {symbol} — {mode_label}",
-        f"🏆 QUYẾT ĐỊNH: {decision.replace('_', ' ')}{conf_text}",
+        f"🏆 QUYẾT ĐỊNH: {decision.replace('_', ' ')}",
+        f"Độ mạnh setup: {strength_text}",
+        f"Độ chắc chắn: {confidence_text}",
         current_price_line,
     ]
 
@@ -5634,7 +5652,7 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
         tp2 = _num_or_none(payload.get("tp2"))
         lines += [
             "",
-            f"{emoji} {decision}{conf_text}",
+            f"{emoji} {decision}",
             f"Entry: {fmt(entry_low)}–{fmt(entry_high)}",
             f"SL: {fmt(sl)}",
             f"TP1: {fmt(tp1)}",
@@ -5736,10 +5754,18 @@ def parse_prediction_from_output(output: str) -> dict:
     tp1 = find_price([r"TP1[:\s]+([0-9,\.]+)"], selected_output)
     tp2 = find_price([r"TP2[:\s]+([0-9,\.]+)"], selected_output)
 
+    setup_strength = None
+    sm = re.search(r"Độ\s+mạnh\s+setup[:\s]+([0-9]+(?:\.[0-9]+)?)\s*(?:/\s*100|%)?", output, re.IGNORECASE)
+    if sm:
+        try:
+            setup_strength = float(sm.group(1))
+        except Exception:
+            pass
+
     confidence = None
-    # Bắt phần trăm tin cậy từ dòng quyết định hoặc dòng LONG/SHORT.
-    # Ví dụ: "🏆 QUYẾT ĐỊNH: LONG — 55%" hoặc "📈 LONG — 62%".
+    # Format mới ưu tiên dòng "Độ chắc chắn: 56%"; vẫn đọc format cũ để tương thích.
     conf_patterns = [
+        r"Độ\s+chắc\s+chắn[:\s]+([0-9]+(?:\.[0-9]+)?)\s*%",
         r"QUYẾT\s+ĐỊNH[:\s]+(?:LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
         r"(?:📈|📉)?\s*(?:LONG|SHORT|NO[_\s-]?TRADE)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
     ]
@@ -5754,6 +5780,7 @@ def parse_prediction_from_output(output: str) -> dict:
 
     return {
         "direction":  direction,
+        "setup_strength": setup_strength,
         "confidence": confidence,
         "entry_low":  entry_low,
         "entry_high": entry_high,
@@ -6031,6 +6058,23 @@ def _validate_actionable_trade_plan(
     direction = (pred.get("direction") or "").upper()
     if direction not in ("LONG", "SHORT"):
         return errors
+
+    # Hai thang điểm có vai trò khác nhau:
+    # - setup_strength: chất lượng kỹ thuật của cấu trúc Entry/SL/TP và sự đồng thuận dữ liệu.
+    # - confidence: mức chắc chắn của model khi chọn LONG/SHORT thay vì hướng còn lại/NO TRADE.
+    # Một tín hiệu chỉ được lưu/theo dõi khi setup đủ mạnh; nếu model quên field mới,
+    # fallback sang confidence để giữ tương thích với output cũ.
+    raw_strength = pred.get("setup_strength")
+    if raw_strength is None:
+        raw_strength = pred.get("confidence")
+    try:
+        strength_val = float(raw_strength) if raw_strength is not None else None
+    except Exception:
+        strength_val = None
+    if strength_val is not None and strength_val < MIN_SETUP_STRENGTH:
+        errors.append(
+            f"Độ mạnh setup chỉ {strength_val:.1f}/100, dưới ngưỡng tối thiểu {MIN_SETUP_STRENGTH:.1f}/100 để lưu thành lệnh thật."
+        )
 
     if mode == "short":
         errors.extend(_validate_scalp_reversal_quality(pred, timeframe_data, output))
@@ -7181,6 +7225,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     pred = parse_prediction_from_output(output)
     direction = (pred.get("direction") or "").upper()
     final_conf = int(pred.get("confidence") or _extract_confidence_from_output(output) or 0)
+    # Nếu model quên field mới, fallback confidence để tương thích output cũ.
+    final_setup_strength = int(pred.get("setup_strength") or final_conf or 0)
 
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:
@@ -7188,7 +7234,18 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         return log_and_return("glm", "rejected", "GLM chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
 
     if direction not in {"LONG", "SHORT"} or final_conf < AUTO_SCAN_MIN_FINAL_CONFIDENCE:
-        return log_and_return("glm", "rejected", f"Tín hiệu cuối chỉ đạt {final_conf}%, dưới ngưỡng gửi {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+        return log_and_return("glm", "rejected", f"Độ chắc chắn chỉ đạt {final_conf}%, dưới ngưỡng gửi {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+
+    if final_setup_strength < AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH:
+        return log_and_return(
+            "glm",
+            "rejected",
+            f"Độ mạnh setup chỉ đạt {final_setup_strength}/100, dưới ngưỡng gửi {AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH}/100.",
+            pre_direction=pre_direction,
+            pre_confidence=pre_conf,
+            final_direction=direction,
+            final_confidence=final_conf,
+        )
 
     if _auto_scan_recently_sent(user_id, binance_symbol, mode, direction=direction):
         return log_and_return("cooldown", "skipped", "direction cooldown", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
