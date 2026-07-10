@@ -5515,12 +5515,22 @@ TRẢ VỀ JSON NỘI BỘ BẮT BUỘC:
 - Nếu decision là LONG/SHORT: entry_low, entry_high, sl, tp1, tp2 bắt buộc là số.
 - Nếu decision là NO_TRADE: entry_low, entry_high, sl, tp1, tp2 để null.
 - current_price nên copy đúng từ JSON input; nếu thiếu, Python sẽ tự chèn giá hiện tại lấy từ Binance.
+- setup_score_breakdown là bắt buộc. Chấm từng mục độc lập theo đúng điểm tối đa; Python sẽ tự cộng thành setup_strength, nên không được tự bịa tổng.
+- Rubric 100 điểm: xu_huong_da_khung 20, entry_dung_vung 20, sl_dung_cau_truc 15, tp_rr_hop_ly 20, dong_luong_xac_nhan 15, volume_nen_xac_nhan 10.
 
 Schema:
 {
   "symbol": "BTCUSDT",
   "mode": "SCALP hoặc SWING",
   "decision": "LONG | SHORT | NO_TRADE",
+  "setup_score_breakdown": {
+    "xu_huong_da_khung": 15,
+    "entry_dung_vung": 17,
+    "sl_dung_cau_truc": 13,
+    "tp_rr_hop_ly": 16,
+    "dong_luong_xac_nhan": 8,
+    "volume_nen_xac_nhan": 5
+  },
   "setup_strength": 74,
   "confidence": 56,
   "current_price": 61266.4,
@@ -5592,15 +5602,55 @@ def _clean_decision(value: str | None) -> str:
     return "WAIT"
 
 
+SETUP_SCORE_RUBRIC = {
+    "xu_huong_da_khung": 20.0,
+    "entry_dung_vung": 20.0,
+    "sl_dung_cau_truc": 15.0,
+    "tp_rr_hop_ly": 20.0,
+    "dong_luong_xac_nhan": 15.0,
+    "volume_nen_xac_nhan": 10.0,
+}
+
+
+def _setup_strength_from_payload(payload: dict | None) -> tuple[float | None, dict[str, float]]:
+    """Tính Độ mạnh setup từ rubric cố định 100 điểm.
+
+    Model chỉ chấm từng thành phần. Python clamp từng điểm theo trần rubric rồi cộng,
+    tránh trường hợp model tự ghi một tổng không khớp. Với output cũ chưa có breakdown,
+    fallback về setup_strength để giữ tương thích.
+    """
+    if not isinstance(payload, dict):
+        return None, {}
+
+    raw = payload.get("setup_score_breakdown")
+    if isinstance(raw, dict):
+        scores: dict[str, float] = {}
+        complete = True
+        for key, max_score in SETUP_SCORE_RUBRIC.items():
+            value = _num_or_none(raw.get(key))
+            if value is None:
+                complete = False
+                break
+            scores[key] = min(max(float(value), 0.0), float(max_score))
+        if complete:
+            return round(sum(scores.values()), 2), scores
+
+    legacy = _num_or_none(payload.get("setup_strength"))
+    if legacy is None:
+        return None, {}
+    return min(max(float(legacy), 0.0), 100.0), {}
+
+
 def parse_prediction_from_json_payload(payload: dict | None) -> dict:
     if not isinstance(payload, dict):
         return {"direction": "WAIT", "setup_strength": None, "confidence": None, "entry_low": None, "entry_high": None, "sl": None, "tp1": None, "tp2": None}
     decision = _clean_decision(payload.get("decision"))
-    setup_strength = _num_or_none(payload.get("setup_strength"))
+    setup_strength, setup_score_breakdown = _setup_strength_from_payload(payload)
     confidence = _num_or_none(payload.get("confidence"))
     return {
         "direction": decision,
         "setup_strength": setup_strength,
+        "setup_score_breakdown": setup_score_breakdown,
         "confidence": confidence,
         "entry_low": _num_or_none(payload.get("entry_low")),
         "entry_high": _num_or_none(payload.get("entry_high")),
@@ -5615,7 +5665,7 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
     mode_label = "SCALP" if mode == "short" else "SWING"
     symbol = str(payload.get("symbol") or fallback_symbol).upper()
     decision = _clean_decision(payload.get("decision"))
-    setup_strength = _num_or_none(payload.get("setup_strength"))
+    setup_strength, _setup_score_breakdown = _setup_strength_from_payload(payload)
     confidence = _num_or_none(payload.get("confidence"))
     strength_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
     confidence_text = f"{confidence:.0f}%" if confidence is not None else "N/A"

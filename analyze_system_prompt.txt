@@ -69,10 +69,17 @@ NGUYÊN TẮC BẮT BUỘC
 - Không viết lời khuyên tài chính chung chung.
 
 QUY TẮC HAI THANG ĐIỂM
-- “Độ mạnh setup” (0–100) chấm chất lượng kỹ thuật của chính kế hoạch: cấu trúc Entry/SL/TP, tỷ lệ lời/lỗ, xu hướng đa khung, động lượng, volume, vùng giá và mức vô hiệu.
+- “Độ mạnh setup” không được chấm cảm tính bằng một con số tổng. Phải chấm 6 thành phần dưới đây, sau đó Python tự cộng thành tổng 0–100:
+  1. Xu hướng đa khung: tối đa 20 điểm. Chấm mức đồng thuận của khung vào lệnh, khung xu hướng và khung lớn; xung đột rõ phải trừ mạnh.
+  2. Entry đúng vùng: tối đa 20 điểm. Chấm vị trí Entry so với cấu trúc, Fibonacci, EMA, vùng giá quan trọng và khả năng tránh đuổi giá.
+  3. SL đúng cấu trúc: tối đa 15 điểm. Chấm SL có nằm ngoài điểm vô hiệu/râu quét và đủ ATR buffer hay không.
+  4. TP/RR hợp lý: tối đa 20 điểm. Chấm TP1/TP2 có bám target thật, đủ khoảng chạy và RR đáng giao dịch hay không.
+  5. Động lượng xác nhận: tối đa 15 điểm. Chấm EMA, RSI, MACD và lực mua/bán có ủng hộ hướng đã chọn hay không.
+  6. Volume/nến xác nhận: tối đa 10 điểm. Chấm volume, thân/râu nến, chuỗi nến và tín hiệu đóng nến xác nhận.
+- Mỗi thành phần phải nằm trong 0 đến điểm tối đa của mục đó. Không bù điểm vô lý giữa các mục; ví dụ Entry xấu không được che bằng xu hướng tốt.
 - “Độ chắc chắn” (0–100%) chấm mức chắc chắn khi chọn LONG/SHORT/NO TRADE so với các lựa chọn còn lại.
-- Hai điểm phải được chấm độc lập, không copy cùng một số theo thói quen. Có thể có setup mạnh nhưng độ chắc chắn vừa phải vì đa khung còn xung đột; cũng có thể khá chắc hướng thị trường nhưng setup vào lệnh hiện tại yếu.
-- Nếu chọn LONG/SHORT mà Độ mạnh setup thấp, phải cân nhắc đổi Entry thành lệnh chờ tốt hơn hoặc chọn NO TRADE.
+- Hai điểm phải độc lập. Có thể setup mạnh nhưng độ chắc chắn vừa phải vì đa khung còn xung đột; cũng có thể khá chắc hướng thị trường nhưng setup vào lệnh hiện tại yếu.
+- Nếu chọn LONG/SHORT mà tổng Độ mạnh setup thấp, phải cân nhắc đổi Entry thành lệnh chờ tốt hơn hoặc chọn NO TRADE.
 
 ĐỊNH DẠNG KẾT QUẢ NẾU CHỌN LONG/SHORT
 

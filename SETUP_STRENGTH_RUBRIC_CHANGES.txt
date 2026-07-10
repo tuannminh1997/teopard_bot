@@ -1,0 +1,20 @@
+Teopard Bot - Setup Strength Rubric Fix
+
+Chỉ sửa:
+- analyze.py
+- analyze_system_prompt.txt
+
+Rubric 100 điểm:
+- Xu hướng đa khung: 20
+- Entry đúng vùng: 20
+- SL đúng cấu trúc: 15
+- TP/RR hợp lý: 20
+- Động lượng xác nhận: 15
+- Volume/nến xác nhận: 10
+
+Cách hoạt động:
+- Model chấm từng thành phần riêng.
+- Python giới hạn từng điểm theo trần và tự cộng thành Độ mạnh setup.
+- Manual và Auto Scan đều dùng tổng do Python cộng.
+- Độ chắc chắn vẫn là thang riêng.
+- Output cũ không có breakdown vẫn được fallback để tránh crash.
