@@ -166,3 +166,10 @@ Không cần set `AUTO_SCAN_SYMBOLS`. User chọn symbol bằng `/autoscanon BTC
 ## Text input/output
 
 Bản này dùng lại text prompt/text output cho GLM như mode thủ công cũ. Không dùng JSON input/output cho phân tích chính. Python vẫn parse text output bằng regex để lưu candidate/history/auto-check.
+
+## Auto Scan nghỉ đêm theo giờ Việt Nam
+
+- Từ 00:00 đến trước 07:00, Auto Scan tự tắt tạm thời để không gọi Binance/DeepSeek/GLM.
+- Lúc 07:00, bot chỉ tự bật lại những tài khoản đang bật trước khi bước vào giờ nghỉ.
+- Nếu user chủ động dùng `/autoscanoff` trong giờ nghỉ, bot sẽ không tự bật lại vào buổi sáng.
+- Mặc định không cần thêm Railway Variables. Có thể tùy chỉnh bằng `AUTO_SCAN_SLEEP_HOUR_VN` và `AUTO_SCAN_WAKE_HOUR_VN`.

@@ -107,6 +107,9 @@ AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTO_SCAN_CANDLE_CLOSE_DEL
 AUTO_SCAN_SCHEDULER_TICK_SECONDS = max(30, int(os.getenv("AUTO_SCAN_SCHEDULER_TICK_SECONDS", "60") or "60"))
 AUTO_SCAN_LOG_LIMIT = int(os.getenv("AUTO_SCAN_LOG_LIMIT", "20"))
 AUTO_SCAN_DEBUG = os.getenv("AUTO_SCAN_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+# Khung giờ nghỉ Auto Scan theo giờ Việt Nam: 00:00-07:00.
+AUTO_SCAN_SLEEP_HOUR_VN = int(os.getenv("AUTO_SCAN_SLEEP_HOUR_VN", "0"))
+AUTO_SCAN_WAKE_HOUR_VN = int(os.getenv("AUTO_SCAN_WAKE_HOUR_VN", "7"))
 
 # DeepSeek filter: dùng OpenAI-compatible Chat Completions. Mặc định trỏ OpenRouter
 # để bạn có thể dùng deepseek/deepseek-v4-flash hoặc model tương đương trên Railway.
@@ -6788,6 +6791,7 @@ def init_auto_scan_db() -> None:
                 chat_id     INTEGER,
                 enabled     INTEGER NOT NULL DEFAULT 0,
                 symbols     TEXT NOT NULL DEFAULT '',
+                night_resume INTEGER NOT NULL DEFAULT 0,
                 updated_at  TEXT NOT NULL
             )
         """)
@@ -6832,6 +6836,7 @@ def init_auto_scan_db() -> None:
         """)
         for col, definition in [
             ("symbols", "TEXT NOT NULL DEFAULT ''"),
+            ("night_resume", "INTEGER NOT NULL DEFAULT 0"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE auto_scan_settings ADD COLUMN {col} {definition}")
@@ -6858,11 +6863,12 @@ def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: li
         if symbols_text is None:
             conn.execute(
                 """
-                INSERT INTO auto_scan_settings (user_id, chat_id, enabled, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO auto_scan_settings (user_id, chat_id, enabled, night_resume, updated_at)
+                VALUES (?, ?, ?, 0, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     chat_id=excluded.chat_id,
                     enabled=excluded.enabled,
+                    night_resume=0,
                     updated_at=excluded.updated_at
                 """,
                 (user_id, chat_id, 1 if enabled else 0, iso(utc_now())),
@@ -6870,12 +6876,13 @@ def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: li
         else:
             conn.execute(
                 """
-                INSERT INTO auto_scan_settings (user_id, chat_id, enabled, symbols, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO auto_scan_settings (user_id, chat_id, enabled, symbols, night_resume, updated_at)
+                VALUES (?, ?, ?, ?, 0, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     chat_id=excluded.chat_id,
                     enabled=excluded.enabled,
                     symbols=excluded.symbols,
+                    night_resume=0,
                     updated_at=excluded.updated_at
                 """,
                 (user_id, chat_id, 1 if enabled else 0, symbols_text, iso(utc_now())),
@@ -6886,12 +6893,50 @@ def get_auto_scan_status(user_id: int) -> dict:
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT user_id, chat_id, enabled, symbols, updated_at FROM auto_scan_settings WHERE user_id=?",
+            "SELECT user_id, chat_id, enabled, symbols, night_resume, updated_at FROM auto_scan_settings WHERE user_id=?",
             (user_id,),
         ).fetchone()
     if not row:
         return {"enabled": False, "chat_id": None, "updated_at": None}
-    return {"user_id": row[0], "chat_id": row[1], "enabled": bool(row[2]), "symbols": row[3] or "", "updated_at": row[4]}
+    return {"user_id": row[0], "chat_id": row[1], "enabled": bool(row[2]), "symbols": row[3] or "", "night_resume": bool(row[4]), "updated_at": row[5]}
+
+
+def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
+    """Tắt tạm Auto Scan từ 00:00 đến trước 07:00 theo giờ Việt Nam.
+
+    Chỉ các tài khoản đang bật lúc vào khung nghỉ mới được đánh dấu để tự bật lại.
+    Nếu user chủ động /autoscanoff trong đêm, cờ tự bật lại sẽ bị hủy.
+    """
+    init_auto_scan_db()
+    local_now = (now or utc_now()).astimezone(VN_TZ)
+    hour = local_now.hour
+    sleep_hour = max(0, min(23, int(AUTO_SCAN_SLEEP_HOUR_VN)))
+    wake_hour = max(0, min(23, int(AUTO_SCAN_WAKE_HOUR_VN)))
+    in_sleep_window = (sleep_hour <= hour < wake_hour) if sleep_hour < wake_hour else (hour >= sleep_hour or hour < wake_hour)
+    disabled = 0
+    resumed = 0
+    with sqlite3.connect(DB_PATH) as conn:
+        if in_sleep_window:
+            cur = conn.execute(
+                "UPDATE auto_scan_settings SET enabled=0, night_resume=1, updated_at=? WHERE enabled=1",
+                (iso(utc_now()),),
+            )
+            disabled = int(cur.rowcount or 0)
+        else:
+            cur = conn.execute(
+                "UPDATE auto_scan_settings SET enabled=1, night_resume=0, updated_at=? WHERE night_resume=1",
+                (iso(utc_now()),),
+            )
+            resumed = int(cur.rowcount or 0)
+        conn.commit()
+    return {
+        "in_sleep_window": in_sleep_window,
+        "disabled": disabled,
+        "resumed": resumed,
+        "local_time": local_now.isoformat(),
+        "sleep_hour": sleep_hour,
+        "wake_hour": wake_hour,
+    }
 
 
 def get_auto_scan_enabled_users() -> list[dict]:
@@ -7125,6 +7170,7 @@ def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
 
 
 def get_auto_scan_runtime_status(user_id: int) -> dict:
+    window = maintain_auto_scan_daily_window()
     status = get_auto_scan_status(user_id)
     slot = _auto_scan_slot_info()
     logs = get_auto_scan_logs(user_id, limit=1)
@@ -7135,6 +7181,9 @@ def get_auto_scan_runtime_status(user_id: int) -> dict:
         "current_slot": slot.get("slot"),
         "next_scan_at": slot.get("next_slot"),
         "last_log": logs[0] if logs else None,
+        "in_sleep_window": bool(window.get("in_sleep_window")),
+        "sleep_hour_vn": int(window.get("sleep_hour", AUTO_SCAN_SLEEP_HOUR_VN)),
+        "wake_hour_vn": int(window.get("wake_hour", AUTO_SCAN_WAKE_HOUR_VN)),
     }
 
 
@@ -7477,7 +7526,15 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
 
 async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
-    """Auto Scan runs near closed-candle slots, not just every N seconds after bot start."""
+    """Auto Scan chạy theo slot nến và tự nghỉ 00:00-07:00 giờ Việt Nam."""
+    window = maintain_auto_scan_daily_window()
+    if window.get("in_sleep_window") and not force:
+        return {
+            "users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(),
+            "sent": 0, "checked": 0, "errors": 0, "skipped": True,
+            "reason": f"daily sleep window {window.get('sleep_hour'):02d}:00-{window.get('wake_hour'):02d}:00 VN",
+            "next_scan_at": None,
+        }
     should_run, slot_info = should_run_auto_scan_now()
     if not force and not should_run:
         return {"users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(), "sent": 0, "checked": 0, "errors": 0, "skipped": True, "reason": slot_info.get("skip_reason"), "next_scan_at": slot_info.get("next_slot")}

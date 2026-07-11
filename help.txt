@@ -155,3 +155,8 @@ Cập nhật V19 - lưu history theo xác nhận user:
 Auto Scan là mode riêng, quét theo nến đã đóng. DeepSeek lọc nhanh trước; nếu tín hiệu đủ tốt mới gọi GLM phân tích đầy đủ như mode thủ công. Nếu GLM đủ ngưỡng confidence thì bot tự gửi tín hiệu và tự lưu theo dõi, không cần bấm nút xác nhận.
 
 Auto Scan chỉ cho 1 symbol/tài khoản để tiết kiệm tài nguyên. Ví dụ: /autoscanon BTC
+
+Ghi chú giờ nghỉ Auto Scan:
+- Auto Scan tự nghỉ từ 00:00 đến trước 07:00 theo giờ Việt Nam.
+- Lúc 07:00, bot tự bật lại nếu Auto Scan đang bật trước giờ nghỉ.
+- Nếu bạn chủ động dùng /autoscanoff trong đêm, sáng bot sẽ không tự bật lại.

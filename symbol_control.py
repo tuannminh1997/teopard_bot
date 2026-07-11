@@ -598,6 +598,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Mode đang quét: {modes}.\n"
         f"DeepSeek lọc nhanh tối thiểu: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}%.\n"
         f"GLM gửi tín hiệu tối thiểu: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%.\n"
+        "Giờ nghỉ tự động: 00:00-07:00 theo giờ Việt Nam; sáng bot tự bật lại nếu trước đó đang bật.\n"
         "Khi có tín hiệu đủ tốt, bot sẽ tự gửi và tự lưu theo dõi, không cần bấm xác nhận."
     )
 
@@ -703,9 +704,15 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
             f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
             f"DeepSeek: {pre} | GLM: {final} | {_display_scan_reason(last_log.get('reason'))}"
         )
+    if status.get("in_sleep_window") and status.get("night_resume"):
+        state_text = "🌙 ĐANG NGHỈ ĐÊM — sẽ tự bật lại lúc 07:00"
+    else:
+        state_text = "🟢 ĐANG BẬT" if status.get("enabled") else "🔴 ĐANG TẮT"
+
     await message.reply_text(
         "🤖 Auto Scan status:\n"
-        f"Trạng thái: {'🟢 ĐANG BẬT' if status.get('enabled') else '🔴 ĐANG TẮT'}\n"
+        f"Trạng thái: {state_text}\n"
+        f"Giờ hoạt động tự động: 07:00-24:00 theo giờ Việt Nam\n"
         f"Symbol: {', '.join(symbols) if symbols else 'chưa chọn'}\n"
         f"Chu kỳ nến: {int(AUTO_SCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng\n"
         f"Mode: {modes}\n"
