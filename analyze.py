@@ -3756,10 +3756,10 @@ SETUP_SCORE_WEIGHTS = {
 }
 
 CONFIDENCE_SCORE_WEIGHTS = {
-    "loi_the_quyet_dinh": 30.0,
+    "loi_the_quyet_dinh": 20.0,
     "huong_lon_ro_rang": 25.0,
-    "hanh_dong_gia_dong_thuan": 20.0,
-    "chi_bao_dong_thuan": 15.0,
+    "hanh_dong_gia_dong_thuan": 25.0,
+    "chi_bao_dong_thuan": 20.0,
     "boi_canh_thi_truong_ung_ho": 10.0,
 }
 
@@ -4342,17 +4342,6 @@ def _format_model_level_map(
     for k, v in (big_structure.get("fib") or {}).items():
         add(v, f"Fib {big_label} {k}")
 
-    # Liquidity box: đưa cả mép gần/mép xa để model biết nếu mép gần quá sát thì chọn mép xa/target kế tiếp.
-    for role in ("near", "main", "deep"):
-        z = zones.get(f"upper_{role}")
-        if z and z[0] is not None and z[1] is not None:
-            add(float(z[0]), f"liq trên {role} mép gần")
-            add(float(z[1]), f"liq trên {role} mép xa")
-        z = zones.get(f"lower_{role}")
-        if z and z[0] is not None and z[1] is not None:
-            add(float(z[1]), f"liq dưới {role} mép gần")
-            add(float(z[0]), f"liq dưới {role} mép xa")
-
     def compact(items: list[tuple[float, str]], side: str) -> str:
         if not items:
             return f"{side}: N/A"
@@ -4375,10 +4364,9 @@ def _format_model_level_map(
         return side + ": " + "; ".join(item_text(v, name) for v, name in unique)
 
     return "\n".join([
-        "BẢN ĐỒ LEVEL CHO MODEL LẬP ENTRY/SL/TP — dùng nội bộ, không show user:",
-        compact(above, "- Mức phía trên giá hiện tại: ứng viên TP LONG / SL SHORT / Entry SHORT"),
-        compact(below, "- Mức phía dưới giá hiện tại: ứng viên TP SHORT / SL LONG / Entry LONG"),
-        f"- Nguyên tắc chọn target: không lấy level gần nhất làm TP nếu nó chỉ là nhiễu nhỏ quanh Entry. Hãy chọn target ở kháng cự/hỗ trợ/Fibonacci/đỉnh đáy/vùng quét kế tiếp có ý nghĩa; nếu target gần nhất quá sát, bỏ qua và chọn bậc kế tiếp hoặc đổi sang lệnh chờ để có Entry tốt hơn.",
+        "CÁC MỨC KỸ THUẬT THAM KHẢO — dùng nội bộ, không show user:",
+        compact(above, "- Mức phía trên giá hiện tại"),
+        compact(below, "- Mức phía dưới giá hiện tại"),
     ])
 
 
@@ -4387,42 +4375,20 @@ def _format_model_plan_contract(
     mode: str,
     price: float,
 ) -> str:
-    """Hợp đồng lập lệnh cho model: Python không tự sửa TP/SL nên model phải tự tính đúng.
+    """Bốn nguyên tắc ngắn để model lập kế hoạch theo cấu trúc.
 
-    Block này không chốt lệnh thay model. Nó chỉ đưa ra quy trình và ngưỡng thực dụng
-    để model tự chọn Entry/SL/TP từ các level đã có, tránh TP/SL quá sát hoặc bịa số.
+    RR chỉ là bộ kiểm tra sau cùng. Block này không đưa mốc RR, khoảng cách TP,
+    độ rộng Entry hay công thức ATR để tránh neo model vào các con số tối thiểu.
     """
-    main_label, structure_label, _ = _mode_labels(mode)
-    trigger_label = _mode_trigger_label(mode)
-    atr_trigger = _current_atr(timeframe_data.get(trigger_label)) or 0.0
-    atr_main = _current_atr(timeframe_data.get(main_label)) or 0.0
-    atr_structure = _current_atr(timeframe_data.get(structure_label)) or 0.0
-    min_stop = _minimum_stop_distance(timeframe_data, mode, price)
-    sl_buf = _structural_sl_buffer(timeframe_data, mode, price)
-    risk_ref = _risk_floor(timeframe_data, mode, price)
-
-    if mode == "short":
-        # TP sát hơn mức này thường không đáng với phí/trượt giá/nhiễu scalp.
-        tp1_noise_floor = max(price * 0.0018, atr_main * 0.45, min_stop * 0.80)
-        tp2_noise_floor = max(price * 0.0035, atr_main * 0.90, min_stop * 1.25)
-        entry_width_hint = max(price * 0.0007, atr_main * 0.20)
-        label = "SCALP"
-    else:
-        tp1_noise_floor = max(price * 0.0060, atr_main * 0.60, min_stop * 0.85)
-        tp2_noise_floor = max(price * 0.0120, atr_main * 1.10, min_stop * 1.35)
-        entry_width_hint = max(price * 0.0020, atr_main * 0.25)
-        label = "SWING"
-
+    _ = timeframe_data, price
     return "\n".join([
-        "HỢP ĐỒNG LẬP LỆNH CHO MODEL — dùng nội bộ, không show user:",
-        f"- Mode {label}: Python không tự cứu TP/SL mặc định. Nếu bạn xuất TP/SL quá sát hoặc sai cấu trúc, Python có thể đổi thành NO TRADE.",
+        "NGUYÊN TẮC LẬP ENTRY/SL/TP — dùng nội bộ, không show user:",
         f"- Vai trò timeframe: {_mode_role_text(mode)}",
-        f"- ATR tham chiếu: trigger {trigger_label}={fmt(atr_trigger)}, setup {main_label}={fmt(atr_main)}, structure {structure_label}={fmt(atr_structure)} | min_stop≈{fmt(min_stop)} | SL buffer cấu trúc≈{fmt(sl_buf)} | risk tham chiếu≈{fmt(risk_ref)}.",
-        f"- Độ rộng Entry gợi ý: khoảng {fmt(entry_width_hint)}–{fmt(entry_width_hint * 2.2)} USDT tùy biến động; không làm Entry quá rộng để che sai điểm vào.",
-        f"- TP1 không nên chỉ cách Entry vài tick. Trừ khi có cấu trúc cực rõ và SL rất ngắn, TP1 nên cách mép Entry bất lợi ít nhất khoảng max({fmt(tp1_noise_floor)} USDT, {fmt(MIN_TP1_R)}R) và phải trùng/tiệm cận một level thực tế.",
-        f"- TP2 nên là bậc cấu trúc kế tiếp, tối thiểu khoảng max({fmt(tp2_noise_floor)} USDT, {fmt(MIN_TP2_R)}R). TP2 không phải số trang trí; nếu không có bậc kế tiếp, chọn TP2 theo biên lớn/Fib kế tiếp hoặc NO TRADE.",
-        "- Quy trình bắt buộc: (1) chọn hướng; (2) chọn Entry; (3) chọn invalidation/SL ngoài đỉnh đáy hoặc râu quét; (4) tính risk theo mép Entry bất lợi; (5) chọn TP1/TP2 từ target ladder đủ xa và có lý do; (6) nếu RR xấu, ưu tiên đổi Entry thành lệnh chờ tốt hơn trước khi NO TRADE.",
-        "- Không bịa SL/TP chỉ để đủ tỷ lệ. Nếu target thực tế không đủ xa hoặc SL cấu trúc làm kèo không đáng, hãy chọn NO TRADE thay vì đặt TP sát.",
+        "1. Entry phải nằm tại một vùng kỹ thuật rõ ràng, không đuổi theo giá.",
+        "2. SL phải nằm ngoài điểm vô hiệu của ý tưởng giao dịch. Không đặt SL chỉ dựa trên một khoảng phần trăm hoặc ATR tùy ý.",
+        "3. TP1 và TP2 phải nằm tại các mục tiêu cấu trúc có ý nghĩa theo hướng giao dịch. TP1 là mục tiêu gần đáng chốt; TP2 là mục tiêu mở rộng kế tiếp. Không đặt TP chỉ để đạt một tỷ lệ RR tối thiểu.",
+        "4. Sau khi chọn các mức theo cấu trúc, mới kiểm tra RR. Nếu RR không đáng thực hiện, hãy cải thiện Entry hoặc chọn NO TRADE; không bóp SL và không bịa TP để làm đẹp RR.",
+        "- Trình tự: cấu trúc thị trường → chọn Entry, SL, TP1, TP2 → kiểm tra RR → giữ kế hoạch hoặc NO TRADE.",
     ])
 
 def build_feature_engineering_block(
@@ -4468,8 +4434,8 @@ def build_feature_engineering_block(
         _format_liquidity_window_line("Vùng thanh khoản dưới giá ước lượng", zones, "lower", price),
         _format_liquidity_window_line("Vùng thanh khoản trên giá ước lượng", zones, "upper", price),
         "- Vai trò vùng quét: Entry có thể tham khảo vùng gần/chính nếu hợp xu hướng và có xác nhận. Với SCALP, không dùng vùng thanh khoản dưới làm Entry LONG hoặc vùng thanh khoản trên làm Entry SHORT theo kiểu chạm-là-fill. Nếu cần thêm xác nhận, có thể ghi lệnh chờ kèm điều kiện rõ; chỉ chọn NO TRADE khi SL/TP, động lượng hoặc vùng vào không đạt.",
-        "- TP không được ép bám sát mép box thanh khoản ước lượng. Nếu box đối diện quá gần làm RR xấu, chính model phải chủ động dùng swing high/low kế tiếp, Fibonacci, EMA/vùng cấu trúc kế tiếp hoặc vùng quét đối diện có ý nghĩa. Nếu không có target đủ đáng thì chọn NO TRADE. Không tạo TP quá gần chỉ vì box thanh khoản rất hẹp.",
-        "- Quy tắc rủi ro V32: model là nguồn chính lập Entry/SL/TP. SL phải nằm ngoài swing high/low hoặc vùng invalidation gần nhất cộng/trừ ATR buffer; nếu setup dựa vào cú quét đáy/đỉnh mới nhất thì wick extreme của cú quét đó là invalidation trực tiếp và SL phải nằm ngoài wick đó. Python mặc định không tự sửa SL/TP sang mức khác; Python chỉ kiểm tra lỗi cứng rồi mới áp phần trăm buffer theo sở thích user nếu có. Vì vậy model phải chọn TP/SL hợp lý ngay từ đầu: TP1 nên >= 0.40R, TP2 nên >= 0.50R, nhưng ưu tiên target thực tế theo kháng cự/hỗ trợ/Fibonacci/swing/vùng quét thay vì target quá sát hoặc bịa.",
+        "- ATR và các vùng quét chỉ là dữ liệu tham khảo về biến động/cấu trúc; không dùng chúng như công thức máy móc để sinh SL hoặc TP.",
+        "- Python chỉ kiểm tra hình học và RR sau khi model đã chọn Entry/SL/TP theo cấu trúc. Không tạo TP từ phép nhân RR và không bóp SL để vượt guard.",
         "- Ghi chú: Vùng quét là vùng thanh khoản kỹ thuật ước lượng theo cửa sổ thời gian, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật nội bộ, không phải lệnh giao dịch chốt sẵn. Không show trực tiếp các vùng thanh khoản/thanh lý/heatmap ra user; chỉ dùng chúng để lập quyết định, Entry/SL/TP, lý do và rủi ro.",
     ]
     return "\n".join(lines)
@@ -4719,6 +4685,43 @@ def format_prediction_history(history: list[dict]) -> str:
     lines.append("Use this traded-only user-specific summary as learning context. These are signals the user explicitly chose to trade/follow; do not learn from unconfirmed analyses and do not assume global user behavior.")
     return "\n".join(lines)
 
+
+def format_deepseek_history_compact(history: list[dict], limit: int = 3) -> str:
+    """History cực gọn chỉ dành cho DeepSeek prefilter.
+
+    Không đưa market_snapshot/feature_snapshot/full_response vào prefilter để giữ
+    input token thấp. GLM phân tích chính vẫn nhận full history giống manual.
+    """
+    selected = list(history or [])[:max(0, int(limit))]
+    if not selected:
+        return "Không có lịch sử đã trade cho coin/mode này."
+
+    finished = [p for p in selected if p.get("result") in ("WIN", "LOSS")]
+    lines = [f"{len(selected)} lệnh đã trade gần nhất của đúng user/coin/mode:"]
+    if finished:
+        wins = sum(1 for p in finished if p.get("result") == "WIN")
+        lines.append(f"- Kết quả đã đóng: {wins}/{len(finished)} WIN.")
+
+    for index, pred in enumerate(selected, 1):
+        entry_low = pred.get("entry_low")
+        entry_high = pred.get("entry_high")
+        entry = (
+            f"{fmt(entry_low)}-{fmt(entry_high)}"
+            if entry_low is not None and entry_high is not None
+            else "N/A"
+        )
+        outcome_reason = str(pred.get("result_reason") or "").strip().replace("\n", " ")
+        if len(outcome_reason) > 120:
+            outcome_reason = outcome_reason[:117] + "..."
+        reason_suffix = f"; lý do kết quả: {outcome_reason}" if outcome_reason else ""
+        lines.append(
+            f"- #{index} {pred.get('direction') or 'N/A'} → {pred.get('result') or 'N/A'}; "
+            f"Entry {entry}; SL {fmt(pred.get('sl'))}; TP1 {fmt(pred.get('tp1'))}; "
+            f"TP2 {fmt(pred.get('tp2'))}{reason_suffix}."
+        )
+
+    lines.append("Chỉ dùng để tránh lặp sai lầm rõ ràng; không thay thế phân tích dữ liệu hiện tại.")
+    return "\n".join(lines)
 
 
 def _json_safe_value(value):
@@ -5599,6 +5602,20 @@ def _num_or_none(value) -> float | None:
 
 
 
+def _rubric_item_score(raw: float, maximum: float) -> float:
+    """Clamp một mục rubric và chuẩn hóa về số nguyên trong giới hạn cho phép.
+
+    Model được phép chấm mọi số nguyên từ 0 đến điểm tối đa của mục, thay vì bị
+    ép vào các nấc 20%. Nếu provider lỡ trả số thập phân, Python làm tròn về số
+    nguyên gần nhất rồi mới cộng tổng.
+    """
+    maximum = max(float(maximum), 0.0)
+    if maximum <= 0:
+        return 0.0
+    value = min(max(float(raw), 0.0), maximum)
+    return float(min(int(value + 0.5), int(maximum)))
+
+
 def _rubric_total(
     breakdown: dict | None,
     weights: dict[str, float],
@@ -5611,7 +5628,7 @@ def _rubric_total(
         raw = _num_or_none(breakdown.get(key))
         if raw is None:
             return None
-        total += min(max(float(raw), 0.0), float(maximum))
+        total += _rubric_item_score(float(raw), float(maximum))
     return min(max(total, 0.0), 100.0)
 
 
@@ -6317,17 +6334,42 @@ def _guarded_no_trade_output(
     current_price: float | None,
     errors: list[str],
     pred: dict | None = None,
+    timeframe_data: dict[str, pd.DataFrame | None] | None = None,
 ) -> str:
+    """Render NO TRADE do Python guard nhưng vẫn giữ hướng model đã ưu tiên.
+
+    QUYẾT ĐỊNH vẫn là NO TRADE vì lệnh không đạt guard. Tuy nhiên user cần thấy
+    kế hoạch gốc nghiêng LONG hay SHORT, đồng thời phân biệt hướng giao dịch với
+    xu hướng cấu trúc của khung xác nhận.
+    """
     mode_label = "SCALP" if mode == "short" else "SWING"
     price_text = f" Giá hiện tại {fmt(current_price)} USDT." if current_price is not None else ""
     reason = errors[0] if errors else "Kế hoạch LONG/SHORT bị bộ lọc rủi ro từ chối."
-    setup_strength = _num_or_none((pred or {}).get("setup_strength"))
-    confidence = _num_or_none((pred or {}).get("confidence"))
+    pred_data = pred or {}
+    setup_strength = _num_or_none(pred_data.get("setup_strength"))
+    confidence = _num_or_none(pred_data.get("confidence"))
     setup_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
     confidence_text = f"{confidence:.0f}%" if confidence is not None else "N/A"
+
+    rejected_direction = str(pred_data.get("direction") or "").upper()
+    direction_line = ""
+    if rejected_direction in ("LONG", "SHORT"):
+        direction_emoji = "📈" if rejected_direction == "LONG" else "📉"
+        direction_line = f"Hướng ưu tiên bị từ chối: {rejected_direction} {direction_emoji}\n"
+
+    structure_line = ""
+    if timeframe_data:
+        _main_label, structure_label, _big_label = _mode_labels(mode)
+        structure = _structure_info(timeframe_data.get(structure_label), current_price)
+        structure_trend = str(structure.get("trend") or "").upper()
+        if structure_trend in ("TĂNG", "GIẢM", "ĐI NGANG"):
+            structure_line = f"Xu hướng cấu trúc ({structure_label}): {structure_trend}\n"
+
     return sanitize_user_output(
         f"🎯 {symbol} — {mode_label}\n"
         f"🏆 QUYẾT ĐỊNH: NO TRADE\n"
+        f"{direction_line}"
+        f"{structure_line}"
         f"Độ mạnh setup: {setup_text}\n"
         f"Độ chắc chắn: {confidence_text}\n"
         f"Giá hiện tại: {fmt(current_price)} USDT\n"
@@ -6593,7 +6635,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
-        guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred)
+        guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred, timeframe_data)
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
         # V19: không lưu rejected vào predictions nữa để history chỉ gồm lệnh user thật sự trade.
         return guarded_output
@@ -6652,6 +6694,57 @@ async def collect_timeframe_data(binance_symbol: str, mode: str) -> dict[str, pd
     return dict(zip(tasks.keys(), results))
 
 
+async def prepare_analysis_context(
+    binance_symbol: str,
+    mode: str,
+    user_id: int | None = None,
+    timeframe_data: dict[str, pd.DataFrame | None] | None = None,
+) -> dict:
+    """Tạo cùng một context GLM cho manual và Auto Scan."""
+    if timeframe_data is None:
+        timeframe_data = await collect_timeframe_data(binance_symbol, mode)
+
+    if not any(df is not None and not df.empty for df in timeframe_data.values()):
+        raise RuntimeError(f"Could not fetch Binance data for {binance_symbol}.")
+
+    system_prompt, fear_greed_info, price_tuple, history, open_signals = await asyncio.gather(
+        asyncio.to_thread(load_system_prompt),
+        asyncio.to_thread(get_fear_greed_index),
+        asyncio.to_thread(get_current_price_str, binance_symbol),
+        asyncio.to_thread(get_recent_predictions, binance_symbol, mode, user_id),
+        asyncio.to_thread(get_open_signal_predictions, binance_symbol, mode, user_id),
+    )
+    current_price_str, current_price = price_tuple
+    feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
+    feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
+    market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
+    open_signal_context = format_open_signal_context(open_signals, current_price)
+    user_prompt = build_user_prompt(
+        symbol=binance_symbol,
+        mode=mode,
+        timeframe_data=timeframe_data,
+        fear_greed_info=fear_greed_info,
+        current_price_str=current_price_str,
+        history=history,
+        feature_block=feature_block,
+        open_signal_context=open_signal_context,
+    )
+    return {
+        "timeframe_data": timeframe_data,
+        "system_prompt": system_prompt,
+        "fear_greed_info": fear_greed_info,
+        "current_price_str": current_price_str,
+        "current_price": current_price,
+        "history": history,
+        "open_signals": open_signals,
+        "open_signal_context": open_signal_context,
+        "feature_block": feature_block,
+        "feature_snapshot": feature_snapshot,
+        "market_snapshot": market_snapshot,
+        "user_prompt": user_prompt,
+    }
+
+
 async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, chat_id: int | None = None) -> dict:
     """
     Async entry point used by Telegram handlers.
@@ -6665,46 +6758,14 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     binance_symbol = f"{symbol.upper()}USDT"
 
-    # Binance requests.get() chạy trong worker threads, các timeframe tải song song.
-    timeframe_data = await collect_timeframe_data(binance_symbol, mode)
-
-    if not any(df is not None and not df.empty for df in timeframe_data.values()):
-        raise RuntimeError(f"Could not fetch Binance data for {binance_symbol}.")
-
-    # Các nguồn dữ liệu sync khác cũng được wrap bằng to_thread.
-    system_prompt_task = asyncio.to_thread(load_system_prompt)
-    fear_greed_task = asyncio.to_thread(get_fear_greed_index)
-    current_price_task = asyncio.to_thread(get_current_price_str, binance_symbol)
-    history_task = asyncio.to_thread(get_recent_predictions, binance_symbol, mode, user_id)
-    open_signal_task = asyncio.to_thread(get_open_signal_predictions, binance_symbol, mode, user_id)
-
-    system_prompt, fear_greed_info, price_tuple, history, open_signals = await asyncio.gather(
-        system_prompt_task,
-        fear_greed_task,
-        current_price_task,
-        history_task,
-        open_signal_task,
-    )
-    current_price_str, current_price = price_tuple
-
-    feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
-    feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
-    market_snapshot = build_market_snapshot(
-        timeframe_data,
-        fear_greed_info,
-        current_price_str,
-    )
-    open_signal_context = format_open_signal_context(open_signals, current_price)
-    user_prompt = build_user_prompt(
-        symbol=binance_symbol,
-        mode=mode,
-        timeframe_data=timeframe_data,
-        fear_greed_info=fear_greed_info,
-        current_price_str=current_price_str,
-        history=history,
-        feature_block=feature_block,
-        open_signal_context=open_signal_context,
-    )
+    # GLM manual dùng chung context builder với GLM Auto Scan.
+    ctx = await prepare_analysis_context(binance_symbol, mode, user_id=user_id)
+    timeframe_data = ctx["timeframe_data"]
+    system_prompt = ctx["system_prompt"]
+    current_price = ctx["current_price"]
+    feature_snapshot = ctx["feature_snapshot"]
+    market_snapshot = ctx["market_snapshot"]
+    user_prompt = ctx["user_prompt"]
 
     # AI API đang sync, nên gọi trong worker thread để không block bot.
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
@@ -6734,7 +6795,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
-        guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred)
+        guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred, timeframe_data)
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
         # V19: không lưu rejected vào predictions/history nữa.
         return {"text": guarded_output, "candidate_id": None}
@@ -7202,7 +7263,7 @@ def build_deepseek_prefilter_text(
     Không tạo Entry/SL/TP và không gửi user.
     """
     mode_label = "SCALP" if mode == "short" else "SWING"
-    history_text = format_prediction_history(history[:3]) if history else "Không có lịch sử đã trade cho coin/mode này."
+    history_text = format_deepseek_history_compact(history, limit=3)
     compact_feature = (feature_snapshot or feature_block or "Không có feature snapshot.")
     return "\n".join([
         f"AUTO SCAN PREFILTER — {symbol} {mode_label}",
@@ -7360,18 +7421,21 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if not any(df is not None and not df.empty for df in timeframe_data.values()):
         return log_and_return("binance", "error", "no binance data")
 
-    fear_greed_info, price_tuple, history, open_signals, system_prompt = await asyncio.gather(
-        asyncio.to_thread(get_fear_greed_index),
-        asyncio.to_thread(get_current_price_str, binance_symbol),
-        asyncio.to_thread(get_recent_predictions, binance_symbol, mode, user_id),
-        asyncio.to_thread(get_open_signal_predictions, binance_symbol, mode, user_id),
-        asyncio.to_thread(load_system_prompt),
+    # GLM Auto Scan dùng đúng cùng context builder với manual.
+    ctx = await prepare_analysis_context(
+        binance_symbol,
+        mode,
+        user_id=user_id,
+        timeframe_data=timeframe_data,
     )
-    current_price_str, current_price = price_tuple
-    feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
-    feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
-    market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
-    open_signal_context = format_open_signal_context(open_signals, current_price)
+    system_prompt = ctx["system_prompt"]
+    current_price_str = ctx["current_price_str"]
+    current_price = ctx["current_price"]
+    history = ctx["history"]
+    open_signal_context = ctx["open_signal_context"]
+    feature_block = ctx["feature_block"]
+    feature_snapshot = ctx["feature_snapshot"]
+    market_snapshot = ctx["market_snapshot"]
     prefilter_text = build_deepseek_prefilter_text(
         symbol=binance_symbol,
         mode=mode,
@@ -7436,16 +7500,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             pre_direction=pre_label, pre_confidence=None,
         )
 
-    user_prompt = build_user_prompt(
-        symbol=binance_symbol,
-        mode=mode,
-        timeframe_data=timeframe_data,
-        fear_greed_info=fear_greed_info,
-        current_price_str=current_price_str,
-        history=history,
-        feature_block=feature_block,
-        open_signal_context=open_signal_context,
-    )
+    user_prompt = ctx["user_prompt"]
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
     scored_output, _score_meta = finalize_model_scoring_output(raw_output)
     output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
