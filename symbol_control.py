@@ -237,7 +237,14 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
     try:
         result_payload = await analyze_symbol(symbol, mode, user_id=user.id, chat_id=query.message.chat_id)
     except Exception as exc:
-        await query.message.reply_text(f"Phân tích thất bại: {exc}")
+        error_text = str(exc)
+        if "timed out" in error_text.lower() or "timeout" in error_text.lower():
+            await query.message.reply_text(
+                "Phân tích thất bại: Z.AI không trả lời kịp sau lần thử chính và một lần retry. "
+                "Lượt sử dụng không bị trừ; bạn có thể chạy lại sau ít phút."
+            )
+        else:
+            await query.message.reply_text(f"Phân tích thất bại: {error_text}")
         return
 
     increment_user_usage(user.id)

@@ -49,11 +49,13 @@ ZAI_API_KEY=...
 ZAI_MODEL=glm-5.2
 ZAI_BASE_URL=https://api.z.ai/api/paas/v4
 ZAI_REASONING_EFFORT=high
+ZAI_RETRY_REASONING_EFFORT=medium
 ZAI_SUMMARY_REASONING_EFFORT=none
 ZAI_APP_NAME=Teopard Bot
 
-LLM_MAX_OUTPUT_TOKENS=8000
-LLM_MAX_CONTINUATIONS=2
+LLM_MAX_OUTPUT_TOKENS=2600
+LLM_MAIN_OUTPUT_TOKEN_CAP=2600
+LLM_MAX_CONTINUATIONS=0
 LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
 
 TEOPARD_PYTHON_ADJUST_SL=0
@@ -126,13 +128,15 @@ TEOPARD_TP2_EXTRA_BUFFER_PCT
 History chỉ lưu lệnh khi user bấm xác nhận đã trade theo bot. `/cleardrafts CONFIRM` chỉ xóa lệnh nháp/candidate và giữ nguyên history.
 
 ## Hotfix timeout provider AI
-Nếu gặp lỗi `Read timed out` từ Z.AI/OpenRouter, đây thường là lỗi tạm thời từ provider hoặc request quá lâu. Bản này có retry tự động.
+Nếu gặp lỗi `Read timed out` từ Z.AI/OpenRouter, đây là provider không trả response trong thời gian đọc. Bản này chỉ retry một lần; lần đầu dùng reasoning đã cấu hình, retry tự hạ xuống `ZAI_RETRY_REASONING_EFFORT` để tránh treo lặp lại. Main analysis không continuation và được cap output token. Bot cũng không gọi LLM lần hai chỉ để tóm tắt history.
 Có thể chỉnh Railway variables:
 
 ```env
-LLM_MAIN_TIMEOUT_SECONDS=180
+LLM_MAIN_TIMEOUT_SECONDS=240
+LLM_RETRY_TIMEOUT_SECONDS=150
 LLM_SUMMARY_TIMEOUT_SECONDS=60
-LLM_API_RETRIES=2
+LLM_API_RETRIES=1
+LLM_MAIN_RETRY_LIMIT=1
 LLM_RETRY_SLEEP_SECONDS=2
 ```
 

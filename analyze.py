@@ -76,18 +76,26 @@ ZAI_MODEL    = os.getenv("ZAI_MODEL", "glm-5.2")
 ZAI_BASE_URL = os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4").rstrip("/")
 # Vì bạn muốn giảm lag, native Z.AI mặc định dùng high thay vì max. Có thể đổi max/xhigh trên Railway nếu muốn.
 ZAI_REASONING_EFFORT = os.getenv("ZAI_REASONING_EFFORT", "high").strip()
+# Nếu lần gọi chính đầu tiên timeout, retry bằng mức reasoning nhẹ hơn để tránh treo lặp lại.
+ZAI_RETRY_REASONING_EFFORT = os.getenv("ZAI_RETRY_REASONING_EFFORT", "medium").strip()
 ZAI_SUMMARY_REASONING_EFFORT = os.getenv("ZAI_SUMMARY_REASONING_EFFORT", "none").strip()
 ZAI_APP_NAME = os.getenv("ZAI_APP_NAME", "Teopard Bot")
 # Trading output cần ổn định, không sáng tạo quá nhiều. Railway có thể override bằng ZAI_TEMPERATURE.
 ZAI_TEMPERATURE = _env_float("ZAI_TEMPERATURE", 0.10)
 
-LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "8000"))
-LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "2"))
-# Timeout/retry cho provider AI. Z.AI/OpenRouter thỉnh thoảng timeout tạm thời,
-# nên retry ngắn giúp bot không chết chỉ vì một request bị treo.
-LLM_MAIN_TIMEOUT_SECONDS = int(os.getenv("LLM_MAIN_TIMEOUT_SECONDS", "180"))
+# Output public chỉ khoảng 150-280 từ nên không cần cửa sổ 8000 token.
+# Cap riêng cho main call vẫn có hiệu lực kể cả Railway còn giữ biến cũ quá lớn.
+LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "2600"))
+LLM_MAIN_OUTPUT_TOKEN_CAP = int(os.getenv("LLM_MAIN_OUTPUT_TOKEN_CAP", "2600"))
+# Main analysis không continuation: output ngắn, continuation chỉ làm một request có thể treo nhiều vòng.
+LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "0"))
+# Timeout/retry cho provider AI.
+# Lần đầu cho GLM high reasoning thêm thời gian; nếu timeout chỉ retry 1 lần bằng medium.
+LLM_MAIN_TIMEOUT_SECONDS = int(os.getenv("LLM_MAIN_TIMEOUT_SECONDS", "240"))
+LLM_RETRY_TIMEOUT_SECONDS = int(os.getenv("LLM_RETRY_TIMEOUT_SECONDS", "150"))
 LLM_SUMMARY_TIMEOUT_SECONDS = int(os.getenv("LLM_SUMMARY_TIMEOUT_SECONDS", "60"))
-LLM_API_RETRIES = int(os.getenv("LLM_API_RETRIES", "2"))
+LLM_API_RETRIES = int(os.getenv("LLM_API_RETRIES", "1"))
+LLM_MAIN_RETRY_LIMIT = int(os.getenv("LLM_MAIN_RETRY_LIMIT", "1"))
 LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
 
 # ─── Auto Scan mode config ──────────────────────────────────────────────────
@@ -5511,18 +5519,37 @@ def create_with_continuation(
     full_text = ""
     max_attempts = LLM_MAX_CONTINUATIONS + 1 if allow_continuation else 1
     retry_count = max(0, LLM_API_RETRIES)
+    if call_type in ("main", "main_json"):
+        # Không cho biến Railway cũ LLM_API_RETRIES=2/3 làm manual treo 9-20 phút.
+        retry_count = min(retry_count, max(0, LLM_MAIN_RETRY_LIMIT))
+    elif call_type == "summary":
+        # Summary chỉ là metadata phụ; không đáng giữ user chờ thêm vì retry.
+        retry_count = 0
 
     for attempt in range(max_attempts):
         result = None
         last_exc: Exception | None = None
         for retry_idx in range(retry_count + 1):
+            effective_timeout = timeout
+            effective_reasoning_effort = reasoning_effort
+            if retry_idx > 0 and call_type in ("main", "main_json"):
+                effective_timeout = max(30, min(timeout, LLM_RETRY_TIMEOUT_SECONDS))
+                if _is_zai_provider():
+                    effective_reasoning_effort = ZAI_RETRY_REASONING_EFFORT or "medium"
             try:
+                print(
+                    f"[LLM_CALL] call_type={call_type} provider={get_ai_provider_label()} "
+                    f"model={get_ai_model_name()} attempt={attempt + 1} try={retry_idx + 1}/{retry_count + 1} "
+                    f"timeout={effective_timeout}s max_tokens={max_tokens} "
+                    f"effort={effective_reasoning_effort or 'default'}",
+                    flush=True,
+                )
                 result = llm_create_once(
                     system,
                     convo,
                     max_tokens=max_tokens,
-                    timeout=timeout,
-                    reasoning_effort=reasoning_effort,
+                    timeout=effective_timeout,
+                    reasoning_effort=effective_reasoning_effort,
                 )
                 break
             except Exception as exc:
@@ -5579,6 +5606,21 @@ def create_with_continuation(
             },
         ]
     return full_text.strip()
+
+
+def build_local_reasoning_summary(full_response: str, limit: int = 420) -> str:
+    """Lấy phần Lý do trực tiếp từ output, tránh gọi thêm LLM chỉ để lưu metadata."""
+    text = sanitize_user_output(full_response or "").strip()
+    if not text:
+        return ""
+    match = re.search(
+        r"(?:^|\n)\s*Lý\s*do\s*:\s*(.*?)(?=\n\s*⚠️\s*Rủi\s*ro\s*:|\Z)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    summary = match.group(1).strip() if match else text
+    summary = re.sub(r"\s+", " ", summary).strip()
+    return _truncate_text(summary, limit)
 
 
 # ─── Tóm tắt reasoning bằng call model thứ 2 (rất ngắn) ──────────────────────
@@ -6828,11 +6870,14 @@ def load_timeframe_data(binance_symbol: str, interval: str, limit: int) -> pd.Da
 
 
 def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
-    """Sync helper: gọi model hiện tại qua Anthropic hoặc OpenRouter/GLM."""
+    """Sync helper: gọi model chính; output ngắn nên không continuation."""
+    max_tokens = max(800, min(LLM_MAX_OUTPUT_TOKENS, LLM_MAIN_OUTPUT_TOKEN_CAP))
     return create_with_continuation(
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
+        max_tokens=max_tokens,
         timeout=LLM_MAIN_TIMEOUT_SECONDS,
+        allow_continuation=False,
         call_type="main",
     )
 
@@ -6925,7 +6970,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     )
 
     if can_track:
-        reasoning_summary = summarize_reasoning(output)
+        reasoning_summary = build_local_reasoning_summary(output)
         save_trade_candidate(
             symbol=binance_symbol,
             mode=mode,
@@ -7032,9 +7077,16 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     await asyncio.to_thread(init_prediction_db)
 
     binance_symbol = f"{symbol.upper()}USDT"
+    loop = asyncio.get_running_loop()
+    manual_started = loop.time()
+    print(f"[MANUAL_START] symbol={binance_symbol} mode={mode} user_id={user_id}", flush=True)
 
     # GLM manual dùng chung context builder với GLM Auto Scan.
     ctx = await prepare_analysis_context(binance_symbol, mode, user_id=user_id)
+    print(
+        f"[MANUAL_CONTEXT_READY] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
+        flush=True,
+    )
     timeframe_data = ctx["timeframe_data"]
     system_prompt = ctx["system_prompt"]
     current_price = ctx["current_price"]
@@ -7043,7 +7095,12 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     user_prompt = ctx["user_prompt"]
 
     # AI API đang sync, nên gọi trong worker thread để không block bot.
+    print(f"[MANUAL_LLM_START] symbol={binance_symbol} mode={mode}", flush=True)
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
+    print(
+        f"[MANUAL_LLM_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
+        flush=True,
+    )
     scored_output, _score_meta = finalize_model_scoring_output(raw_output)
     output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
     pred = _attach_plan_sources(parse_prediction_from_output(output), raw_output)
@@ -7086,7 +7143,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     candidate_id = None
     if can_track:
-        reasoning_summary = await asyncio.to_thread(summarize_reasoning, output)
+        reasoning_summary = build_local_reasoning_summary(output)
         candidate_id = await asyncio.to_thread(
             save_trade_candidate,
             symbol=binance_symbol,
@@ -7113,6 +7170,11 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
                 missing.append(f"Không parse được {field}.")
         log_hidden_rejection(binance_symbol, mode, pred, missing, output)
 
+    print(
+        f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} candidate_id={candidate_id} "
+        f"elapsed={loop.time() - manual_started:.1f}s",
+        flush=True,
+    )
     return {"text": output, "candidate_id": candidate_id}
 
 
@@ -7824,7 +7886,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if not can_track:
         return log_and_return("glm", "rejected", "missing trade levels", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
 
-    reasoning_summary = await asyncio.to_thread(summarize_reasoning, output)
+    reasoning_summary = build_local_reasoning_summary(output)
     prediction_id = await asyncio.to_thread(
         save_prediction,
         symbol=binance_symbol,
