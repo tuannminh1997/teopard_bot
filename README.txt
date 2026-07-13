@@ -8,7 +8,14 @@ Bản này chốt dùng GLM native qua Z.AI.
 - Python tính dữ liệu cứng: EMA, RSI, MACD, ATR, Fibonacci, cấu trúc, vùng stop/liquidity ước lượng.
 - Model GLM tự phân tích và tự chọn Entry / SL / TP.
 - Python mặc định không tự nhảy SL/TP sang số khác.
-- Python chỉ validate lỗi hình học/risk tối thiểu, xử lý lệnh chờ, và chỉ lưu history khi user bấm xác nhận đã trade theo bot.
+- Python validate hình học, nguồn level, RR theo mode và khoảng chống nhiễu ATR; xử lý lệnh chờ, và chỉ lưu history khi user bấm xác nhận đã trade theo bot.
+
+## Cơ chế Entry / SL / TP bản structural-final
+
+- Python gộp Fibonacci, EMA, đỉnh/đáy và vùng quét gần nhau thành tối đa 6 level mỗi phía.
+- Model phải khai báo nguồn nội bộ cho Entry, SL, TP1, TP2 bằng ID level; block này được xóa trước khi gửi Telegram.
+- Python không tự bẻ số mặc định, nhưng từ chối kế hoạch nếu SL chưa nằm ngoài invalidation, TP không bám level, RR theo mode quá thấp, TP2 quá sát TP1 hoặc TP quá gần so với ATR của khung vào lệnh.
+- Các biến cũ `TEOPARD_MIN_TP1_R`, `TEOPARD_MIN_TP2_R`, `TEOPARD_TP2_SEPARATION_MULT` không còn được dùng; dùng biến SCALP/SWING riêng trong phần Railway variables.
 
 ## Timeframe roles V33
 
@@ -60,9 +67,19 @@ TEOPARD_RR_USE_EXTRA_SL_BUFFER=0
 TEOPARD_RR_USE_EXTRA_TP_BUFFER=0
 
 TEOPARD_GUARD_PROFILE=loose
-TEOPARD_MIN_TP1_R=0.40
-TEOPARD_MIN_TP2_R=0.50
-TEOPARD_MIN_SCALP_CONFIDENCE=48
+TEOPARD_MIN_TP1_R_SCALP=0.70
+TEOPARD_MIN_TP2_R_SCALP=1.20
+TEOPARD_TP2_SEPARATION_MULT_SCALP=1.35
+TEOPARD_MIN_TP1_ATR_MULT_SCALP=0.50
+TEOPARD_MIN_TP2_ATR_MULT_SCALP=1.00
+TEOPARD_MIN_TP1_R_SWING=0.80
+TEOPARD_MIN_TP2_R_SWING=1.50
+TEOPARD_TP2_SEPARATION_MULT_SWING=1.40
+TEOPARD_MIN_TP1_ATR_MULT_SWING=0.50
+TEOPARD_MIN_TP2_ATR_MULT_SWING=1.00
+TEOPARD_MIN_SCALP_CONFIDENCE=62
+TEOPARD_MIN_SWING_CONFIDENCE=62
+TEOPARD_MIN_SETUP_STRENGTH=62
 TEOPARD_MIN_REVERSAL_CONFIDENCE=50
 TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE=52
 TEOPARD_WEAK_CONFIRM_VOLUME=0.45
@@ -152,7 +169,7 @@ DEEPSEEK_TEMPERATURE="0.05"
 AUTO_SCAN_INTERVAL_SECONDS="900"
 AUTO_SCAN_MODES="short"
 AUTO_SCAN_MIN_PREFILTER_CONFIDENCE="62"
-AUTO_SCAN_MIN_FINAL_CONFIDENCE="60"
+AUTO_SCAN_MIN_FINAL_CONFIDENCE="62"
 AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES="180"
 AUTO_SCAN_SEND_NO_TRADE="0"
 AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS="5"
