@@ -194,3 +194,10 @@ Bản này dùng lại text prompt/text output cho GLM như mode thủ công cũ
 - Lúc 07:00, bot chỉ tự bật lại những tài khoản đang bật trước khi bước vào giờ nghỉ.
 - Nếu user chủ động dùng `/autoscanoff` trong giờ nghỉ, bot sẽ không tự bật lại vào buổi sáng.
 - Mặc định không cần thêm Railway Variables. Có thể tùy chỉnh bằng `AUTO_SCAN_SLEEP_HOUR_VN` và `AUTO_SCAN_WAKE_HOUR_VN`.
+
+PREDICTION HISTORY CONTEXT
+--------------------------
+PREDICTION_HISTORY_COUNT="3"
+- Số history đầy đủ gần nhất gửi cho GLM trong cả manual và Auto Scan.
+- Chỉ thay đổi số bản ghi lấy vào prompt; không xóa dữ liệu cũ trong bot.db.
+- Giá trị được giới hạn từ 1 đến 10; mặc định là 3 nếu biến thiếu hoặc không hợp lệ.

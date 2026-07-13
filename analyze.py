@@ -31,6 +31,17 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse integer env safely; invalid or blank values fall back to default."""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return default
+
+
 # ─── AI provider config ───────────────────────────────────────────────────────
 # V33: chốt dùng GLM/Z.AI native làm provider chính.
 # OpenRouter/Claude code vẫn còn để không làm vỡ import cũ, nhưng Railway không cần set các biến đó nữa.
@@ -180,7 +191,7 @@ RESULT_CHECK_INTERVAL = {
 def get_result_check_interval(mode: str) -> str:
     return RESULT_CHECK_INTERVAL.get(mode, "15m")
 
-PREDICTION_HISTORY_COUNT = 5
+PREDICTION_HISTORY_COUNT = max(1, min(10, _env_int("PREDICTION_HISTORY_COUNT", 3)))
 VISIBLE_PREDICTION_RETENTION_LIMIT = 10
 HIDDEN_LEARNING_RETENTION_LIMIT = 10
 # V19: REJECTED_PLAN/NO_TRADE không còn được lưu vào predictions sau mỗi lần phân tích.
@@ -319,7 +330,7 @@ def prune_prediction_history(user_id: int | None) -> None:
     - /history chỉ dùng nhóm lệnh hiển thị, nên nhóm này được giữ đúng 10 dòng mới nhất.
     - NO_TRADE/REJECTED_PLAN là bản ghi học ẩn, không hiện trong /history; vẫn giới hạn
       riêng để DB không phình theo thời gian.
-    - Learning prompt vẫn chỉ lấy PREDICTION_HISTORY_COUNT = 5 dòng gần nhất theo user/symbol/mode.
+    - Learning prompt lấy số dòng gần nhất theo PREDICTION_HISTORY_COUNT (mặc định 3) cho đúng user/symbol/mode.
     """
     if user_id is None:
         return
