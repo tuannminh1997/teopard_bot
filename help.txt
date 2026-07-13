@@ -84,14 +84,14 @@ Ghi chú lưu lịch sử: Bot chỉ giữ 10 lệnh hiển thị gần nhất c
 
 
 Cập nhật format phản hồi:
-- Bắt buộc có đủ các mục Thanh khoản, Quyết định, Entry/SL/TP, Kịch bản chính và Rủi ro.
+- Bắt buộc có đủ các mục Thanh khoản, Quyết định, Entry/SL/TP, Kích hoạt và Rủi ro.
 - Bot không dùng cụm “swing gần/swing lớn” trong output cho user; thay bằng “đỉnh/đáy gần/biên lớn”.
 - Nếu Claude trả thiếu format, Python không tự sửa nội dung; bot ẩn phản hồi đó, trả thông báo “chưa đủ dữ liệu hợp lệ để tạo phân tích” cho user và lưu hidden REJECTED_PLAN để học/debug.
 
 V4.8 compact output guard update:
 - Output cho user dùng format rút gọn: không hiện riêng “Bối cảnh” và “Cấu trúc”.
 - Bot vẫn gửi dữ liệu EMA/RSI/MACD/ATR/Fibonacci/cấu trúc/vùng quét cho Claude để phân tích nội bộ.
-- Prompt vẫn yêu cầu Claude có đủ Thanh khoản, Quyết định, Entry/SL/TP, Kịch bản chính và Rủi ro, nhưng Python không ẩn phản hồi nếu Claude thiếu format.
+- Prompt vẫn yêu cầu Claude có đủ Thanh khoản, Quyết định, Entry/SL/TP, Kích hoạt và Rủi ro, nhưng Python không ẩn phản hồi nếu Claude thiếu format.
 
 
 Bản cập nhật thông báo lỗi:
@@ -108,7 +108,7 @@ Cập nhật Sonnet Analyst Mode:
 Ghi chú bản completion guard:
 - Bot không dùng Python risk/format guard để sửa hoặc chặn lệnh Claude.
 - Nếu phản hồi Claude bị cụt rõ ràng, bot gọi Claude trả lại bản hoàn chỉnh; Python không tự viết hay sửa Entry/SL/TP.
-- Có thể chỉnh LLM_MAX_OUTPUT_TOKENS trong Railway, mặc định 8000.
+- Có thể chỉnh LLM_MAX_OUTPUT_TOKENS trong Railway, mặc định 12000.
 
 
 Ghi chú model AI:
@@ -132,7 +132,7 @@ Ghi chú kế hoạch đang mở:
 
 Ghi chú Z.AI native V16:
 - Muốn chạy GLM chính chủ Z.AI: AI_PROVIDER=zai, ZAI_API_KEY=..., ZAI_MODEL=glm-5.2, ZAI_BASE_URL=https://api.z.ai/api/paas/v4.
-- ZAI_REASONING_EFFORT mặc định high để giảm lag; có thể đổi max/xhigh nếu muốn phân tích sâu hơn.
+- ZAI_REASONING_EFFORT mặc định max; lần retry cũng giữ max để ưu tiên chất lượng phân tích.
 - ZAI_SUMMARY_REASONING_EFFORT mặc định none để summary nhanh và rẻ hơn.
 - Muốn quay lại OpenRouter: AI_PROVIDER=openrouter, OPENROUTER_MODEL=z-ai/glm-5.2 hoặc deepseek/deepseek-v4-pro.
 - Muốn quay lại Claude native: AI_PROVIDER=anthropic.

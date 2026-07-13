@@ -74,23 +74,23 @@ OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Teopard Bot")
 ZAI_API_KEY  = os.getenv("ZAI_API_KEY")
 ZAI_MODEL    = os.getenv("ZAI_MODEL", "glm-5.2")
 ZAI_BASE_URL = os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4").rstrip("/")
-# Vì bạn muốn giảm lag, native Z.AI mặc định dùng high thay vì max. Có thể đổi max/xhigh trên Railway nếu muốn.
-ZAI_REASONING_EFFORT = os.getenv("ZAI_REASONING_EFFORT", "high").strip()
-# Nếu lần gọi chính đầu tiên timeout, retry bằng mức reasoning nhẹ hơn để tránh treo lặp lại.
-ZAI_RETRY_REASONING_EFFORT = os.getenv("ZAI_RETRY_REASONING_EFFORT", "medium").strip()
-ZAI_SUMMARY_REASONING_EFFORT = os.getenv("ZAI_SUMMARY_REASONING_EFFORT", "none").strip()
+# Mọi lượt gọi GLM/Z.AI dùng reasoning max để ưu tiên chất lượng phân tích.
+ZAI_REASONING_EFFORT = os.getenv("ZAI_REASONING_EFFORT", "max").strip()
+# Retry vẫn giữ reasoning max theo cấu hình, không tự hạ effort.
+ZAI_RETRY_REASONING_EFFORT = os.getenv("ZAI_RETRY_REASONING_EFFORT", "max").strip()
+ZAI_SUMMARY_REASONING_EFFORT = os.getenv("ZAI_SUMMARY_REASONING_EFFORT", "max").strip()
 ZAI_APP_NAME = os.getenv("ZAI_APP_NAME", "Teopard Bot")
 # Trading output cần ổn định, không sáng tạo quá nhiều. Railway có thể override bằng ZAI_TEMPERATURE.
 ZAI_TEMPERATURE = _env_float("ZAI_TEMPERATURE", 0.10)
 
-# Output public chỉ khoảng 150-280 từ nên không cần cửa sổ 8000 token.
-# Cap riêng cho main call vẫn có hiệu lực kể cả Railway còn giữ biến cũ quá lớn.
-LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "2600"))
-LLM_MAIN_OUTPUT_TOKEN_CAP = int(os.getenv("LLM_MAIN_OUTPUT_TOKEN_CAP", "2600"))
+# Reasoning max dùng chung ngân sách completion với phần trả lời cuối.
+# Cần cap đủ lớn để model suy luận xong vẫn còn chỗ xuất format parse được.
+LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "12000"))
+LLM_MAIN_OUTPUT_TOKEN_CAP = int(os.getenv("LLM_MAIN_OUTPUT_TOKEN_CAP", "12000"))
 # Main analysis không continuation: output ngắn, continuation chỉ làm một request có thể treo nhiều vòng.
 LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "0"))
 # Timeout/retry cho provider AI.
-# Lần đầu cho GLM high reasoning thêm thời gian; nếu timeout chỉ retry 1 lần bằng medium.
+# GLM dùng reasoning max cho cả lần đầu và lần retry; retry vẫn bị giới hạn một lần.
 LLM_MAIN_TIMEOUT_SECONDS = int(os.getenv("LLM_MAIN_TIMEOUT_SECONDS", "240"))
 LLM_RETRY_TIMEOUT_SECONDS = int(os.getenv("LLM_RETRY_TIMEOUT_SECONDS", "150"))
 LLM_SUMMARY_TIMEOUT_SECONDS = int(os.getenv("LLM_SUMMARY_TIMEOUT_SECONDS", "60"))
@@ -1021,7 +1021,7 @@ def format_open_signal_context(open_signals: list[dict], current_price: float | 
     lines.extend([
         "Cách dùng kế hoạch đang mở:",
         "- Nếu kế hoạch cũ là LONG chờ hồi, vùng Entry LONG KHÔNG phải TP cho lệnh SHORT ngược lại. Nếu kế hoạch cũ là SHORT chờ hồi, vùng Entry SHORT KHÔNG phải TP cho lệnh LONG ngược lại.",
-        "- Khi phân tích lại, phải xem kế hoạch cũ là còn hiệu lực, bị hủy, hay cần thay bằng kế hoạch mới. Nếu thay kế hoạch, nêu ngắn lý do trong Kịch bản chính.",
+        "- Khi phân tích lại, phải xem kế hoạch cũ là còn hiệu lực, bị hủy, hay cần thay bằng kế hoạch mới. Nếu thay kế hoạch, ghi ngắn trong Kích hoạt rằng kế hoạch mới thay thế kế hoạch cũ.",
         "- Nếu giá không hồi về Entry cũ mà đã chạy theo hướng dự báo, không được đuổi giá chỉ vì giá đang chạy. Chỉ cho vào ngay khi giá hiện tại nằm trong vùng Entry mới hợp lý và đã có xác nhận rõ; nếu không, ưu tiên NO TRADE hoặc chờ kiểm tra lại.",
     ])
     return "\n".join(lines)
@@ -5429,7 +5429,7 @@ def _zai_create_once(
     # Z.AI dùng top-level reasoning_effort + thinking.
     # Summary mặc định truyền none/off để không tốn token và giảm latency.
     if reasoning_effort is None:
-        effective_reasoning_effort = (ZAI_REASONING_EFFORT or "high").strip()
+        effective_reasoning_effort = (ZAI_REASONING_EFFORT or "max").strip()
     else:
         effective_reasoning_effort = (reasoning_effort or "").strip()
 
@@ -5535,7 +5535,7 @@ def create_with_continuation(
             if retry_idx > 0 and call_type in ("main", "main_json"):
                 effective_timeout = max(30, min(timeout, LLM_RETRY_TIMEOUT_SECONDS))
                 if _is_zai_provider():
-                    effective_reasoning_effort = ZAI_RETRY_REASONING_EFFORT or "medium"
+                    effective_reasoning_effort = ZAI_RETRY_REASONING_EFFORT or "max"
             try:
                 print(
                     f"[LLM_CALL] call_type={call_type} provider={get_ai_provider_label()} "
@@ -5609,16 +5609,21 @@ def create_with_continuation(
 
 
 def build_local_reasoning_summary(full_response: str, limit: int = 420) -> str:
-    """Lấy phần Lý do trực tiếp từ output, tránh gọi thêm LLM chỉ để lưu metadata."""
+    """Tạo metadata ngắn từ Kích hoạt/Rủi ro mà không cần public mục Lý do."""
     text = sanitize_user_output(full_response or "").strip()
     if not text:
         return ""
-    match = re.search(
-        r"(?:^|\n)\s*Lý\s*do\s*:\s*(.*?)(?=\n\s*⚠️\s*Rủi\s*ro\s*:|\Z)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    summary = match.group(1).strip() if match else text
+    parts: list[str] = []
+    for pattern in (
+        r"(?:^|\n)\s*Kích\s*hoạt\s*:\s*(.*?)(?=\n|\Z)",
+        r"(?:^|\n)\s*⚠️\s*Rủi\s*ro\s*:\s*(.*?)(?=\n\s*\[\[TEOPARD_|\Z)",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            value = re.sub(r"\s+", " ", match.group(1)).strip(" -")
+            if value:
+                parts.append(value)
+    summary = " | ".join(parts) if parts else text
     summary = re.sub(r"\s+", " ", summary).strip()
     return _truncate_text(summary, limit)
 
@@ -5693,9 +5698,7 @@ Schema:
   "tp2_source": "A3",
   "risk_text": "~1,465.89 USDT",
   "activation": "Có thể vào ngay... hoặc Lệnh chờ, chưa vào ngay...",
-  "reason": ["Lý do kỹ thuật 1", "Lý do kỹ thuật 2"],
-  "main_scenario": "Kịch bản chính ngắn gọn.",
-  "risk_note": "Rủi ro và điều kiện hủy lệnh ngắn gọn."
+  "risk_note": "Rủi ro chính và điều kiện hủy lệnh ngắn gọn."
 }
 """
 
@@ -5977,15 +5980,8 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
     current_price_line = f"Giá hiện tại: {fmt(current_price)} USDT" if current_price is not None else "Giá hiện tại: N/A"
 
     activation = str(payload.get("activation") or "").strip()
-    main_scenario = str(payload.get("main_scenario") or "").strip()
     risk_note = str(payload.get("risk_note") or "").strip()
     risk_text = str(payload.get("risk_text") or "").strip()
-    reasons = payload.get("reason")
-    if isinstance(reasons, str):
-        reasons = [reasons]
-    if not isinstance(reasons, list):
-        reasons = []
-    reasons = [str(x).strip() for x in reasons if str(x).strip()]
 
     lines = [
         f"🎯 {symbol} — {mode_label}",
@@ -6018,15 +6014,6 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
         if activation:
             lines += ["", f"Kích hoạt: {activation}"]
 
-    if main_scenario:
-        lines += ["", f"Lý do: {main_scenario}"]
-    elif reasons:
-        lines += ["", "Lý do:"]
-    if reasons:
-        if main_scenario:
-            lines.append("")
-        for item in reasons[:5]:
-            lines.append(f"- {item}")
     if risk_note:
         lines += ["", f"⚠️ Rủi ro: {risk_note}"]
 
@@ -6690,8 +6677,7 @@ def _guarded_no_trade_output(
         f"Độ mạnh setup: {setup_text}\n"
         f"Độ chắc chắn: {confidence_text}\n"
         f"Giá hiện tại: {fmt(current_price)} USDT\n"
-        f"Lý do: {reason}{price_text} Bot không lưu tín hiệu này.\n"
-        f"⚠️ Rủi ro: Nếu cố vào lệnh, xác suất bị nhiễu hoặc quét SL ngắn hạn còn cao."
+        f"⚠️ Rủi ro: {reason}{price_text} Bot không lưu tín hiệu này; nếu cố vào lệnh, nguy cơ bị nhiễu hoặc quét SL ngắn hạn còn cao."
     )
 
 
@@ -6790,8 +6776,13 @@ def sanitize_user_output(output: str) -> str:
     # Output public tối giản: không show metadata thừa hoặc section cũ.
     text = re.sub(r"^\s*Xu hướng:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
     text = re.sub(r"^\s*Giá:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
-    text = re.sub(r"^\s*📊\s*Kịch bản chính\s*:", "Lý do:", text, flags=re.IGNORECASE | re.MULTILINE)
-    text = re.sub(r"^\s*Kịch bản chính\s*:", "Lý do:", text, flags=re.IGNORECASE | re.MULTILINE)
+    # Public output mới không còn mục Lý do/Kịch bản chính. Xóa cả block cũ nếu model lỡ in.
+    text = re.sub(
+        r"\n?\s*(?:📊\s*)?(?:Lý\s*do|Kịch\s*bản\s*chính)\s*:[\s\S]*?(?=\n\s*⚠️\s*Rủi\s*ro\s*:|\n\s*\[\[TEOPARD_|\Z)",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = _remove_hidden_liquidity_sections(text)
     return text
 
