@@ -152,7 +152,7 @@ Cập nhật V19 - lưu history theo xác nhận user:
 /autoscanstatus - Xem trạng thái Auto Scan
 /autoscanlog - Xem log các lần quét gần nhất
 
-Auto Scan là mode riêng, quét theo nến đã đóng. DeepSeek lọc nhanh trước; nếu tín hiệu đủ tốt mới gọi GLM phân tích đầy đủ như mode thủ công. Nếu GLM đủ ngưỡng confidence thì bot tự gửi tín hiệu và tự lưu theo dõi, không cần bấm nút xác nhận.
+Auto Scan là mode riêng, quét theo nến đã đóng. DeepSeek chấm mini-rubric riêng cho LONG và SHORT rồi Python tự cộng điểm. Nếu một hướng đủ điểm và đủ chênh lệch mới gọi GLM phân tích đầy đủ như mode thủ công; DeepSeek được phép trả NEUTRAL. Điểm DeepSeek là điểm lọc nhanh /100, không phải xác suất thắng. GLM vẫn có thể chọn NO TRADE sau khi lập Entry/SL/TP và chấm full rubric. Nếu GLM đủ ngưỡng confidence thì bot tự gửi tín hiệu và tự lưu theo dõi, không cần bấm nút xác nhận.
 
 Auto Scan chỉ cho 1 symbol/tài khoản để tiết kiệm tài nguyên. Ví dụ: /autoscanon BTC
 
@@ -160,3 +160,10 @@ Ghi chú giờ nghỉ Auto Scan:
 - Auto Scan tự nghỉ từ 00:00 đến trước 07:00 theo giờ Việt Nam.
 - Lúc 07:00, bot tự bật lại nếu Auto Scan đang bật trước giờ nghỉ.
 - Nếu bạn chủ động dùng /autoscanoff trong đêm, sáng bot sẽ không tự bật lại.
+
+Cập nhật quota Auto Scan:
+- DeepSeek quét mỗi 15 phút khi Auto Scan đang bật.
+- Chỉ khi DeepSeek thấy setup đủ tốt mới gọi GLM; mỗi lần bắt đầu gọi GLM tính 1 lượt.
+- Mặc định tối đa 5 lượt gọi GLM/ngày cho mỗi tài khoản.
+- Lượt thứ 5 vẫn được xử lý, sau đó Auto Scan tự dừng.
+- 07:00 sáng hôm sau theo giờ Việt Nam, quota reset về 0/5 và Auto Scan tự bật lại.

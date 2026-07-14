@@ -541,7 +541,8 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     from auth import is_account_activated
     from analyze import (
         set_auto_scan_enabled, _normalize_auto_scan_modes, AUTO_SCAN_INTERVAL_SECONDS,
-        AUTO_SCAN_MIN_PREFILTER_CONFIDENCE, AUTO_SCAN_MIN_FINAL_CONFIDENCE, normalize_auto_scan_symbol
+        AUTO_SCAN_MIN_PREFILTER_CONFIDENCE, AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP,
+        AUTO_SCAN_MIN_FINAL_CONFIDENCE, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, normalize_auto_scan_symbol
     )
 
     user = update.effective_user
@@ -596,15 +597,24 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    await asyncio.to_thread(set_auto_scan_enabled, user.id, message.chat_id, True, symbols)
+    enable_result = await asyncio.to_thread(set_auto_scan_enabled, user.id, message.chat_id, True, symbols)
+    if enable_result.get("quota_blocked"):
+        await message.reply_text(
+            f"Auto Scan đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi GLM trong ngày. "
+            "Bot sẽ tự bật lại và reset quota lúc 07:00 sáng mai theo giờ Việt Nam."
+        )
+        return
     modes = ", ".join("SCALP" if m == "short" else "SWING" for m in _normalize_auto_scan_modes())
     await message.reply_text(
         "Đã bật Auto Scan cho tài khoản của bạn.\n"
         f"Symbol đang quét: {symbols[0]}.\n"
         f"Chu kỳ quét: mỗi {int(AUTO_SCAN_INTERVAL_SECONDS // 60)} phút.\n"
         f"Mode đang quét: {modes}.\n"
-        f"DeepSeek lọc nhanh tối thiểu: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}%.\n"
+        f"DeepSeek mini-rubric tối thiểu: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100.\n"
+        f"Chênh lệch LONG/SHORT tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm.\n"
         f"GLM gửi tín hiệu tối thiểu: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%.\n"
+        f"Giới hạn gọi GLM: {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
+        "Đủ quota thì Auto Scan tự dừng; 07:00 sáng hôm sau tự bật và reset quota.\n"
         "Giờ nghỉ tự động: 00:00-07:00 theo giờ Việt Nam; sáng bot tự bật lại nếu trước đó đang bật.\n"
         "Khi có tín hiệu đủ tốt, bot sẽ tự gửi và tự lưu theo dõi, không cần bấm xác nhận."
     )
@@ -641,6 +651,7 @@ def _display_scan_stage(stage, status=None) -> str:
         "glm": "GLM",
         "binance": "Binance",
         "cooldown": "Cooldown",
+        "quota": "Quota GLM",
         "sent": "Đã gửi",
         "error": "Lỗi",
     }
@@ -682,14 +693,17 @@ def _display_scan_score(direction, confidence, *, source: str) -> str:
     if label == "NO TRADE":
         return "NO TRADE"
     if confidence is None:
-        return f"{label} -%"
+        return f"{label} -/100" if source == "deepseek" else f"{label} -%"
+    if source == "deepseek":
+        return f"{label} {confidence}/100"
     return f"{label} {confidence}%"
 
 async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import (
         get_auto_scan_runtime_status, _parse_auto_scan_symbols_text, _auto_scan_symbols_from_env_or_db,
         _normalize_auto_scan_modes, AUTO_SCAN_INTERVAL_SECONDS, AUTO_SCAN_MIN_PREFILTER_CONFIDENCE,
-        AUTO_SCAN_MIN_FINAL_CONFIDENCE, AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES, DEEPSEEK_MODEL,
+        AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP, AUTO_SCAN_MIN_FINAL_CONFIDENCE,
+        AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, DEEPSEEK_MODEL,
         _auto_scan_format_dt,
     )
 
@@ -711,7 +725,9 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
             f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
             f"DeepSeek: {pre} | GLM: {final} | {_display_scan_reason(last_log.get('reason'))}"
         )
-    if status.get("in_sleep_window") and status.get("night_resume"):
+    if status.get("quota_resume"):
+        state_text = "⏸ ĐÃ ĐỦ QUOTA GLM — sẽ tự bật lại lúc 07:00"
+    elif status.get("in_sleep_window") and status.get("night_resume"):
         state_text = "🌙 ĐANG NGHỈ ĐÊM — sẽ tự bật lại lúc 07:00"
     else:
         state_text = "🟢 ĐANG BẬT" if status.get("enabled") else "🔴 ĐANG TẮT"
@@ -725,8 +741,11 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         f"Mode: {modes}\n"
         "Giới hạn: 1 symbol/tài khoản\n"
         f"DeepSeek model: {DEEPSEEK_MODEL}\n"
-        f"Ngưỡng lọc nhanh: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}%\n"
-        f"Ngưỡng gửi tín hiệu: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%\n"
+        f"Ngưỡng mini-rubric DeepSeek: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100\n"
+        f"Chênh lệch hướng tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm\n"
+        f"Ngưỡng gửi tín hiệu GLM: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%\n"
+        f"Quota gọi GLM hôm nay: {status.get('glm_calls_today', 0)}/{AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} "
+        f"(còn {status.get('glm_calls_remaining', AUTO_SCAN_MAX_GLM_CALLS_PER_DAY)} lượt)\n"
         f"Cooldown cùng symbol/mode: {AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES} phút\n"
         f"Lần quét gần nhất: {_auto_scan_format_dt(status.get('last_scan_at'))}\n"
         f"Lần quét kế tiếp: {_auto_scan_format_dt(status.get('next_scan_at'))}\n"

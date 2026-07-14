@@ -147,7 +147,7 @@ Auto Scan là mode riêng, không thay thế phân tích thủ công.
 Flow:
 
 - Bot quét theo nến đã đóng, mặc định mỗi 15 phút.
-- DeepSeek v4 flash lọc nhanh bằng text prompt rút gọn để xem có đáng gọi GLM không.
+- DeepSeek v4 flash chấm mini-rubric riêng cho LONG và SHORT bằng text prompt rút gọn; Python tự cộng điểm, cho phép NEUTRAL và chỉ gọi GLM khi một hướng đủ điểm lẫn đủ chênh lệch.
 - Nếu lọc nhanh đạt ngưỡng, bot gửi data text đầy đủ sang GLM/Z.AI giống mode thủ công.
 - Nếu GLM/Z.AI trả LONG/SHORT đủ confidence, bot gửi tín hiệu cho user.
 - Auto Scan không hiện nút "Tôi đã đặt lệnh theo phân tích này".
@@ -173,6 +173,7 @@ DEEPSEEK_TEMPERATURE="0.05"
 AUTO_SCAN_INTERVAL_SECONDS="900"
 AUTO_SCAN_MODES="short"
 AUTO_SCAN_MIN_PREFILTER_CONFIDENCE="62"
+AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP="5"
 AUTO_SCAN_MIN_FINAL_CONFIDENCE="62"
 AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES="180"
 AUTO_SCAN_SEND_NO_TRADE="0"
@@ -183,6 +184,23 @@ AUTO_SCAN_SCHEDULER_TICK_SECONDS="60"
 ```
 
 Không cần set `AUTO_SCAN_SYMBOLS`. User chọn symbol bằng `/autoscanon BTC`. Auto Scan chỉ cho 1 symbol/user để tiết kiệm tài nguyên.
+
+DeepSeek mini-rubric prefilter:
+
+```text
+Xu hướng đa khung                 25
+Vị trí giá và cấu trúc           25
+Động lượng/hành động giá         20
+Volume và nến xác nhận           15
+Khả năng hình thành setup        15
+Tổng                            100
+```
+
+- DeepSeek chấm rubric này riêng cho LONG và SHORT, không lập Entry/SL/TP.
+- Python tự cộng điểm; total model tự ghi không được dùng.
+- Nếu cả hai hướng dưới ngưỡng hoặc chênh nhau dưới `AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP`, kết quả là NEUTRAL và không gọi GLM.
+- Điểm DeepSeek là `điểm lọc nhanh /100`, không phải xác suất thắng hay Độ chắc chắn của GLM.
+- GLM vẫn dùng full rubric, lập Entry/SL/TP và có thể chọn NO TRADE sau khi nhận context đầy đủ.
 
 ## Text input/output
 
@@ -201,3 +219,12 @@ PREDICTION_HISTORY_COUNT="3"
 - Số history đầy đủ gần nhất gửi cho GLM trong cả manual và Auto Scan.
 - Chỉ thay đổi số bản ghi lấy vào prompt; không xóa dữ liệu cũ trong bot.db.
 - Giá trị được giới hạn từ 1 đến 10; mặc định là 3 nếu biến thiếu hoặc không hợp lệ.
+
+## Auto Scan GLM daily quota
+- DeepSeek vẫn quét theo chu kỳ nến 15 phút khi Auto Scan đang bật.
+- Mỗi lần DeepSeek vượt mini-rubric và bắt đầu gọi GLM sẽ tính 1 lượt quota.
+- Mặc định tối đa 5 lượt gọi GLM cho mỗi user trong ngày Auto Scan (07:00 VN đến 06:59 hôm sau).
+- Lượt thứ 5 vẫn được GLM xử lý; ngay sau khi giữ suất thứ 5, Auto Scan tự tắt để không phát sinh lượt thứ 6.
+- Lúc 07:00 VN hôm sau, bot reset quota về 0/5 và tự bật lại user đã bị dừng do hết quota.
+- User chủ động /autoscanoff thì bot không tự bật lại do quota.
+- Railway: AUTO_SCAN_MAX_GLM_CALLS_PER_DAY="5"

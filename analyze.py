@@ -115,6 +115,12 @@ LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
 AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
 AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
 AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "62"))
+# Nếu LONG/SHORT quá sát điểm nhau thì prefilter xem là NEUTRAL và không gọi GLM.
+# Đây là độ chênh tối thiểu giữa hai tổng điểm mini-rubric, không phải confidence %.
+AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
+    0,
+    min(100, int(os.getenv("AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP", "5"))),
+)
 AUTO_SCAN_MIN_FINAL_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", "62"))
 AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH = int(os.getenv("AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH", "62"))
 AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES", "180"))
@@ -129,6 +135,8 @@ AUTO_SCAN_DEBUG = os.getenv("AUTO_SCAN_DEBUG", "0").strip().lower() in {"1", "tr
 # Khung giờ nghỉ Auto Scan theo giờ Việt Nam: 00:00-07:00.
 AUTO_SCAN_SLEEP_HOUR_VN = int(os.getenv("AUTO_SCAN_SLEEP_HOUR_VN", "0"))
 AUTO_SCAN_WAKE_HOUR_VN = int(os.getenv("AUTO_SCAN_WAKE_HOUR_VN", "7"))
+# Mỗi user chỉ được gọi GLM tối đa N lần trong một ngày Auto Scan (07:00 VN đến 06:59 hôm sau).
+AUTO_SCAN_MAX_GLM_CALLS_PER_DAY = max(1, int(os.getenv("AUTO_SCAN_MAX_GLM_CALLS_PER_DAY", "5")))
 
 # DeepSeek filter: dùng OpenAI-compatible Chat Completions. Mặc định trỏ OpenRouter
 # để bạn có thể dùng deepseek/deepseek-v4-flash hoặc model tương đương trên Railway.
@@ -7192,6 +7200,9 @@ def init_auto_scan_db() -> None:
                 enabled     INTEGER NOT NULL DEFAULT 0,
                 symbols     TEXT NOT NULL DEFAULT '',
                 night_resume INTEGER NOT NULL DEFAULT 0,
+                quota_resume INTEGER NOT NULL DEFAULT 0,
+                glm_calls_today INTEGER NOT NULL DEFAULT 0,
+                glm_calls_day TEXT NOT NULL DEFAULT '',
                 updated_at  TEXT NOT NULL
             )
         """)
@@ -7237,6 +7248,9 @@ def init_auto_scan_db() -> None:
         for col, definition in [
             ("symbols", "TEXT NOT NULL DEFAULT ''"),
             ("night_resume", "INTEGER NOT NULL DEFAULT 0"),
+            ("quota_resume", "INTEGER NOT NULL DEFAULT 0"),
+            ("glm_calls_today", "INTEGER NOT NULL DEFAULT 0"),
+            ("glm_calls_day", "TEXT NOT NULL DEFAULT ''"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE auto_scan_settings ADD COLUMN {col} {definition}")
@@ -7248,7 +7262,15 @@ def init_auto_scan_db() -> None:
         conn.commit()
 
 
-def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: list[str] | None = None) -> None:
+def _auto_scan_quota_day_key(now: datetime | None = None) -> str:
+    """Ngày quota Auto Scan chạy từ 07:00 VN đến 06:59 VN hôm sau."""
+    local_now = (now or utc_now()).astimezone(VN_TZ)
+    wake_hour = max(0, min(23, int(AUTO_SCAN_WAKE_HOUR_VN)))
+    quota_date = local_now.date() if local_now.hour >= wake_hour else (local_now - timedelta(days=1)).date()
+    return quota_date.isoformat()
+
+
+def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: list[str] | None = None) -> dict:
     init_auto_scan_db()
     normalized_symbols = []
     if symbols is not None:
@@ -7259,85 +7281,172 @@ def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: li
                 normalized_symbols.append(sym)
                 seen.add(sym)
     symbols_text = ",".join(normalized_symbols) if symbols is not None else None
+    day_key = _auto_scan_quota_day_key()
     with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT glm_calls_today, glm_calls_day FROM auto_scan_settings WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        calls = int(row[0] or 0) if row else 0
+        stored_day = str(row[1] or "") if row else ""
+        if stored_day != day_key:
+            calls = 0
+        quota_blocked = bool(enabled and calls >= AUTO_SCAN_MAX_GLM_CALLS_PER_DAY)
+        effective_enabled = bool(enabled and not quota_blocked)
+        quota_resume = 1 if quota_blocked else 0
         if symbols_text is None:
             conn.execute(
                 """
-                INSERT INTO auto_scan_settings (user_id, chat_id, enabled, night_resume, updated_at)
-                VALUES (?, ?, ?, 0, ?)
+                INSERT INTO auto_scan_settings
+                    (user_id, chat_id, enabled, night_resume, quota_resume, glm_calls_today, glm_calls_day, updated_at)
+                VALUES (?, ?, ?, 0, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     chat_id=excluded.chat_id,
                     enabled=excluded.enabled,
                     night_resume=0,
+                    quota_resume=excluded.quota_resume,
+                    glm_calls_today=excluded.glm_calls_today,
+                    glm_calls_day=excluded.glm_calls_day,
                     updated_at=excluded.updated_at
                 """,
-                (user_id, chat_id, 1 if enabled else 0, iso(utc_now())),
+                (user_id, chat_id, 1 if effective_enabled else 0, quota_resume, calls, day_key, iso(utc_now())),
             )
         else:
             conn.execute(
                 """
-                INSERT INTO auto_scan_settings (user_id, chat_id, enabled, symbols, night_resume, updated_at)
-                VALUES (?, ?, ?, ?, 0, ?)
+                INSERT INTO auto_scan_settings
+                    (user_id, chat_id, enabled, symbols, night_resume, quota_resume, glm_calls_today, glm_calls_day, updated_at)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     chat_id=excluded.chat_id,
                     enabled=excluded.enabled,
                     symbols=excluded.symbols,
                     night_resume=0,
+                    quota_resume=excluded.quota_resume,
+                    glm_calls_today=excluded.glm_calls_today,
+                    glm_calls_day=excluded.glm_calls_day,
                     updated_at=excluded.updated_at
                 """,
-                (user_id, chat_id, 1 if enabled else 0, symbols_text, iso(utc_now())),
+                (user_id, chat_id, 1 if effective_enabled else 0, symbols_text, quota_resume, calls, day_key, iso(utc_now())),
+            )
+        if not enabled:
+            conn.execute(
+                "UPDATE auto_scan_settings SET night_resume=0, quota_resume=0 WHERE user_id=?",
+                (user_id,),
             )
         conn.commit()
+    return {
+        "enabled": effective_enabled,
+        "quota_blocked": quota_blocked,
+        "glm_calls_today": calls,
+        "glm_calls_remaining": max(0, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY - calls),
+    }
 
 def get_auto_scan_status(user_id: int) -> dict:
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT user_id, chat_id, enabled, symbols, night_resume, updated_at FROM auto_scan_settings WHERE user_id=?",
+            "SELECT user_id, chat_id, enabled, symbols, night_resume, quota_resume, glm_calls_today, glm_calls_day, updated_at FROM auto_scan_settings WHERE user_id=?",
             (user_id,),
         ).fetchone()
     if not row:
         return {"enabled": False, "chat_id": None, "updated_at": None}
-    return {"user_id": row[0], "chat_id": row[1], "enabled": bool(row[2]), "symbols": row[3] or "", "night_resume": bool(row[4]), "updated_at": row[5]}
+    day_key = _auto_scan_quota_day_key()
+    calls = int(row[6] or 0) if str(row[7] or "") == day_key else 0
+    return {
+        "user_id": row[0], "chat_id": row[1], "enabled": bool(row[2]),
+        "symbols": row[3] or "", "night_resume": bool(row[4]),
+        "quota_resume": bool(row[5]), "glm_calls_today": calls,
+        "glm_calls_remaining": max(0, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY - calls),
+        "glm_calls_limit": AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, "updated_at": row[8],
+    }
 
 
 def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
-    """Tắt tạm Auto Scan từ 00:00 đến trước 07:00 theo giờ Việt Nam.
-
-    Chỉ các tài khoản đang bật lúc vào khung nghỉ mới được đánh dấu để tự bật lại.
-    Nếu user chủ động /autoscanoff trong đêm, cờ tự bật lại sẽ bị hủy.
-    """
+    """Nghỉ 00:00-07:00 VN; 07:00 reset quota GLM và bật lại user bị dừng do quota/đêm."""
     init_auto_scan_db()
-    local_now = (now or utc_now()).astimezone(VN_TZ)
+    current = now or utc_now()
+    local_now = current.astimezone(VN_TZ)
     hour = local_now.hour
     sleep_hour = max(0, min(23, int(AUTO_SCAN_SLEEP_HOUR_VN)))
     wake_hour = max(0, min(23, int(AUTO_SCAN_WAKE_HOUR_VN)))
     in_sleep_window = (sleep_hour <= hour < wake_hour) if sleep_hour < wake_hour else (hour >= sleep_hour or hour < wake_hour)
+    day_key = _auto_scan_quota_day_key(current)
     disabled = 0
     resumed = 0
+    quota_reset = 0
     with sqlite3.connect(DB_PATH) as conn:
+        # Sang ngày quota mới (mốc 07:00 VN): reset số lần gọi GLM.
+        cur = conn.execute(
+            """
+            UPDATE auto_scan_settings
+            SET glm_calls_today=0, glm_calls_day=?, updated_at=?
+            WHERE glm_calls_day IS NULL OR glm_calls_day<>?
+            """,
+            (day_key, iso(current), day_key),
+        )
+        quota_reset = int(cur.rowcount or 0)
         if in_sleep_window:
             cur = conn.execute(
                 "UPDATE auto_scan_settings SET enabled=0, night_resume=1, updated_at=? WHERE enabled=1",
-                (iso(utc_now()),),
+                (iso(current),),
             )
             disabled = int(cur.rowcount or 0)
         else:
             cur = conn.execute(
-                "UPDATE auto_scan_settings SET enabled=1, night_resume=0, updated_at=? WHERE night_resume=1",
-                (iso(utc_now()),),
+                """
+                UPDATE auto_scan_settings
+                SET enabled=1, night_resume=0, quota_resume=0, updated_at=?
+                WHERE night_resume=1 OR quota_resume=1
+                """,
+                (iso(current),),
             )
             resumed = int(cur.rowcount or 0)
         conn.commit()
     return {
-        "in_sleep_window": in_sleep_window,
-        "disabled": disabled,
-        "resumed": resumed,
-        "local_time": local_now.isoformat(),
-        "sleep_hour": sleep_hour,
-        "wake_hour": wake_hour,
+        "in_sleep_window": in_sleep_window, "disabled": disabled, "resumed": resumed,
+        "quota_reset": quota_reset, "quota_day": day_key, "local_time": local_now.isoformat(),
+        "sleep_hour": sleep_hour, "wake_hour": wake_hour,
     }
 
+
+def reserve_auto_scan_glm_call(user_id: int) -> dict:
+    """Giữ 1 suất gọi GLM theo user. Lần thứ N vẫn được chạy, sau đó Auto Scan tự tắt."""
+    init_auto_scan_db()
+    day_key = _auto_scan_quota_day_key()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT glm_calls_today, glm_calls_day FROM auto_scan_settings WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        calls = int(row[0] or 0) if row else 0
+        stored_day = str(row[1] or "") if row else ""
+        if stored_day != day_key:
+            calls = 0
+        if calls >= AUTO_SCAN_MAX_GLM_CALLS_PER_DAY:
+            conn.execute(
+                "UPDATE auto_scan_settings SET enabled=0, quota_resume=1, glm_calls_today=?, glm_calls_day=?, updated_at=? WHERE user_id=?",
+                (calls, day_key, iso(utc_now()), user_id),
+            )
+            conn.commit()
+            return {"allowed": False, "used": calls, "remaining": 0, "exhausted": True}
+        new_calls = calls + 1
+        exhausted = new_calls >= AUTO_SCAN_MAX_GLM_CALLS_PER_DAY
+        conn.execute(
+            """
+            UPDATE auto_scan_settings
+            SET glm_calls_today=?, glm_calls_day=?, enabled=?, quota_resume=?, updated_at=?
+            WHERE user_id=?
+            """,
+            (new_calls, day_key, 0 if exhausted else 1, 1 if exhausted else 0, iso(utc_now()), user_id),
+        )
+        conn.commit()
+    return {
+        "allowed": True, "used": new_calls,
+        "remaining": max(0, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY - new_calls),
+        "exhausted": exhausted,
+    }
 
 def get_auto_scan_enabled_users() -> list[dict]:
     init_auto_scan_db()
@@ -7598,8 +7707,8 @@ def build_deepseek_prefilter_text(
 ) -> str:
     """Text input rút gọn cho DeepSeek prefilter, không dùng JSON.
 
-    DeepSeek chỉ chấm sơ bộ LONG/SHORT score để quyết định có gọi GLM không.
-    Không tạo Entry/SL/TP và không gửi user.
+    DeepSeek chấm hai mini-rubric LONG/SHORT để quyết định có đáng gọi GLM không.
+    Nó không tạo Entry/SL/TP và không thay thế full rubric của GLM.
     """
     mode_label = "SCALP" if mode == "short" else "SWING"
     history_text = format_deepseek_history_compact(history, limit=3)
@@ -7607,10 +7716,20 @@ def build_deepseek_prefilter_text(
     return "\n".join([
         f"AUTO SCAN PREFILTER — {symbol} {mode_label}",
         current_price_str,
-        "Nhiệm vụ: chỉ lọc nhanh xem có đáng gọi GLM phân tích sâu không.",
+        "Nhiệm vụ: dùng mini-rubric để lọc nhanh xem có đáng gọi GLM phân tích sâu không.",
         "Không chốt lệnh, không tạo Entry/SL/TP, không gửi user.",
-        "Hãy so sánh LONG và SHORT rồi chấm điểm từng hướng từ 0-100.",
-        "Nếu cả hai yếu, vẫn ghi điểm thấp cho cả hai; không dùng NO TRADE để chặn cứng.",
+        "Chấm riêng LONG và SHORT bằng số nguyên trong đúng giới hạn từng tiêu chí.",
+        "Python sẽ tự cộng điểm; không làm tròn theo nấc và không tự nâng điểm để đạt ngưỡng.",
+        "Nếu hai hướng đều yếu hoặc điểm gần ngang nhau, chọn NEUTRAL.",
+        "Mục 'khả năng hình thành setup' chỉ đánh giá có đủ vùng/cấu trúc để GLM lập kế hoạch tiềm năng; không tự bịa level.",
+        "",
+        "MINI-RUBRIC CHO MỖI HƯỚNG:",
+        "- Xu hướng đa khung ủng hộ: tối đa 25 điểm.",
+        "- Vị trí giá và cấu trúc có lợi: tối đa 25 điểm.",
+        "- Động lượng và hành động giá xác nhận: tối đa 20 điểm.",
+        "- Volume và nến xác nhận: tối đa 15 điểm.",
+        "- Khả năng hình thành setup tiềm năng: tối đa 15 điểm.",
+        "Tổng tối đa: 100 điểm cho LONG và 100 điểm cho SHORT.",
         "",
         "SNAPSHOT KỸ THUẬT RÚT GỌN:",
         compact_feature,
@@ -7620,37 +7739,161 @@ def build_deepseek_prefilter_text(
         "LỊCH SỬ USER RÚT GỌN:",
         history_text,
         "",
-        "FORMAT TRẢ VỀ BẮT BUỘC, KHÔNG JSON:",
-        "LONG_SCORE: <số 0-100>",
-        "SHORT_SCORE: <số 0-100>",
-        "BEST: LONG hoặc SHORT",
+        "FORMAT TRẢ VỀ BẮT BUỘC, KHÔNG JSON, KHÔNG MARKDOWN:",
+        "LONG_TREND: <0-25>",
+        "LONG_STRUCTURE: <0-25>",
+        "LONG_MOMENTUM: <0-20>",
+        "LONG_CONFIRMATION: <0-15>",
+        "LONG_SETUP_ROOM: <0-15>",
+        "SHORT_TREND: <0-25>",
+        "SHORT_STRUCTURE: <0-25>",
+        "SHORT_MOMENTUM: <0-20>",
+        "SHORT_CONFIRMATION: <0-15>",
+        "SHORT_SETUP_ROOM: <0-15>",
+        "BEST: LONG hoặc SHORT hoặc NEUTRAL",
+        "CALL_GLM: YES hoặc NO",
         "REASON: <một câu rất ngắn>",
     ])
 
 
+_DEEPSEEK_MINI_RUBRIC_WEIGHTS = {
+    "trend": 25,
+    "structure": 25,
+    "momentum": 20,
+    "confirmation": 15,
+    "setup_room": 15,
+}
+
+
+def _parse_prefilter_item(raw: str, side: str, key: str, maximum: int) -> int | None:
+    pattern = rf"{side}_{key}\s*[:=]\s*(-?\d+(?:\.\d+)?)"
+    match = re.search(pattern, raw, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return max(0, min(maximum, int(round(float(match.group(1))))))
+    except Exception:
+        return None
+
+
 def _parse_deepseek_prefilter_text(text: str | None) -> dict:
     raw = text or ""
-    def score(name: str) -> int:
-        m = re.search(rf"{name}\s*[:=]\s*(\d+(?:\.\d+)?)", raw, flags=re.IGNORECASE)
-        if not m:
+    breakdown: dict[str, dict[str, int]] = {"LONG": {}, "SHORT": {}}
+    found_items = 0
+    for side in ("LONG", "SHORT"):
+        for key, maximum in _DEEPSEEK_MINI_RUBRIC_WEIGHTS.items():
+            value = _parse_prefilter_item(raw, side, key.upper(), maximum)
+            if value is not None:
+                found_items += 1
+                breakdown[side][key] = value
+            else:
+                breakdown[side][key] = 0
+
+    # Backward compatibility: nếu provider lỡ trả format cũ, vẫn đọc LONG_SCORE/SHORT_SCORE.
+    def legacy_score(name: str) -> int:
+        match = re.search(rf"{name}\s*[:=]\s*(\d+(?:\.\d+)?)", raw, flags=re.IGNORECASE)
+        if not match:
             return 0
         try:
-            return max(0, min(100, int(float(m.group(1)))))
+            return max(0, min(100, int(round(float(match.group(1))))))
         except Exception:
             return 0
-    long_score = score("LONG_SCORE")
-    short_score = score("SHORT_SCORE")
-    best_match = re.search(r"BEST\s*[:=]\s*(LONG|SHORT)", raw, flags=re.IGNORECASE)
-    best = (best_match.group(1).upper() if best_match else ("LONG" if long_score >= short_score else "SHORT"))
+
+    if found_items > 0:
+        long_score = sum(breakdown["LONG"].values())
+        short_score = sum(breakdown["SHORT"].values())
+        rubric_complete = found_items == len(_DEEPSEEK_MINI_RUBRIC_WEIGHTS) * 2
+    else:
+        long_score = legacy_score("LONG_SCORE")
+        short_score = legacy_score("SHORT_SCORE")
+        rubric_complete = False
+
+    best_match = re.search(r"BEST\s*[:=]\s*(LONG|SHORT|NEUTRAL)", raw, flags=re.IGNORECASE)
+    best = best_match.group(1).upper() if best_match else "NEUTRAL"
+    call_match = re.search(r"CALL_GLM\s*[:=]\s*(YES|NO)", raw, flags=re.IGNORECASE)
+    model_call_glm = (call_match.group(1).upper() == "YES") if call_match else None
     reason_match = re.search(r"REASON\s*[:=]\s*(.+)", raw, flags=re.IGNORECASE | re.DOTALL)
     reason = reason_match.group(1).strip()[:300] if reason_match else raw.strip()[:300]
     return {
         "long_score": long_score,
         "short_score": short_score,
+        "long_breakdown": breakdown["LONG"],
+        "short_breakdown": breakdown["SHORT"],
+        "rubric_complete": rubric_complete,
+        "used_legacy_format": found_items == 0 and (long_score > 0 or short_score > 0),
         "best_direction": best,
+        "model_should_call_glm": model_call_glm,
         "best_score": max(long_score, short_score),
         "reason": reason,
-        "raw_text": raw[:1000],
+        "raw_text": raw[:1600],
+    }
+
+
+def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
+    """Python-authoritative gate cho DeepSeek mini-rubric.
+
+    DeepSeek chỉ chấm các tiêu chí. Python tự cộng, chọn hướng, kiểm tra ngưỡng
+    và độ chênh. Trường BEST/CALL_GLM của model chỉ dùng để debug, không quyết định.
+    """
+    payload = prefilter if isinstance(prefilter, dict) else {}
+
+    def score_value(value) -> int:
+        try:
+            return max(0, min(100, int(round(float(value)))))
+        except Exception:
+            return 0
+
+    long_score = score_value(payload.get("long_score"))
+    short_score = score_value(payload.get("short_score"))
+    gap = abs(long_score - short_score)
+    best_score = max(long_score, short_score)
+
+    if long_score > short_score:
+        raw_direction = "LONG"
+    elif short_score > long_score:
+        raw_direction = "SHORT"
+    else:
+        raw_direction = "NEUTRAL"
+
+    neutral_by_gap = raw_direction == "NEUTRAL" or gap < AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP
+    direction = "NEUTRAL" if neutral_by_gap else raw_direction
+    above_threshold = best_score >= AUTO_SCAN_MIN_PREFILTER_CONFIDENCE
+    rubric_complete = bool(payload.get("rubric_complete"))
+
+    # Format cũ LONG_SCORE/SHORT_SCORE vẫn được phép chạy để tránh outage khi chuyển bản.
+    # Nhưng format mini-rubric mới mà thiếu tiêu chí sẽ bị reject, không cộng thiếu thành điểm hợp lệ.
+    used_legacy_format = bool(payload.get("used_legacy_format"))
+    parse_ok = rubric_complete or used_legacy_format
+    should_call_glm = bool(parse_ok and above_threshold and not neutral_by_gap)
+
+    if not parse_ok:
+        gate_reason = "Không parse được mini-rubric DeepSeek nên chưa gọi GLM."
+    elif neutral_by_gap:
+        gate_reason = (
+            f"Mini-rubric gần cân bằng: LONG {long_score}/100, SHORT {short_score}/100; "
+            f"chênh {gap} điểm, cần tối thiểu {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm."
+        )
+    elif not above_threshold:
+        gate_reason = (
+            f"{raw_direction} đạt {best_score}/100, dưới ngưỡng lọc nhanh "
+            f"{AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100."
+        )
+    else:
+        gate_reason = (
+            f"{raw_direction} đạt {best_score}/100, hướng đối diện "
+            f"{min(long_score, short_score)}/100, chênh {gap} điểm; gọi GLM."
+        )
+
+    return {
+        "long_score": long_score,
+        "short_score": short_score,
+        "direction": direction,
+        "raw_direction": raw_direction,
+        "best_score": best_score,
+        "gap": gap,
+        "should_call_glm": should_call_glm,
+        "reason": gate_reason,
+        "rubric_complete": rubric_complete,
     }
 
 
@@ -7687,15 +7930,13 @@ def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEE
 
 
 def request_deepseek_prefilter(prefilter_text: str) -> dict:
-    """DeepSeek lọc sơ bộ bằng text input/output, không dùng JSON contract."""
+    """DeepSeek lọc sơ bộ bằng mini-rubric text, không dùng JSON contract."""
     prompt = (
         "Bạn là bộ lọc nhanh cho Teopard Auto Scan. Không bịa dữ liệu. "
-        "Bạn KHÔNG chốt lệnh, chỉ chấm điểm sơ bộ LONG/SHORT để quyết định có gọi GLM không. "
-        "Bắt buộc trả đúng 4 dòng text, không JSON, không markdown:\n"
-        "LONG_SCORE: <số 0-100>\n"
-        "SHORT_SCORE: <số 0-100>\n"
-        "BEST: LONG hoặc SHORT\n"
-        "REASON: <một câu rất ngắn>\n\n"
+        "Bạn KHÔNG chốt lệnh và KHÔNG tạo Entry/SL/TP. "
+        "Hãy chấm đủ 5 tiêu chí cho LONG và đủ 5 tiêu chí cho SHORT. "
+        "Bắt buộc trả đúng format text bên dưới, không JSON, không markdown. "
+        "BEST được phép là NEUTRAL khi hai hướng yếu hoặc gần ngang nhau.\n\n"
         + prefilter_text
     )
     retry_count = max(0, LLM_API_RETRIES)
@@ -7715,7 +7956,20 @@ def request_deepseek_prefilter(prefilter_text: str) -> dict:
                 pass
     if last_exc:
         raise last_exc
-    return {"long_score": 0, "short_score": 0, "best_direction": "LONG", "best_score": 0, "reason": "DeepSeek không trả được kết quả."}
+    return {
+        "long_score": 0,
+        "short_score": 0,
+        "long_breakdown": {},
+        "short_breakdown": {},
+        "rubric_complete": False,
+        "used_legacy_format": False,
+        "best_direction": "NEUTRAL",
+        "model_should_call_glm": False,
+        "best_score": 0,
+        "reason": "DeepSeek không trả được kết quả.",
+    }
+
+
 
 def _payload_confidence(payload: dict | None) -> int | None:
     try:
@@ -7787,56 +8041,32 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     prefilter = await asyncio.to_thread(request_deepseek_prefilter, prefilter_text)
 
-    # DeepSeek prefilter V3: score both sides, then threshold decides whether to call GLM.
-    # This avoids fake logs like "LONG 0%" when DeepSeek did not really find a LONG setup.
-    def _score_value(value, default: int = 0) -> int:
-        try:
-            if value is None:
-                return default
-            return max(0, min(100, int(float(value))))
-        except Exception:
-            return default
+    # DeepSeek mini-rubric: Python tự cộng điểm, chọn hướng và quyết định có gọi GLM.
+    gate = _evaluate_deepseek_prefilter_gate(prefilter)
+    long_score = gate["long_score"]
+    short_score = gate["short_score"]
+    pre_direction = gate["direction"]
+    pre_conf = gate["best_score"]
 
-    long_score = _score_value(prefilter.get("long_score"), 0)
-    short_score = _score_value(prefilter.get("short_score"), 0)
-
-    # Backward compatibility: older DeepSeek schema may return one direction + signal_score.
-    legacy_direction = _clean_decision(str(
-        prefilter.get("best_direction")
-        or prefilter.get("candidate_direction")
-        or prefilter.get("direction")
-        or prefilter.get("decision")
-        or ""
-    ))
-    legacy_score = _payload_confidence(prefilter)
-    if legacy_direction == "LONG" and long_score == 0 and legacy_score is not None:
-        long_score = legacy_score
-    if legacy_direction == "SHORT" and short_score == 0 and legacy_score is not None:
-        short_score = legacy_score
-
-    if long_score > short_score:
-        pre_direction = "LONG"
-        pre_conf = long_score
-    elif short_score > long_score:
-        pre_direction = "SHORT"
-        pre_conf = short_score
-    else:
-        # Tie: keep model's best_direction if valid, otherwise use NEUTRAL for log only.
-        pre_direction = legacy_direction if legacy_direction in {"LONG", "SHORT"} and long_score > 0 else "NEUTRAL"
-        pre_conf = max(long_score, short_score)
-
-    should_call_glm = pre_conf >= AUTO_SCAN_MIN_PREFILTER_CONFIDENCE
-    if not should_call_glm:
-        if pre_direction == "NEUTRAL":
-            pre_label = f"LONG {long_score}% | SHORT {short_score}%"
-            reason_text = f"Cả LONG và SHORT đều dưới ngưỡng lọc nhanh {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}%, nên chưa gọi GLM."
-        else:
-            pre_label = f"LONG {long_score}% | SHORT {short_score}%"
-            reason_text = f"{pre_direction} đang nhỉnh hơn, nhưng điểm chỉ đạt {pre_conf}% dưới ngưỡng lọc nhanh {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}%, nên chưa gọi GLM."
+    if not gate["should_call_glm"]:
+        model_reason = str(prefilter.get("reason") or "").strip()
+        reason_text = gate["reason"]
+        if model_reason:
+            reason_text += f" DeepSeek: {model_reason[:180]}"
         return log_and_return(
-            "deepseek", "rejected",
+            "deepseek",
+            "rejected",
             reason_text,
-            pre_direction=pre_label, pre_confidence=None,
+            pre_direction=pre_direction,
+            pre_confidence=pre_conf,
+        )
+
+    quota = reserve_auto_scan_glm_call(user_id)
+    if not quota.get("allowed"):
+        return log_and_return(
+            "quota", "skipped",
+            f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi GLM trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
+            pre_direction=pre_direction, pre_confidence=pre_conf,
         )
 
     user_prompt = ctx["user_prompt"]
