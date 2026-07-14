@@ -41,7 +41,7 @@ SWING:
 
 ```env
 BOT_TOKEN=...
-ADMIN_USER_IDS=5920124635
+ADMIN_USER_IDS=...
 DB_PATH=/data/bot.db
 
 AI_PROVIDER=zai
