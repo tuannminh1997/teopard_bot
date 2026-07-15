@@ -165,5 +165,5 @@ Cập nhật quota Auto Scan:
 - DeepSeek quét mỗi 15 phút khi Auto Scan đang bật.
 - Chỉ khi DeepSeek thấy setup đủ tốt mới gọi GLM; mỗi lần bắt đầu gọi GLM tính 1 lượt.
 - Mặc định tối đa 5 lượt gọi GLM/ngày cho mỗi tài khoản.
-- Lượt thứ 5 vẫn được xử lý, sau đó Auto Scan tự dừng.
+- Lượt thứ 5 vẫn được xử lý, sau đó toàn bộ Auto Scan tự dừng; DeepSeek cũng không quét thêm.
 - 07:00 sáng hôm sau theo giờ Việt Nam, quota reset về 0/5 và Auto Scan tự bật lại.

@@ -7363,20 +7363,36 @@ def get_auto_scan_status(user_id: int) -> dict:
 
 
 def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
-    """Nghỉ 00:00-07:00 VN; 07:00 reset quota GLM và bật lại user bị dừng do quota/đêm."""
+    """Quản lý giờ nghỉ và quota theo ngày Auto Scan 07:00-06:59 VN.
+
+    Quy tắc quan trọng:
+    - 00:00-07:00: chỉ các user đang bật mới bị tạm dừng bằng ``night_resume=1``.
+    - User hết quota giữ ``enabled=0, quota_resume=1`` suốt phần còn lại của ngày;
+      tuyệt đối không bật lại ở các scheduler tick ban ngày.
+    - Chỉ khi sang quota day mới tại 07:00, số lượt mới reset về 0 và user bị dừng
+      bởi quota mới được bật lại.
+    - User tự dùng /autoscanoff có cả hai cờ resume bằng 0 nên không tự bật lại.
+    """
     init_auto_scan_db()
     current = now or utc_now()
     local_now = current.astimezone(VN_TZ)
     hour = local_now.hour
     sleep_hour = max(0, min(23, int(AUTO_SCAN_SLEEP_HOUR_VN)))
     wake_hour = max(0, min(23, int(AUTO_SCAN_WAKE_HOUR_VN)))
-    in_sleep_window = (sleep_hour <= hour < wake_hour) if sleep_hour < wake_hour else (hour >= sleep_hour or hour < wake_hour)
+    in_sleep_window = (
+        (sleep_hour <= hour < wake_hour)
+        if sleep_hour < wake_hour
+        else (hour >= sleep_hour or hour < wake_hour)
+    )
     day_key = _auto_scan_quota_day_key(current)
     disabled = 0
     resumed = 0
     quota_reset = 0
     with sqlite3.connect(DB_PATH) as conn:
-        # Sang ngày quota mới (mốc 07:00 VN): reset số lần gọi GLM.
+        conn.execute("BEGIN IMMEDIATE")
+
+        # Sang quota day mới (mốc 07:00 VN): reset số lần gọi GLM.
+        # Không thay đổi enabled/resume flags ở đây; phần dưới quyết định ai được bật lại.
         cur = conn.execute(
             """
             UPDATE auto_scan_settings
@@ -7386,27 +7402,104 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
             (day_key, iso(current), day_key),
         )
         quota_reset = int(cur.rowcount or 0)
+
         if in_sleep_window:
+            # Chỉ đánh dấu resume ban đêm cho user thực sự đang bật.
+            # User đã hết quota vốn enabled=0/quota_resume=1 nên không bị đổi trạng thái.
             cur = conn.execute(
-                "UPDATE auto_scan_settings SET enabled=0, night_resume=1, updated_at=? WHERE enabled=1",
+                """
+                UPDATE auto_scan_settings
+                SET enabled=0, night_resume=1, updated_at=?
+                WHERE enabled=1 AND quota_resume=0
+                """,
                 (iso(current),),
             )
             disabled = int(cur.rowcount or 0)
         else:
+            # User bị tạm dừng vì đêm được bật lại khi ra khỏi khung nghỉ.
             cur = conn.execute(
                 """
                 UPDATE auto_scan_settings
-                SET enabled=1, night_resume=0, quota_resume=0, updated_at=?
-                WHERE night_resume=1 OR quota_resume=1
+                SET enabled=1, night_resume=0, updated_at=?
+                WHERE night_resume=1 AND quota_resume=0
                 """,
                 (iso(current),),
             )
-            resumed = int(cur.rowcount or 0)
+            resumed += int(cur.rowcount or 0)
+
+            # User hết quota CHỈ được bật lại sau khi đã reset sang quota day mới.
+            # Điều kiện calls=0 + day_key hiện tại ngăn scheduler ban ngày bật nhầm 5/5.
+            cur = conn.execute(
+                """
+                UPDATE auto_scan_settings
+                SET enabled=1, quota_resume=0, night_resume=0, updated_at=?
+                WHERE quota_resume=1
+                  AND glm_calls_day=?
+                  AND glm_calls_today=0
+                """,
+                (iso(current), day_key),
+            )
+            resumed += int(cur.rowcount or 0)
+
         conn.commit()
     return {
-        "in_sleep_window": in_sleep_window, "disabled": disabled, "resumed": resumed,
-        "quota_reset": quota_reset, "quota_day": day_key, "local_time": local_now.isoformat(),
-        "sleep_hour": sleep_hour, "wake_hour": wake_hour,
+        "in_sleep_window": in_sleep_window,
+        "disabled": disabled,
+        "resumed": resumed,
+        "quota_reset": quota_reset,
+        "quota_day": day_key,
+        "local_time": local_now.isoformat(),
+        "sleep_hour": sleep_hour,
+        "wake_hour": wake_hour,
+    }
+
+
+def get_auto_scan_glm_quota_state(user_id: int, now: datetime | None = None) -> dict:
+    """Đọc quota trước mọi tác vụ nặng và khóa Auto Scan nếu đã đủ lượt.
+
+    Hàm này không giữ/trừ lượt. Nó là guard sớm để không gọi Binance hoặc DeepSeek
+    khi user đã dùng hết quota GLM. ``reserve_auto_scan_glm_call`` vẫn là nơi tăng
+    quota atomically ngay trước request GLM.
+    """
+    init_auto_scan_db()
+    current = now or utc_now()
+    day_key = _auto_scan_quota_day_key(current)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT glm_calls_today, glm_calls_day FROM auto_scan_settings WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        calls = int(row[0] or 0) if row else 0
+        stored_day = str(row[1] or "") if row else ""
+        if stored_day != day_key:
+            calls = 0
+            if row:
+                conn.execute(
+                    """
+                    UPDATE auto_scan_settings
+                    SET glm_calls_today=0, glm_calls_day=?, updated_at=?
+                    WHERE user_id=?
+                    """,
+                    (day_key, iso(current), user_id),
+                )
+        exhausted = calls >= AUTO_SCAN_MAX_GLM_CALLS_PER_DAY
+        if exhausted and row:
+            conn.execute(
+                """
+                UPDATE auto_scan_settings
+                SET enabled=0, quota_resume=1, glm_calls_today=?, glm_calls_day=?, updated_at=?
+                WHERE user_id=?
+                """,
+                (calls, day_key, iso(current), user_id),
+            )
+        conn.commit()
+    return {
+        "allowed": not exhausted,
+        "used": calls,
+        "remaining": max(0, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY - calls),
+        "exhausted": exhausted,
+        "day": day_key,
     }
 
 
@@ -8006,6 +8099,16 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             scan_slot=scan_slot, stage=stage, status=status, reason=reason, **kwargs,
         )
         return {"send": False, "reason": reason, "stage": stage, "status": status, **kwargs}
+
+    # Guard quota PHẢI đứng trước cooldown, Binance và DeepSeek.
+    # Nhờ vậy khi đã đủ 5/5, toàn bộ Auto Scan của user thực sự dừng cho tới 07:00.
+    quota_state = get_auto_scan_glm_quota_state(user_id)
+    if not quota_state.get("allowed"):
+        return log_and_return(
+            "quota",
+            "skipped",
+            f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi GLM trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
+        )
 
     if _auto_scan_recently_sent(user_id, binance_symbol, mode):
         return log_and_return("cooldown", "skipped", "cooldown")

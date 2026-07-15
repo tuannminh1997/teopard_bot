@@ -41,7 +41,7 @@ SWING:
 
 ```env
 BOT_TOKEN=...
-ADMIN_USER_IDS=...
+ADMIN_USER_IDS=5920124635
 DB_PATH=/data/bot.db
 
 AI_PROVIDER=zai
@@ -225,6 +225,7 @@ PREDICTION_HISTORY_COUNT="3"
 - Mỗi lần DeepSeek vượt mini-rubric và bắt đầu gọi GLM sẽ tính 1 lượt quota.
 - Mặc định tối đa 5 lượt gọi GLM cho mỗi user trong ngày Auto Scan (07:00 VN đến 06:59 hôm sau).
 - Lượt thứ 5 vẫn được GLM xử lý; ngay sau khi giữ suất thứ 5, Auto Scan tự tắt để không phát sinh lượt thứ 6.
+- Khi đã đủ quota, toàn bộ Auto Scan của user dừng: không lấy Binance, không gọi DeepSeek và không gọi GLM ở các chu kỳ tiếp theo.
 - Lúc 07:00 VN hôm sau, bot reset quota về 0/5 và tự bật lại user đã bị dừng do hết quota.
 - User chủ động /autoscanoff thì bot không tự bật lại do quota.
 - Railway: AUTO_SCAN_MAX_GLM_CALLS_PER_DAY="5"
