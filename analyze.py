@@ -152,7 +152,9 @@ AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTO_SCAN_CANDLE_CLOSE_DEL
 # Job scheduler only wakes up to check whether a candle-close slot is due.
 # It does NOT call Binance/LLM unless should_run_auto_scan_now() returns true.
 AUTO_SCAN_SCHEDULER_TICK_SECONDS = max(30, int(os.getenv("AUTO_SCAN_SCHEDULER_TICK_SECONDS", "60") or "60"))
-AUTO_SCAN_LOG_LIMIT = int(os.getenv("AUTO_SCAN_LOG_LIMIT", "20"))
+# Toàn bộ log người dùng chỉ giữ 5 mục gần nhất. Cố định trong code để biến Railway cũ
+# AUTO_SCAN_LOG_LIMIT=20 không vô tình làm DB/log Telegram dài trở lại.
+AUTO_SCAN_LOG_LIMIT = 5
 AUTO_SCAN_DEBUG = os.getenv("AUTO_SCAN_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 # Khung giờ nghỉ Auto Scan theo giờ Việt Nam: 00:00-07:00.
 AUTO_SCAN_SLEEP_HOUR_VN = int(os.getenv("AUTO_SCAN_SLEEP_HOUR_VN", "0"))
@@ -227,8 +229,9 @@ def get_result_check_interval(mode: str) -> str:
     return RESULT_CHECK_INTERVAL.get(mode, "15m")
 
 PREDICTION_HISTORY_COUNT = max(1, min(10, _env_int("PREDICTION_HISTORY_COUNT", 3)))
-VISIBLE_PREDICTION_RETENTION_LIMIT = 10
-HIDDEN_LEARNING_RETENTION_LIMIT = 10
+# /history và các log học ẩn đều chỉ giữ 5 mục gần nhất cho mỗi user.
+VISIBLE_PREDICTION_RETENTION_LIMIT = 5
+HIDDEN_LEARNING_RETENTION_LIMIT = 5
 # V19: REJECTED_PLAN/NO_TRADE không còn được lưu vào predictions sau mỗi lần phân tích.
 # Biến này vẫn giữ để lọc dữ liệu cũ trong DB của các bản trước.
 HIDDEN_LEARNING_RESULTS = ("REJECTED_PLAN", "NO_TRADE")
@@ -356,13 +359,37 @@ def init_prediction_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_symbol_mode_id ON predictions(user_id, symbol, mode, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_result_next_check ON predictions(result, next_check_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_candidates_user_status_id ON trade_candidates(user_id, status, id DESC)")
+
+        # Migration/cleanup: ngay sau deploy cũng chỉ giữ 5 prediction gần nhất mỗi user
+        # cho từng nhóm hiển thị và nhóm học ẩn, không cần chờ tới lần lưu lệnh kế tiếp.
+        hidden_a, hidden_b = HIDDEN_LEARNING_RESULTS
+        conn.execute(
+            """
+            DELETE FROM predictions
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY user_id,
+                                CASE WHEN result IN (?, ?) THEN 1 ELSE 0 END
+                            ORDER BY id DESC
+                        ) AS keep_rank
+                    FROM predictions
+                    WHERE user_id IS NOT NULL
+                ) ranked
+                WHERE keep_rank > ?
+            )
+            """,
+            (hidden_a, hidden_b, VISIBLE_PREDICTION_RETENTION_LIMIT),
+        )
         conn.commit()
 
 
 def prune_prediction_history(user_id: int | None) -> None:
-    """Giữ DB gọn: mỗi user chỉ giữ 10 lệnh hiển thị gần nhất.
+    """Giữ DB gọn: mỗi user chỉ giữ 5 lệnh hiển thị gần nhất.
 
-    - /history chỉ dùng nhóm lệnh hiển thị, nên nhóm này được giữ đúng 10 dòng mới nhất.
+    - /history chỉ dùng nhóm lệnh hiển thị, nên nhóm này được giữ đúng 5 dòng mới nhất.
     - NO_TRADE/REJECTED_PLAN là bản ghi học ẩn, không hiện trong /history; vẫn giới hạn
       riêng để DB không phình theo thời gian.
     - Learning prompt lấy số dòng gần nhất theo PREDICTION_HISTORY_COUNT (mặc định 3) cho đúng user/symbol/mode.
@@ -1507,8 +1534,9 @@ def format_stats(symbol: str | None = None, user_id: int | None = None) -> str:
     ])
 
 
-def format_history(symbol: str | None = None, limit: int = 10, user_id: int | None = None) -> str:
+def format_history(symbol: str | None = None, limit: int = 5, user_id: int | None = None) -> str:
     init_prediction_db()
+    limit = max(1, min(5, int(limit or 5)))
     where, params = build_prediction_where(symbol=symbol, user_id=user_id)
     params.append(limit)
     with sqlite3.connect(DB_PATH) as conn:
@@ -1526,15 +1554,14 @@ def format_history(symbol: str | None = None, limit: int = 10, user_id: int | No
     if not rows:
         return "Chưa có lịch sử dự đoán."
 
-    # V21: /history hiển thị số thứ tự ổn định theo cửa sổ 10 lệnh gần nhất: cũ → mới.
-    # Ví dụ có #1..#10, khi lệnh thứ 11 được lưu thì lệnh cũ nhất bị prune,
-    # lệnh cũ #2 sẽ thành #1, ... và lệnh mới nhất thành #10.
+    # /history hiển thị số thứ tự ổn định theo cửa sổ 5 lệnh gần nhất: cũ → mới.
+    # Khi lệnh thứ 6 được lưu, lệnh cũ nhất bị prune và danh sách vẫn là #1..#5.
     # DB id vẫn giữ nguyên ở trong DB, nhưng không dùng làm số hiển thị cho user.
     rows = list(reversed(rows))
 
     # user_id=None chỉ được dùng cho admin, nên admin sẽ thấy lệnh thuộc user nào.
     is_admin_scope = user_id is None
-    lines = [f"🧾 10 lệnh đã trade theo bot gần nhất {format_scope_label(symbol, user_id)}"]
+    lines = [f"🧾 {limit} lệnh đã trade theo bot gần nhất {format_scope_label(symbol, user_id)}"]
     for display_idx, row in enumerate(rows, 1):
         pid, owner_user_id, owner_chat_id, sym, mode, direction, entry_low, entry_high, sl, tp1, tp2, result, result_price, created_at, result_reason = row
         mode_label = "SCALP" if mode == "short" else "SWING"
@@ -7375,6 +7402,22 @@ def init_auto_scan_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_settings_enabled ON auto_scan_settings(enabled)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_signals_user_symbol_mode ON auto_scan_signals(user_id, symbol, mode, sent_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_logs_user_id ON auto_scan_logs(user_id, id DESC)")
+
+        # Migration/cleanup: xóa log Auto Scan cũ vượt quá 5 mục mỗi user ngay khi deploy.
+        conn.execute(
+            """
+            DELETE FROM auto_scan_logs
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY id DESC) AS keep_rank
+                    FROM auto_scan_logs
+                    WHERE user_id IS NOT NULL
+                ) ranked
+                WHERE keep_rank > ?
+            )
+            """,
+            (AUTO_SCAN_LOG_LIMIT,),
+        )
         conn.commit()
 
 
@@ -7870,7 +7913,7 @@ def _record_auto_scan_log(
 
 def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
     init_auto_scan_db()
-    limit = int(limit or AUTO_SCAN_LOG_LIMIT or 20)
+    limit = max(1, min(AUTO_SCAN_LOG_LIMIT, int(limit or AUTO_SCAN_LOG_LIMIT)))
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             """
@@ -8366,7 +8409,17 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     _record_auto_scan_signal(user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id))
     text = _auto_scan_text_header(binance_symbol, mode) + output + "\n\nBot đã tự lưu tín hiệu Auto Scan này để theo dõi. Không cần bấm xác nhận."
-    return {"send": True, "text": text, "prediction_id": int(prediction_id), "direction": direction, "confidence": final_conf}
+    return {
+        "send": True,
+        "text": text,
+        "prediction_id": int(prediction_id),
+        "direction": direction,
+        "confidence": final_conf,
+        "pre_direction": pre_direction,
+        "pre_confidence": pre_conf,
+        "final_direction": direction,
+        "final_confidence": final_conf,
+    }
 
 
 async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
@@ -8401,6 +8454,24 @@ async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
                     result = await auto_scan_symbol_for_user(symbol, mode, user["user_id"], user["chat_id"], scan_slot=slot_info.get("slot"))
                     if result.get("send") and result.get("text") and bot is not None:
                         await bot.send_message(chat_id=user["chat_id"], text=result["text"])
+                        # Tín hiệu Auto Scan hợp lệ đã được lưu vào predictions (/history) ở trên.
+                        # Sau khi Telegram gửi thành công, lưu thêm một bản ghi riêng vào
+                        # auto_scan_logs để tín hiệu vẫn xuất hiện đồng thời trong /autoscanlog.
+                        _record_auto_scan_log(
+                            user.get("user_id"),
+                            user.get("chat_id"),
+                            normalize_auto_scan_symbol(symbol),
+                            mode,
+                            scan_slot=slot_info.get("slot"),
+                            stage="sent",
+                            status="sent",
+                            reason="Đã gửi tín hiệu Auto Scan và lưu đồng thời vào history cùng Auto Scan log.",
+                            pre_direction=result.get("pre_direction"),
+                            pre_confidence=result.get("pre_confidence"),
+                            final_direction=result.get("final_direction") or result.get("direction"),
+                            final_confidence=result.get("final_confidence") if result.get("final_confidence") is not None else result.get("confidence"),
+                            prediction_id=result.get("prediction_id"),
+                        )
                         payload["sent"] += 1
                 except Exception as exc:
                     payload["errors"] += 1

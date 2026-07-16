@@ -761,7 +761,7 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.effective_message
     if not user or not message:
         return
-    logs = await asyncio.to_thread(get_auto_scan_logs, user.id, 20)
+    logs = await asyncio.to_thread(get_auto_scan_logs, user.id, 5)
     if not logs:
         await message.reply_text("Chưa có log Auto Scan nào. Bot sẽ có log sau lần quét đầu tiên theo nến đóng.")
         return
@@ -779,7 +779,14 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"AI cuối: {final}\n"
             f"Ghi chú: {_display_scan_reason(item.get('reason'))}{pid}"
         )
-    await message.reply_text("\n".join(lines))
+    # Vẫn chia tin nhắn an toàn vì một log có thể chứa ghi chú dài, dù chỉ giữ 5 mục.
+    log_text = "\n".join(lines)
+    chunks = split_telegram_message(log_text, limit=3800)
+    total_chunks = len(chunks)
+    for index, chunk in enumerate(chunks, start=1):
+        if index > 1:
+            chunk = f"🧾 Auto Scan log (tiếp {index}/{total_chunks}):\n{chunk}"
+        await message.reply_text(chunk)
 
 
 async def job_auto_scan(context: ContextTypes.DEFAULT_TYPE) -> None:

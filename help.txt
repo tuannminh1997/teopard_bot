@@ -20,7 +20,7 @@ Sau đó chọn:
 /listsymbols - Xem danh sách coin được phép phân tích
 /stats - Xem thống kê win/loss của chính bạn
 /stats BTC - Xem thống kê BTCUSDT của chính bạn
-/history - Xem 10 dự đoán gần nhất của chính bạn
+/history - Xem 5 dự đoán gần nhất của chính bạn
 /history BTC - Xem lịch sử BTCUSDT của chính bạn
 /dashboard - Xem dashboard nhanh của chính bạn
 /help - Xem hướng dẫn này
@@ -80,7 +80,7 @@ Ghi chú học lại: Khi bạn phân tích coin, Claude chỉ dùng lịch sử
 
 Ghi chú học lại nâng cao: Lịch sử đưa cho AI cuối học gồm 5 phân tích gần nhất của chính bạn cho cùng coin/mode. Mỗi lịch sử có Entry/SL/TP, kết quả WIN/LOSS, lý do kết quả, reasoning cũ, market snapshot và feature snapshot gồm cấu trúc, Fibonacci, vùng quét, ATR/risk, EMA/RSI/MACD/volume.
 
-Ghi chú lưu lịch sử: Bot chỉ giữ 10 lệnh hiển thị gần nhất cho mỗi user để DB không phình lâu dài. /history show tối đa 10 lệnh đó; lệnh thứ 11 sẽ làm lệnh hiển thị cũ nhất của user bị xóa khỏi DB. Bản ghi học ẩn NO_TRADE/REJECTED_PLAN được giới hạn riêng và không hiện trong /history.
+Ghi chú lưu lịch sử: Bot chỉ giữ 5 lệnh hiển thị gần nhất cho mỗi user để DB không phình lâu dài. /history show tối đa 5 lệnh đó; lệnh thứ 6 sẽ làm lệnh hiển thị cũ nhất của user bị xóa khỏi DB. Bản ghi học ẩn NO_TRADE/REJECTED_PLAN được giới hạn riêng và không hiện trong /history.
 
 
 Cập nhật format phản hồi:
@@ -142,7 +142,7 @@ Cập nhật V19 - lưu history theo xác nhận user:
 - Phân tích LONG/SHORT hợp lệ chỉ tạo lệnh nháp kèm nút xác nhận.
 - Chỉ khi user bấm “✅ Tôi đã đặt lệnh theo phân tích này”, bot mới lưu vào bảng predictions; nếu Entry chưa khớp thì auto-check chờ ENTRY_FILLED trước khi tính WIN/LOSS.
 - NO TRADE, REJECTED_PLAN và phân tích chưa xác nhận không còn được đưa vào /history hoặc learning prompt.
-- /history đánh số lại từ #1 đến #10 theo danh sách đang hiển thị, không dùng ID DB nhảy số.
+- /history đánh số lại từ #1 đến #5 theo danh sách đang hiển thị, không dùng ID DB nhảy số.
 - /clearhistory báo riêng số lệnh đã trade/đang theo dõi, tổng dòng predictions cũ và số lệnh nháp bị xóa.
 - /cleardrafts chỉ xóa bảng lệnh nháp/candidate, không đụng lịch sử đã trade.
 
