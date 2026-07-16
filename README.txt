@@ -1,3 +1,39 @@
+# Teopard Bot — DeepSeek Flash → DeepSeek V4 Pro build
+
+Bản này dùng:
+- `deepseek-v4-flash` làm prefilter mini-rubric mỗi 15 phút.
+- `deepseek-v4-pro` làm AI phân tích cuối cho cả manual và Auto Scan.
+- Python guard, quota 5 lượt/ngày, nghỉ 00:00-07:00 và database giữ nguyên.
+
+## Railway tối thiểu
+
+```env
+AI_PROVIDER="deepseek"
+DEEPSEEK_API_KEY=""
+DEEPSEEK_BASE_URL="https://api.deepseek.com"
+DEEPSEEK_MODEL="deepseek-v4-flash"
+DEEPSEEK_MAX_OUTPUT_TOKENS="3000"
+
+DEEPSEEK_FINAL_API_KEY=""
+DEEPSEEK_FINAL_BASE_URL="https://api.deepseek.com"
+DEEPSEEK_FINAL_MODEL="deepseek-v4-pro"
+DEEPSEEK_FINAL_REASONING_EFFORT="high"
+DEEPSEEK_FINAL_RETRY_REASONING_EFFORT="high"
+DEEPSEEK_FINAL_SUMMARY_REASONING_EFFORT="off"
+
+LLM_MAX_OUTPUT_TOKENS="30000"
+LLM_MAIN_OUTPUT_TOKEN_CAP="30000"
+LLM_MAIN_TIMEOUT_SECONDS="240"
+LLM_RETRY_TIMEOUT_SECONDS="240"
+LLM_API_RETRIES="1"
+LLM_MAIN_RETRY_LIMIT="1"
+```
+
+Có thể để trống `DEEPSEEK_FINAL_API_KEY` nếu muốn dùng chung `DEEPSEEK_API_KEY`.
+Tên quota DB và biến cũ có chữ `GLM` vẫn được giữ để tương thích; giao diện đã đổi thành “AI cuối”.
+
+---
+
 # Teopard Bot — GLM Native / Z.AI build
 
 Bản này chốt dùng GLM native qua Z.AI.

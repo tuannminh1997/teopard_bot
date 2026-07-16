@@ -45,10 +45,11 @@ def _env_int(name: str, default: int) -> int:
 # ─── AI provider config ───────────────────────────────────────────────────────
 # V33: chốt dùng GLM/Z.AI native làm provider chính.
 # OpenRouter/Claude code vẫn còn để không làm vỡ import cũ, nhưng Railway không cần set các biến đó nữa.
-AI_PROVIDER = os.getenv("AI_PROVIDER", "zai").strip().lower()
+AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek").strip().lower()
 
 OPENROUTER_PROVIDER_NAMES = {"openrouter", "or", "glm_openrouter", "openrouter_glm"}
 ZAI_PROVIDER_NAMES = {"zai", "z.ai", "z_ai", "zai_native", "zai-official", "zai_official", "glm_native"}
+DEEPSEEK_FINAL_PROVIDER_NAMES = {"deepseek", "deepseek_native", "deepseek-official", "deepseek_official", "deepseek_final"}
 ANTHROPIC_PROVIDER_NAMES = {"anthropic", "claude", "claude_native"}
 # Backward compatible: trước đây AI_PROVIDER=glm được hiểu là GLM qua OpenRouter.
 OPENROUTER_LEGACY_PROVIDER_NAMES = {"glm"}
@@ -64,9 +65,16 @@ def _is_zai_provider(provider: str | None = None) -> bool:
     return p in ZAI_PROVIDER_NAMES
 
 
+def _is_deepseek_final_provider(provider: str | None = None) -> bool:
+    p = (provider or AI_PROVIDER or "").strip().lower()
+    return p in DEEPSEEK_FINAL_PROVIDER_NAMES
+
+
 def _is_anthropic_provider(provider: str | None = None) -> bool:
     p = (provider or AI_PROVIDER or "").strip().lower()
-    return p in ANTHROPIC_PROVIDER_NAMES or not (_is_openrouter_provider(p) or _is_zai_provider(p))
+    return p in ANTHROPIC_PROVIDER_NAMES or not (
+        _is_openrouter_provider(p) or _is_zai_provider(p) or _is_deepseek_final_provider(p)
+    )
 
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -94,6 +102,20 @@ ZAI_APP_NAME = os.getenv("ZAI_APP_NAME", "Teopard Bot")
 # Trading output cần ổn định, không sáng tạo quá nhiều. Railway có thể override bằng ZAI_TEMPERATURE.
 ZAI_TEMPERATURE = _env_float("ZAI_TEMPERATURE", 0.10)
 
+# DeepSeek chính chủ cho lớp phân tích cuối. Tách riêng với DEEPSEEK_* của prefilter Flash.
+# Có thể dùng chung một API key; DEEPSEEK_FINAL_API_KEY sẽ fallback sang DEEPSEEK_API_KEY.
+DEEPSEEK_FINAL_API_KEY = os.getenv("DEEPSEEK_FINAL_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_FINAL_BASE_URL = os.getenv("DEEPSEEK_FINAL_BASE_URL", "https://api.deepseek.com").rstrip("/")
+DEEPSEEK_FINAL_MODEL = os.getenv("DEEPSEEK_FINAL_MODEL", "deepseek-v4-pro")
+# Vì mục tiêu chính là giảm chi phí khi scale, mặc định high. Có thể đổi max trên Railway.
+DEEPSEEK_FINAL_REASONING_EFFORT = os.getenv("DEEPSEEK_FINAL_REASONING_EFFORT", "high").strip()
+DEEPSEEK_FINAL_RETRY_REASONING_EFFORT = os.getenv(
+    "DEEPSEEK_FINAL_RETRY_REASONING_EFFORT", DEEPSEEK_FINAL_REASONING_EFFORT or "high"
+).strip()
+DEEPSEEK_FINAL_SUMMARY_REASONING_EFFORT = os.getenv(
+    "DEEPSEEK_FINAL_SUMMARY_REASONING_EFFORT", "off"
+).strip()
+
 # Reasoning max dùng chung ngân sách completion với phần trả lời cuối.
 # Cần cap đủ lớn để model suy luận xong vẫn còn chỗ xuất format parse được.
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "12000"))
@@ -110,12 +132,12 @@ LLM_MAIN_RETRY_LIMIT = int(os.getenv("LLM_MAIN_RETRY_LIMIT", "1"))
 LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
 
 # ─── Auto Scan mode config ──────────────────────────────────────────────────
-# Auto Scan là mode riêng: DeepSeek lọc nhanh mỗi 15 phút, GLM/Z.AI phân tích sâu
+# Auto Scan là mode riêng: DeepSeek Flash lọc nhanh mỗi 15 phút, AI cuối phân tích sâu
 # chỉ khi prefilter thấy tín hiệu đủ tốt.
 AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
 AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
 AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "62"))
-# Nếu LONG/SHORT quá sát điểm nhau thì prefilter xem là NEUTRAL và không gọi GLM.
+# Nếu LONG/SHORT quá sát điểm nhau thì prefilter xem là NEUTRAL và không gọi AI cuối.
 # Đây là độ chênh tối thiểu giữa hai tổng điểm mini-rubric, không phải confidence %.
 AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
     0,
@@ -135,17 +157,22 @@ AUTO_SCAN_DEBUG = os.getenv("AUTO_SCAN_DEBUG", "0").strip().lower() in {"1", "tr
 # Khung giờ nghỉ Auto Scan theo giờ Việt Nam: 00:00-07:00.
 AUTO_SCAN_SLEEP_HOUR_VN = int(os.getenv("AUTO_SCAN_SLEEP_HOUR_VN", "0"))
 AUTO_SCAN_WAKE_HOUR_VN = int(os.getenv("AUTO_SCAN_WAKE_HOUR_VN", "7"))
-# Mỗi user chỉ được gọi GLM tối đa N lần trong một ngày Auto Scan (07:00 VN đến 06:59 hôm sau).
-AUTO_SCAN_MAX_GLM_CALLS_PER_DAY = max(1, int(os.getenv("AUTO_SCAN_MAX_GLM_CALLS_PER_DAY", "5")))
+# Mỗi user chỉ được gọi AI cuối tối đa N lần trong một ngày Auto Scan (07:00 VN đến 06:59 hôm sau).
+AUTO_SCAN_MAX_GLM_CALLS_PER_DAY = max(
+    1,
+    int(os.getenv("AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY", os.getenv("AUTO_SCAN_MAX_GLM_CALLS_PER_DAY", "5"))),
+)
+# Tên mới để hiển thị/code mới; tên cũ vẫn giữ để tương thích DB/Railway cũ.
+AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY = AUTO_SCAN_MAX_GLM_CALLS_PER_DAY
 
 # DeepSeek filter: dùng OpenAI-compatible Chat Completions. Mặc định trỏ OpenRouter
 # để bạn có thể dùng deepseek/deepseek-v4-flash hoặc model tương đương trên Railway.
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek/deepseek-v4-flash")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_APP_NAME = os.getenv("DEEPSEEK_APP_NAME", "Teopard Auto Scan")
 DEEPSEEK_TIMEOUT_SECONDS = int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "60"))
-DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "700"))
+DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "3000"))
 DEEPSEEK_TEMPERATURE = _env_float("DEEPSEEK_TEMPERATURE", 0.05)
 # Call tóm tắt reasoning dùng token riêng và KHÔNG continuation để tránh model đốt token reasoning ẩn.
 LLM_SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_SUMMARY_MAX_OUTPUT_TOKENS", "600"))
@@ -5281,6 +5308,8 @@ def get_ai_api_key() -> str | None:
         return OPENROUTER_API_KEY
     if _is_zai_provider():
         return ZAI_API_KEY
+    if _is_deepseek_final_provider():
+        return DEEPSEEK_FINAL_API_KEY
     return ANTHROPIC_API_KEY
 
 
@@ -5289,6 +5318,8 @@ def get_ai_model_name() -> str:
         return OPENROUTER_MODEL
     if _is_zai_provider():
         return ZAI_MODEL
+    if _is_deepseek_final_provider():
+        return DEEPSEEK_FINAL_MODEL
     return CLAUDE_MODEL
 
 
@@ -5297,6 +5328,8 @@ def get_ai_provider_label() -> str:
         return "openrouter"
     if _is_zai_provider():
         return "zai"
+    if _is_deepseek_final_provider():
+        return "deepseek"
     return "anthropic"
 
 
@@ -5308,6 +5341,12 @@ def ensure_ai_config() -> None:
     if _is_zai_provider():
         if not ZAI_API_KEY:
             raise RuntimeError("Missing ZAI_API_KEY. Set AI_PROVIDER=zai and ZAI_API_KEY in Railway variables.")
+        return
+    if _is_deepseek_final_provider():
+        if not DEEPSEEK_FINAL_API_KEY:
+            raise RuntimeError(
+                "Missing DeepSeek API key. Set DEEPSEEK_FINAL_API_KEY or DEEPSEEK_API_KEY in Railway variables."
+            )
         return
     if not ANTHROPIC_API_KEY:
         raise RuntimeError("Missing ANTHROPIC_API_KEY in .env/Railway variables.")
@@ -5321,7 +5360,7 @@ def _anthropic_create_once(
     reasoning_effort: str | None = None,
 ) -> dict:
     if anthropic is None:
-        raise RuntimeError("Anthropic SDK is not installed. This build is intended to run with AI_PROVIDER=zai.")
+        raise RuntimeError("Anthropic SDK is not installed for the selected provider.")
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     kwargs = {
         "model": CLAUDE_MODEL,
@@ -5488,6 +5527,77 @@ def _zai_create_once(
     }
 
 
+
+def _deepseek_final_create_once(
+    system: str | None,
+    messages: list,
+    max_tokens: int,
+    timeout: int,
+    reasoning_effort: str | None = None,
+) -> dict:
+    """Gọi DeepSeek V4 Pro chính chủ cho phân tích cuối bằng Chat Completions."""
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_FINAL_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload_messages = []
+    if system:
+        payload_messages.append({"role": "system", "content": system})
+    payload_messages.extend(messages)
+
+    if reasoning_effort is None:
+        effective_reasoning_effort = (DEEPSEEK_FINAL_REASONING_EFFORT or "high").strip().lower()
+    else:
+        effective_reasoning_effort = (reasoning_effort or "").strip().lower()
+
+    payload = {
+        "model": DEEPSEEK_FINAL_MODEL,
+        "messages": payload_messages,
+        "max_tokens": max_tokens,
+    }
+
+    if effective_reasoning_effort in {"", "off", "none", "false", "0", "disabled"}:
+        payload["thinking"] = {"type": "disabled"}
+        effective_effort_for_log = "off"
+    else:
+        # API DeepSeek V4 hỗ trợ high/max; map giá trị cũ về hai mức hợp lệ.
+        if effective_reasoning_effort in {"max", "xhigh"}:
+            effort = "max"
+        else:
+            effort = "high"
+        payload["thinking"] = {"type": "enabled"}
+        payload["reasoning_effort"] = effort
+        effective_effort_for_log = effort
+
+    r = requests.post(
+        f"{DEEPSEEK_FINAL_BASE_URL}/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+    )
+    try:
+        r.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"DeepSeek API error: {r.status_code} - {r.text[:1000]}") from exc
+
+    data = r.json()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    if not str(content).strip():
+        raise RuntimeError(
+            "DeepSeek returned empty final content. Increase output cap or retry later."
+        )
+    return {
+        "text": str(content),
+        "stop_reason": choice.get("finish_reason"),
+        "usage": data.get("usage"),
+        "effort": effective_effort_for_log,
+    }
+
 def llm_create_once(
     system: str | None,
     messages: list,
@@ -5500,6 +5610,8 @@ def llm_create_once(
         return _openrouter_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
     if _is_zai_provider():
         return _zai_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
+    if _is_deepseek_final_provider():
+        return _deepseek_final_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
     return _anthropic_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
 
 
@@ -5555,6 +5667,8 @@ def create_with_continuation(
                 effective_timeout = max(30, min(timeout, LLM_RETRY_TIMEOUT_SECONDS))
                 if _is_zai_provider():
                     effective_reasoning_effort = ZAI_RETRY_REASONING_EFFORT or "max"
+                elif _is_deepseek_final_provider():
+                    effective_reasoning_effort = DEEPSEEK_FINAL_RETRY_REASONING_EFFORT or "high"
             try:
                 print(
                     f"[LLM_CALL] call_type={call_type} provider={get_ai_provider_label()} "
@@ -5660,6 +5774,8 @@ def summarize_reasoning(full_response: str) -> str:
             summary_effort = OPENROUTER_SUMMARY_REASONING_EFFORT
         elif _is_zai_provider():
             summary_effort = ZAI_SUMMARY_REASONING_EFFORT
+        elif _is_deepseek_final_provider():
+            summary_effort = DEEPSEEK_FINAL_SUMMARY_REASONING_EFFORT
         else:
             summary_effort = ANTHROPIC_SUMMARY_EFFORT
         text = create_with_continuation(
@@ -7391,7 +7507,7 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("BEGIN IMMEDIATE")
 
-        # Sang quota day mới (mốc 07:00 VN): reset số lần gọi GLM.
+        # Sang quota day mới (mốc 07:00 VN): reset số lần gọi AI cuối.
         # Không thay đổi enabled/resume flags ở đây; phần dưới quyết định ai được bật lại.
         cur = conn.execute(
             """
@@ -7800,8 +7916,8 @@ def build_deepseek_prefilter_text(
 ) -> str:
     """Text input rút gọn cho DeepSeek prefilter, không dùng JSON.
 
-    DeepSeek chấm hai mini-rubric LONG/SHORT để quyết định có đáng gọi GLM không.
-    Nó không tạo Entry/SL/TP và không thay thế full rubric của GLM.
+    DeepSeek chấm hai mini-rubric LONG/SHORT để quyết định có đáng gọi AI cuối không.
+    Nó không tạo Entry/SL/TP và không thay thế full rubric của AI cuối.
     """
     mode_label = "SCALP" if mode == "short" else "SWING"
     history_text = format_deepseek_history_compact(history, limit=3)
@@ -7809,12 +7925,12 @@ def build_deepseek_prefilter_text(
     return "\n".join([
         f"AUTO SCAN PREFILTER — {symbol} {mode_label}",
         current_price_str,
-        "Nhiệm vụ: dùng mini-rubric để lọc nhanh xem có đáng gọi GLM phân tích sâu không.",
+        "Nhiệm vụ: dùng mini-rubric để lọc nhanh xem có đáng gọi AI cuối phân tích sâu không.",
         "Không chốt lệnh, không tạo Entry/SL/TP, không gửi user.",
         "Chấm riêng LONG và SHORT bằng số nguyên trong đúng giới hạn từng tiêu chí.",
         "Python sẽ tự cộng điểm; không làm tròn theo nấc và không tự nâng điểm để đạt ngưỡng.",
         "Nếu hai hướng đều yếu hoặc điểm gần ngang nhau, chọn NEUTRAL.",
-        "Mục 'khả năng hình thành setup' chỉ đánh giá có đủ vùng/cấu trúc để GLM lập kế hoạch tiềm năng; không tự bịa level.",
+        "Mục 'khả năng hình thành setup' chỉ đánh giá có đủ vùng/cấu trúc để AI cuối lập kế hoạch tiềm năng; không tự bịa level.",
         "",
         "MINI-RUBRIC CHO MỖI HƯỚNG:",
         "- Xu hướng đa khung ủng hộ: tối đa 25 điểm.",
@@ -7960,7 +8076,7 @@ def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
     should_call_glm = bool(parse_ok and above_threshold and not neutral_by_gap)
 
     if not parse_ok:
-        gate_reason = "Không parse được mini-rubric DeepSeek nên chưa gọi GLM."
+        gate_reason = "Không parse được mini-rubric DeepSeek nên chưa gọi AI cuối."
     elif neutral_by_gap:
         gate_reason = (
             f"Mini-rubric gần cân bằng: LONG {long_score}/100, SHORT {short_score}/100; "
@@ -7974,7 +8090,7 @@ def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
     else:
         gate_reason = (
             f"{raw_direction} đạt {best_score}/100, hướng đối diện "
-            f"{min(long_score, short_score)}/100, chênh {gap} điểm; gọi GLM."
+            f"{min(long_score, short_score)}/100, chênh {gap} điểm; gọi AI cuối."
         )
 
     return {
@@ -7996,8 +8112,9 @@ def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEE
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
-        "X-OpenRouter-Title": DEEPSEEK_APP_NAME,
     }
+    if "openrouter.ai" in DEEPSEEK_BASE_URL.lower():
+        headers["X-OpenRouter-Title"] = DEEPSEEK_APP_NAME
     payload_messages = []
     if system:
         payload_messages.append({"role": "system", "content": system})
@@ -8107,7 +8224,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         return log_and_return(
             "quota",
             "skipped",
-            f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi GLM trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
+            f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
         )
 
     if _auto_scan_recently_sent(user_id, binance_symbol, mode):
@@ -8144,7 +8261,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     prefilter = await asyncio.to_thread(request_deepseek_prefilter, prefilter_text)
 
-    # DeepSeek mini-rubric: Python tự cộng điểm, chọn hướng và quyết định có gọi GLM.
+    # DeepSeek mini-rubric: Python tự cộng điểm, chọn hướng và quyết định có gọi AI cuối.
     gate = _evaluate_deepseek_prefilter_gate(prefilter)
     long_score = gate["long_score"]
     short_score = gate["short_score"]
@@ -8168,7 +8285,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if not quota.get("allowed"):
         return log_and_return(
             "quota", "skipped",
-            f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi GLM trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
+            f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
             pre_direction=pre_direction, pre_confidence=pre_conf,
         )
 
@@ -8184,10 +8301,10 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:
             return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
-        return log_and_return("glm", "rejected", "GLM chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+        return log_and_return("glm", "rejected", "AI cuối chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
 
     if direction not in {"LONG", "SHORT"}:
-        return log_and_return("glm", "rejected", "GLM không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+        return log_and_return("glm", "rejected", "AI cuối không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
 
     if final_conf < AUTO_SCAN_MIN_FINAL_CONFIDENCE or final_setup < AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH:
         return log_and_return(

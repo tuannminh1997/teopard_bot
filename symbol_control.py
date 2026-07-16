@@ -240,7 +240,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         error_text = str(exc)
         if "timed out" in error_text.lower() or "timeout" in error_text.lower():
             await query.message.reply_text(
-                "Phân tích thất bại: Z.AI không trả lời kịp sau lần thử chính và một lần retry. "
+                "Phân tích thất bại: AI cuối không trả lời kịp sau lần thử chính và một lần retry. "
                 "Lượt sử dụng không bị trừ; bạn có thể chạy lại sau ít phút."
             )
         else:
@@ -600,7 +600,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     enable_result = await asyncio.to_thread(set_auto_scan_enabled, user.id, message.chat_id, True, symbols)
     if enable_result.get("quota_blocked"):
         await message.reply_text(
-            f"Auto Scan đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi GLM trong ngày. "
+            f"Auto Scan đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày. "
             "Bot sẽ tự bật lại và reset quota lúc 07:00 sáng mai theo giờ Việt Nam."
         )
         return
@@ -612,8 +612,8 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Mode đang quét: {modes}.\n"
         f"DeepSeek mini-rubric tối thiểu: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100.\n"
         f"Chênh lệch LONG/SHORT tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm.\n"
-        f"GLM gửi tín hiệu tối thiểu: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%.\n"
-        f"Giới hạn gọi GLM: {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
+        f"AI cuối gửi tín hiệu tối thiểu: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%.\n"
+        f"Giới hạn gọi AI cuối: {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
         "Đủ quota thì Auto Scan tự dừng; 07:00 sáng hôm sau tự bật và reset quota.\n"
         "Giờ nghỉ tự động: 00:00-07:00 theo giờ Việt Nam; sáng bot tự bật lại nếu trước đó đang bật.\n"
         "Khi có tín hiệu đủ tốt, bot sẽ tự gửi và tự lưu theo dõi, không cần bấm xác nhận."
@@ -648,10 +648,10 @@ def _display_scan_stage(stage, status=None) -> str:
     status_raw = str(status or "-").lower()
     stage_map = {
         "deepseek": "DeepSeek",
-        "glm": "GLM",
+        "glm": "AI cuối",
         "binance": "Binance",
         "cooldown": "Cooldown",
-        "quota": "Quota GLM",
+        "quota": "Quota AI cuối",
         "sent": "Đã gửi",
         "error": "Lỗi",
     }
@@ -674,7 +674,7 @@ def _display_scan_reason(reason) -> str:
         "prefilter rejected: no actionable long/short signal": "DeepSeek bỏ qua vì tín hiệu chưa đạt ngưỡng.",
         "prefilter rejected: no actionable long/short structure": "DeepSeek bỏ qua vì tín hiệu chưa đạt ngưỡng.",
         "deepseek không chọn được hướng long/short để gửi glm.": "DeepSeek bỏ qua vì tín hiệu chưa đạt ngưỡng.",
-        "glm returned no trade": "GLM chọn NO TRADE sau phân tích đầy đủ.",
+        "glm returned no trade": "AI cuối chọn NO TRADE sau phân tích đầy đủ.",
         "cooldown": "Đang trong thời gian chờ, chưa gửi lại tín hiệu cùng symbol/mode.",
         "direction cooldown": "Đang trong thời gian chờ, chưa gửi lại tín hiệu cùng hướng.",
         "no binance data": "Không lấy được dữ liệu Binance.",
@@ -682,7 +682,7 @@ def _display_scan_reason(reason) -> str:
     if lower in replacements:
         return replacements[lower]
     # Clean older English prefixes if any remain.
-    text = text.replace("prefilter rejected:", "DeepSeek bỏ qua:").replace("final rejected:", "GLM bỏ qua:")
+    text = text.replace("prefilter rejected:", "DeepSeek bỏ qua:").replace("final rejected:", "AI cuối bỏ qua:")
     text = text.replace("signal score", "điểm tín hiệu").replace("below", "dưới ngưỡng")
     return text
 
@@ -704,7 +704,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         _normalize_auto_scan_modes, AUTO_SCAN_INTERVAL_SECONDS, AUTO_SCAN_MIN_PREFILTER_CONFIDENCE,
         AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP, AUTO_SCAN_MIN_FINAL_CONFIDENCE,
         AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, DEEPSEEK_MODEL,
-        _auto_scan_format_dt,
+        get_ai_model_name, get_ai_provider_label, _auto_scan_format_dt,
     )
 
     user = update.effective_user
@@ -723,10 +723,10 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
             f"{_auto_scan_format_dt(last_log.get('scanned_at'))} | "
             f"{last_log.get('symbol')} {'SCALP' if last_log.get('mode') == 'short' else 'SWING'} | "
             f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
-            f"DeepSeek: {pre} | GLM: {final} | {_display_scan_reason(last_log.get('reason'))}"
+            f"DeepSeek: {pre} | AI cuối: {final} | {_display_scan_reason(last_log.get('reason'))}"
         )
     if status.get("quota_resume"):
-        state_text = "⏸ ĐÃ ĐỦ QUOTA GLM — sẽ tự bật lại lúc 07:00"
+        state_text = "⏸ ĐÃ ĐỦ QUOTA AI CUỐI — sẽ tự bật lại lúc 07:00"
     elif status.get("in_sleep_window") and status.get("night_resume"):
         state_text = "🌙 ĐANG NGHỈ ĐÊM — sẽ tự bật lại lúc 07:00"
     else:
@@ -740,11 +740,12 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         f"Chu kỳ nến: {int(AUTO_SCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng\n"
         f"Mode: {modes}\n"
         "Giới hạn: 1 symbol/tài khoản\n"
-        f"DeepSeek model: {DEEPSEEK_MODEL}\n"
+        f"DeepSeek prefilter: {DEEPSEEK_MODEL}\n"
+        f"AI cuối: {get_ai_model_name()} ({get_ai_provider_label()})\n"
         f"Ngưỡng mini-rubric DeepSeek: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100\n"
         f"Chênh lệch hướng tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm\n"
-        f"Ngưỡng gửi tín hiệu GLM: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%\n"
-        f"Quota gọi GLM hôm nay: {status.get('glm_calls_today', 0)}/{AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} "
+        f"Ngưỡng gửi tín hiệu AI cuối: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}%\n"
+        f"Quota gọi AI cuối hôm nay: {status.get('glm_calls_today', 0)}/{AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} "
         f"(còn {status.get('glm_calls_remaining', AUTO_SCAN_MAX_GLM_CALLS_PER_DAY)} lượt)\n"
         f"Cooldown cùng symbol/mode: {AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES} phút\n"
         f"Lần quét gần nhất: {_auto_scan_format_dt(status.get('last_scan_at'))}\n"
@@ -775,7 +776,7 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"{item.get('symbol')} {mode_label}\n"
             f"Kết quả: {_display_scan_stage(item.get('stage'), item.get('status'))}\n"
             f"DeepSeek: {pre}\n"
-            f"GLM: {final}\n"
+            f"AI cuối: {final}\n"
             f"Ghi chú: {_display_scan_reason(item.get('reason'))}{pid}"
         )
     await message.reply_text("\n".join(lines))

@@ -78,7 +78,7 @@ Ghi chú admin: Admin dùng /historyall hoặc /historyall BTC sẽ thấy thêm
 
 Ghi chú học lại: Khi bạn phân tích coin, Claude chỉ dùng lịch sử phân tích của chính tài khoản bạn cho cùng coin/mode. Lịch sử của user khác không được đưa vào prompt học lại. Admin vẫn xem được thống kê/lịch sử toàn hệ thống khi dùng /statsall, /historyall, /dashboardall.
 
-Ghi chú học lại nâng cao: Lịch sử đưa cho Claude/GLM học gồm 5 phân tích gần nhất của chính bạn cho cùng coin/mode. Mỗi lịch sử có Entry/SL/TP, kết quả WIN/LOSS, lý do kết quả, reasoning cũ, market snapshot và feature snapshot gồm cấu trúc, Fibonacci, vùng quét, ATR/risk, EMA/RSI/MACD/volume.
+Ghi chú học lại nâng cao: Lịch sử đưa cho AI cuối học gồm 5 phân tích gần nhất của chính bạn cho cùng coin/mode. Mỗi lịch sử có Entry/SL/TP, kết quả WIN/LOSS, lý do kết quả, reasoning cũ, market snapshot và feature snapshot gồm cấu trúc, Fibonacci, vùng quét, ATR/risk, EMA/RSI/MACD/volume.
 
 Ghi chú lưu lịch sử: Bot chỉ giữ 10 lệnh hiển thị gần nhất cho mỗi user để DB không phình lâu dài. /history show tối đa 10 lệnh đó; lệnh thứ 11 sẽ làm lệnh hiển thị cũ nhất của user bị xóa khỏi DB. Bản ghi học ẩn NO_TRADE/REJECTED_PLAN được giới hạn riêng và không hiện trong /history.
 
@@ -152,7 +152,7 @@ Cập nhật V19 - lưu history theo xác nhận user:
 /autoscanstatus - Xem trạng thái Auto Scan
 /autoscanlog - Xem log các lần quét gần nhất
 
-Auto Scan là mode riêng, quét theo nến đã đóng. DeepSeek chấm mini-rubric riêng cho LONG và SHORT rồi Python tự cộng điểm. Nếu một hướng đủ điểm và đủ chênh lệch mới gọi GLM phân tích đầy đủ như mode thủ công; DeepSeek được phép trả NEUTRAL. Điểm DeepSeek là điểm lọc nhanh /100, không phải xác suất thắng. GLM vẫn có thể chọn NO TRADE sau khi lập Entry/SL/TP và chấm full rubric. Nếu GLM đủ ngưỡng confidence thì bot tự gửi tín hiệu và tự lưu theo dõi, không cần bấm nút xác nhận.
+Auto Scan là mode riêng, quét theo nến đã đóng. DeepSeek chấm mini-rubric riêng cho LONG và SHORT rồi Python tự cộng điểm. Nếu một hướng đủ điểm và đủ chênh lệch mới gọi AI cuối phân tích đầy đủ như mode thủ công; DeepSeek được phép trả NEUTRAL. Điểm DeepSeek là điểm lọc nhanh /100, không phải xác suất thắng. AI cuối vẫn có thể chọn NO TRADE sau khi lập Entry/SL/TP và chấm full rubric. Nếu AI cuối đủ ngưỡng confidence thì bot tự gửi tín hiệu và tự lưu theo dõi, không cần bấm nút xác nhận.
 
 Auto Scan chỉ cho 1 symbol/tài khoản để tiết kiệm tài nguyên. Ví dụ: /autoscanon BTC
 
@@ -163,7 +163,13 @@ Ghi chú giờ nghỉ Auto Scan:
 
 Cập nhật quota Auto Scan:
 - DeepSeek quét mỗi 15 phút khi Auto Scan đang bật.
-- Chỉ khi DeepSeek thấy setup đủ tốt mới gọi GLM; mỗi lần bắt đầu gọi GLM tính 1 lượt.
-- Mặc định tối đa 5 lượt gọi GLM/ngày cho mỗi tài khoản.
+- Chỉ khi DeepSeek thấy setup đủ tốt mới gọi AI cuối; mỗi lần bắt đầu gọi AI cuối tính 1 lượt.
+- Mặc định tối đa 5 lượt gọi AI cuối/ngày cho mỗi tài khoản.
 - Lượt thứ 5 vẫn được xử lý, sau đó toàn bộ Auto Scan tự dừng; DeepSeek cũng không quét thêm.
 - 07:00 sáng hôm sau theo giờ Việt Nam, quota reset về 0/5 và Auto Scan tự bật lại.
+
+
+Cập nhật DeepSeek V4 Pro:
+- DeepSeek V4 Flash tiếp tục làm prefilter mini-rubric.
+- DeepSeek V4 Pro là AI phân tích cuối cho manual và Auto Scan khi `AI_PROVIDER=deepseek`.
+- Quota Auto Scan tính theo mỗi lần bắt đầu gọi AI cuối, kể cả AI cuối trả NO TRADE hoặc bị guard từ chối.
