@@ -1,156 +1,102 @@
-# Teopard Bot — DeepSeek Flash → DeepSeek V4 Pro build
+# Teopard Bot — DeepSeek V4 Flash → DeepSeek V4 Pro
 
-Bản này dùng:
-- `deepseek-v4-flash` làm prefilter mini-rubric mỗi 15 phút.
-- `deepseek-v4-pro` làm AI phân tích cuối cho cả manual và Auto Scan.
-- Python guard, quota 5 lượt/ngày, nghỉ 00:00-07:00 và database giữ nguyên.
+Bản hiện tại dùng:
 
-## Railway tối thiểu
+- `deepseek-v4-flash` làm prefilter mini-rubric cho Auto Scan.
+- `deepseek-v4-pro` làm AI phân tích cuối cho manual và Auto Scan.
+- Python tính chỉ báo/cấu trúc, kiểm tra Entry–SL–TP, RR, ATR và quản lý vòng đời lệnh.
+
+## Flow phân tích
+
+Manual:
+
+1. Lấy nến Binance theo mode.
+2. Python tính EMA, RSI, MACD, ATR, volume, Fibonacci, cấu trúc và đỉnh/đáy.
+3. DeepSeek V4 Pro chọn LONG, SHORT hoặc NO TRADE và lập Entry/SL/TP.
+4. Python kiểm tra rubric, nguồn level, hình học, RR và khoảng chống nhiễu ATR.
+5. Lệnh manual chỉ vào history khi user bấm xác nhận theo dõi.
+
+Auto Scan:
+
+1. DeepSeek V4 Flash quét mini-rubric mỗi 15 phút.
+2. Chỉ khi điểm hướng tốt nhất và độ chênh LONG/SHORT đạt ngưỡng mới gọi V4 Pro.
+3. V4 Pro phân tích đầy đủ; Python guard kiểm tra lần cuối.
+4. Tín hiệu gửi thành công được lưu đồng thời vào `/history` và `/autoscanlog`.
+5. `/history` và `/autoscanlog` đều giữ 5 bản ghi gần nhất mỗi user.
+
+## Không dùng pseudo-liquidation
+
+Bản này không truyền vùng thanh lý/thanh khoản ước lượng từ OHLCV cho Flash hoặc Pro.
+
+- BẢN ĐỒ LEVEL chỉ gồm cấu trúc, đỉnh/đáy, Fibonacci và EMA.
+- ATR, volume, RSI, MACD và nến đã đóng vẫn được gửi bình thường.
+- Râu nến/cú quét đỉnh-đáy đã xảy ra được coi là hành động giá, không phải dữ liệu thanh lý thật.
+- Auto-adjust TP, nếu bật, chỉ lấy target cấu trúc/Fibonacci; không dùng liquidity box ước lượng.
+- Feature snapshot mới không chứa vùng dưới/trên ước lượng.
+- Snapshot cũ trong DB được lọc khi đưa lại vào prompt; không cần xóa `bot.db`.
+- Các hàm tính vùng cũ còn nằm trong `analyze.py` để tương thích mã nguồn, nhưng không còn được gọi trong prompt, level map, guard, manual hay Auto Scan.
+
+## Timeframe
+
+SCALP:
+
+- 15M: timing và xác nhận nến.
+- 1H: setup chính.
+- 4H: xác nhận xu hướng.
+- 1D: bối cảnh lớn.
+
+SWING:
+
+- 1H: timing phụ.
+- 4H: setup và vùng vào.
+- 1D: xu hướng chính.
+- 1W: bối cảnh lớn.
+
+Chỉ nến đã đóng được dùng làm xác nhận. Nến đang chạy chỉ dùng tham khảo.
+
+## Railway
+
+Dùng file `railway_deepseek_pro.env` hoặc `railway_variables.env.example` làm mẫu. Các biến chính:
 
 ```env
+BOT_TOKEN=""
+ADMIN_USER_IDS=""
+DB_PATH="/data/bot.db"
 AI_PROVIDER="deepseek"
+
 DEEPSEEK_API_KEY=""
 DEEPSEEK_BASE_URL="https://api.deepseek.com"
 DEEPSEEK_MODEL="deepseek-v4-flash"
 DEEPSEEK_MAX_OUTPUT_TOKENS="3000"
 
-DEEPSEEK_FINAL_API_KEY=""
-DEEPSEEK_FINAL_BASE_URL="https://api.deepseek.com"
 DEEPSEEK_FINAL_MODEL="deepseek-v4-pro"
 DEEPSEEK_FINAL_REASONING_EFFORT="high"
 DEEPSEEK_FINAL_RETRY_REASONING_EFFORT="high"
-DEEPSEEK_FINAL_SUMMARY_REASONING_EFFORT="off"
 
-LLM_MAX_OUTPUT_TOKENS="30000"
-LLM_MAIN_OUTPUT_TOKEN_CAP="30000"
-LLM_MAIN_TIMEOUT_SECONDS="240"
-LLM_RETRY_TIMEOUT_SECONDS="240"
-LLM_API_RETRIES="1"
-LLM_MAIN_RETRY_LIMIT="1"
+AUTO_SCAN_INTERVAL_SECONDS="900"
+AUTO_SCAN_MIN_PREFILTER_CONFIDENCE="62"
+AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP="5"
+AUTO_SCAN_MIN_FINAL_CONFIDENCE="62"
+AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH="62"
+AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY="5"
+AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES="180"
+AUTO_SCAN_SLEEP_HOUR_VN="0"
+AUTO_SCAN_WAKE_HOUR_VN="7"
 ```
 
-Có thể để trống `DEEPSEEK_FINAL_API_KEY` nếu muốn dùng chung `DEEPSEEK_API_KEY`.
-Tên quota DB và biến cũ có chữ `GLM` vẫn được giữ để tương thích; giao diện đã đổi thành “AI cuối”.
+`DEEPSEEK_FINAL_API_KEY` có thể để trống; code sẽ dùng chung `DEEPSEEK_API_KEY`.
 
----
+## Quota và giờ nghỉ Auto Scan
 
-# Teopard Bot — GLM Native / Z.AI build
+- Quota mặc định: tối đa 5 lần bắt đầu gọi AI cuối trong ngày Auto Scan.
+- Đủ quota: toàn bộ Auto Scan dừng, không gọi Binance, Flash hoặc Pro.
+- 00:00–07:00 giờ Việt Nam: Auto Scan nghỉ.
+- 07:00 hôm sau: reset quota và tự bật lại khi bị dừng do quota/giờ nghỉ.
+- `/autoscanoff` thủ công không bị tự bật lại.
 
-Bản này chốt dùng GLM native qua Z.AI.
+## Lệnh
 
-## Flow phân tích
-
-- Bot lấy dữ liệu nến từ Binance.
-- Python tính dữ liệu cứng: EMA, RSI, MACD, ATR, Fibonacci, cấu trúc, vùng stop/liquidity ước lượng.
-- Model GLM tự phân tích và tự chọn Entry / SL / TP.
-- Python mặc định không tự nhảy SL/TP sang số khác.
-- Python validate hình học, nguồn level, RR theo mode và khoảng chống nhiễu ATR; xử lý lệnh chờ, và chỉ lưu history khi user bấm xác nhận đã trade theo bot.
-
-## Cơ chế Entry / SL / TP bản structural-final
-
-- Python gộp Fibonacci, EMA, đỉnh/đáy và vùng quét gần nhau thành tối đa 6 level mỗi phía.
-- Model phải khai báo nguồn nội bộ cho Entry, SL, TP1, TP2 bằng ID level; block này được xóa trước khi gửi Telegram.
-- Python không tự bẻ số mặc định, nhưng từ chối kế hoạch nếu SL chưa nằm ngoài invalidation, TP không bám level, RR theo mode quá thấp, TP2 quá sát TP1 hoặc TP quá gần so với ATR của khung vào lệnh.
-- Các biến cũ `TEOPARD_MIN_TP1_R`, `TEOPARD_MIN_TP2_R`, `TEOPARD_TP2_SEPARATION_MULT` không còn được dùng; dùng biến SCALP/SWING riêng trong phần Railway variables.
-
-## Timeframe roles V33
-
-SCALP:
-- 15M = trigger/timing, sweep/wick, chỉ tham khảo để vào lệnh.
-- 1H = khung setup/chính.
-- 4H = xác nhận xu hướng.
-- 1D = bối cảnh lớn.
-
-SWING:
-- 1H = trigger/timing phụ.
-- 4H = setup/vùng vào.
-- 1D = khung xu hướng/chính.
-- 1W = bối cảnh lớn.
-
-## Nến đã đóng vs nến đang chạy
-
-- Indicator, structure, Fibonacci, raw candle chính và market regime dùng nến đã đóng.
-- Nến đang chạy được tách riêng trong LIVE_CANDLE_CONTEXT và chỉ dùng tham khảo.
-- Model không được dùng nến live để xác nhận Entry/đảo chiều.
-
-## Railway variables cần thiết
-
-```env
-BOT_TOKEN=...
-ADMIN_USER_IDS=5920124635
-DB_PATH=/data/bot.db
-
-AI_PROVIDER=zai
-ZAI_API_KEY=...
-ZAI_MODEL=glm-5.2
-ZAI_BASE_URL=https://api.z.ai/api/paas/v4
-ZAI_REASONING_EFFORT=max
-ZAI_RETRY_REASONING_EFFORT=max
-ZAI_SUMMARY_REASONING_EFFORT=none
-ZAI_APP_NAME=Teopard Bot
-
-LLM_MAX_OUTPUT_TOKENS=12000
-LLM_MAIN_OUTPUT_TOKEN_CAP=12000
-LLM_MAX_CONTINUATIONS=0
-LLM_SUMMARY_MAX_OUTPUT_TOKENS=600
-
-TEOPARD_PYTHON_ADJUST_SL=0
-TEOPARD_PYTHON_ADJUST_TP=0
-
-TEOPARD_EXTRA_SL_BUFFER_PCT=0
-TEOPARD_EXTRA_TP1_BUFFER_PCT=0
-TEOPARD_EXTRA_TP2_BUFFER_PCT=0
-TEOPARD_EXTRA_TP_BUFFER_PCT=0
-TEOPARD_RR_USE_EXTRA_SL_BUFFER=0
-TEOPARD_RR_USE_EXTRA_TP_BUFFER=0
-
-TEOPARD_GUARD_PROFILE=loose
-TEOPARD_MIN_TP1_R_SCALP=0.70
-TEOPARD_MIN_TP2_R_SCALP=1.20
-TEOPARD_TP2_SEPARATION_MULT_SCALP=1.35
-TEOPARD_MIN_TP1_ATR_MULT_SCALP=0.50
-TEOPARD_MIN_TP2_ATR_MULT_SCALP=1.00
-TEOPARD_MIN_TP1_R_SWING=0.80
-TEOPARD_MIN_TP2_R_SWING=1.50
-TEOPARD_TP2_SEPARATION_MULT_SWING=1.40
-TEOPARD_MIN_TP1_ATR_MULT_SWING=0.50
-TEOPARD_MIN_TP2_ATR_MULT_SWING=1.00
-TEOPARD_MIN_SCALP_CONFIDENCE=62
-TEOPARD_MIN_SWING_CONFIDENCE=62
-TEOPARD_MIN_SETUP_STRENGTH=62
-TEOPARD_MIN_REVERSAL_CONFIDENCE=50
-TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE=52
-TEOPARD_WEAK_CONFIRM_VOLUME=0.45
-```
-
-## Có thể xóa khỏi Railway
-
-Nếu đã chốt chỉ dùng Z.AI native thì có thể xóa:
-
-```env
-OPENROUTER_API_KEY
-OPENROUTER_MODEL
-OPENROUTER_BASE_URL
-OPENROUTER_REASONING_EFFORT
-OPENROUTER_SUMMARY_REASONING_EFFORT
-OPENROUTER_SITE_URL
-OPENROUTER_APP_NAME
-
-ANTHROPIC_API_KEY
-CLAUDE_MODEL
-ANTHROPIC_EFFORT
-ANTHROPIC_SUMMARY_EFFORT
-CLAUDE_MAX_TOKENS
-
-GLM_MODEL
-GLM_REASONING_EFFORT
-Z_AI_API_KEY
-TEOPARD_SL_EXTRA_BUFFER_PCT
-TEOPARD_TP1_EXTRA_BUFFER_PCT
-TEOPARD_TP2_EXTRA_BUFFER_PCT
-```
-
-## Lệnh chính
+User:
 
 - `/start`
 - `/help`
@@ -158,110 +104,20 @@ TEOPARD_TP2_EXTRA_BUFFER_PCT
 - `/history`
 - `/stats`
 - `/dashboard`
+- `/autoscanon BTC`
+- `/autoscanoff`
+- `/autoscanstatus`
+- `/autoscanlog`
+
+Admin:
+
+- `/adduser <id>`
+- `/removeuser <id>`
+- `/setlimit <id> <số lượt>`
+- `/addsymbol BTC`
+- `/removesymbol BTC`
+- `/historyall`
+- `/statsall`
+- `/checknow`
 - `/clearhistory CONFIRM`
-- `/cleardrafts CONFIRM`
-
-History chỉ lưu lệnh khi user bấm xác nhận đã trade theo bot. `/cleardrafts CONFIRM` chỉ xóa lệnh nháp/candidate và giữ nguyên history.
-
-## Hotfix timeout provider AI
-Nếu gặp lỗi `Read timed out` từ Z.AI/OpenRouter, đây là provider không trả response trong thời gian đọc. Bản này chỉ retry một lần; cả lần đầu và lần retry đều giữ `reasoning_effort=max`; bot chỉ retry một lần để tránh treo nhiều vòng. Main analysis không continuation; reasoning vẫn max và cap output là 12000 để còn chỗ cho phần trả lời cuối. Bot cũng không gọi LLM lần hai chỉ để tóm tắt history.
-Có thể chỉnh Railway variables:
-
-```env
-LLM_MAIN_TIMEOUT_SECONDS=240
-LLM_RETRY_TIMEOUT_SECONDS=150
-LLM_SUMMARY_TIMEOUT_SECONDS=60
-LLM_API_RETRIES=1
-LLM_MAIN_RETRY_LIMIT=1
-LLM_RETRY_SLEEP_SECONDS=2
-```
-
-## Auto Scan Mode
-
-Auto Scan là mode riêng, không thay thế phân tích thủ công.
-
-Flow:
-
-- Bot quét theo nến đã đóng, mặc định mỗi 15 phút.
-- DeepSeek v4 flash chấm mini-rubric riêng cho LONG và SHORT bằng text prompt rút gọn; Python tự cộng điểm, cho phép NEUTRAL và chỉ gọi GLM khi một hướng đủ điểm lẫn đủ chênh lệch.
-- Nếu lọc nhanh đạt ngưỡng, bot gửi data text đầy đủ sang GLM/Z.AI giống mode thủ công.
-- Nếu GLM/Z.AI trả LONG/SHORT đủ confidence, bot gửi tín hiệu cho user.
-- Auto Scan không hiện nút "Tôi đã đặt lệnh theo phân tích này".
-- Tín hiệu Auto Scan được lưu thẳng vào predictions để auto-check.
-
-Lệnh user:
-
-- `/autoscanon BTC` - bật Auto Scan cho BTC.
-- `/autoscanoff` - tắt Auto Scan.
-- `/autoscanstatus` - xem trạng thái, lần quét gần nhất và lần quét kế tiếp.
-- `/autoscanlog` - xem log các lần quét gần nhất.
-
-Railway variables Auto Scan:
-
-```env
-DEEPSEEK_API_KEY="..."
-DEEPSEEK_BASE_URL="https://api.deepseek.com"
-DEEPSEEK_MODEL="deepseek-v4-flash"
-DEEPSEEK_TIMEOUT_SECONDS="60"
-DEEPSEEK_MAX_OUTPUT_TOKENS="700"
-DEEPSEEK_TEMPERATURE="0.05"
-
-AUTO_SCAN_INTERVAL_SECONDS="900"
-AUTO_SCAN_MODES="short"
-AUTO_SCAN_MIN_PREFILTER_CONFIDENCE="62"
-AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP="5"
-AUTO_SCAN_MIN_FINAL_CONFIDENCE="62"
-AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES="180"
-AUTO_SCAN_SEND_NO_TRADE="0"
-AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS="5"
-AUTO_SCAN_LOG_LIMIT="5"
-AUTO_SCAN_DEBUG="0"
-AUTO_SCAN_SCHEDULER_TICK_SECONDS="60"
-```
-
-Không cần set `AUTO_SCAN_SYMBOLS`. User chọn symbol bằng `/autoscanon BTC`. Auto Scan chỉ cho 1 symbol/user để tiết kiệm tài nguyên.
-
-DeepSeek mini-rubric prefilter:
-
-```text
-Xu hướng đa khung                 25
-Vị trí giá và cấu trúc           25
-Động lượng/hành động giá         20
-Volume và nến xác nhận           15
-Khả năng hình thành setup        15
-Tổng                            100
-```
-
-- DeepSeek chấm rubric này riêng cho LONG và SHORT, không lập Entry/SL/TP.
-- Python tự cộng điểm; total model tự ghi không được dùng.
-- Nếu cả hai hướng dưới ngưỡng hoặc chênh nhau dưới `AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP`, kết quả là NEUTRAL và không gọi GLM.
-- Điểm DeepSeek là `điểm lọc nhanh /100`, không phải xác suất thắng hay Độ chắc chắn của GLM.
-- GLM vẫn dùng full rubric, lập Entry/SL/TP và có thể chọn NO TRADE sau khi nhận context đầy đủ.
-
-## Text input/output
-
-Bản này dùng lại text prompt/text output cho GLM như mode thủ công cũ. Không dùng JSON input/output cho phân tích chính. Python vẫn parse text output bằng regex để lưu candidate/history/auto-check.
-
-## Auto Scan nghỉ đêm theo giờ Việt Nam
-
-- Từ 00:00 đến trước 07:00, Auto Scan tự tắt tạm thời để không gọi Binance/DeepSeek/GLM.
-- Lúc 07:00, bot chỉ tự bật lại những tài khoản đang bật trước khi bước vào giờ nghỉ.
-- Nếu user chủ động dùng `/autoscanoff` trong giờ nghỉ, bot sẽ không tự bật lại vào buổi sáng.
-- Mặc định không cần thêm Railway Variables. Có thể tùy chỉnh bằng `AUTO_SCAN_SLEEP_HOUR_VN` và `AUTO_SCAN_WAKE_HOUR_VN`.
-
-PREDICTION HISTORY CONTEXT
---------------------------
-PREDICTION_HISTORY_COUNT="3"
-- Số history đầy đủ gần nhất gửi cho GLM trong cả manual và Auto Scan.
-- Chỉ thay đổi số bản ghi lấy vào prompt; không xóa dữ liệu cũ trong bot.db.
-- Giá trị được giới hạn từ 1 đến 10; mặc định là 3 nếu biến thiếu hoặc không hợp lệ.
-
-## Auto Scan GLM daily quota
-- DeepSeek vẫn quét theo chu kỳ nến 15 phút khi Auto Scan đang bật.
-- Mỗi lần DeepSeek vượt mini-rubric và bắt đầu gọi GLM sẽ tính 1 lượt quota.
-- Mặc định tối đa 5 lượt gọi GLM cho mỗi user trong ngày Auto Scan (07:00 VN đến 06:59 hôm sau).
-- Lượt thứ 5 vẫn được GLM xử lý; ngay sau khi giữ suất thứ 5, Auto Scan tự tắt để không phát sinh lượt thứ 6.
-- Khi đã đủ quota, toàn bộ Auto Scan của user dừng: không lấy Binance, không gọi DeepSeek và không gọi GLM ở các chu kỳ tiếp theo.
-- Lúc 07:00 VN hôm sau, bot reset quota về 0/5 và tự bật lại user đã bị dừng do hết quota.
-- User chủ động /autoscanoff thì bot không tự bật lại do quota.
-- Railway: AUTO_SCAN_MAX_GLM_CALLS_PER_DAY="5"
+- `/cleardrafts ALL CONFIRM`

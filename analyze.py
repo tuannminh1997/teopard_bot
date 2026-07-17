@@ -3873,7 +3873,7 @@ CONFIDENCE_SCORE_WEIGHTS = {
 
 
 def _dedupe_price_candidates(candidates: list[dict], price_ref: float, risk: float) -> list[dict]:
-    """Gộp các target gần như trùng nhau để TP không nhảy giữa vài mức sát nhau."""
+    """Gộp các target cấu trúc gần như trùng nhau để TP không nhảy giữa vài mức sát nhau."""
     if not candidates:
         return []
     tol = max(price_ref * 0.00035, risk * 0.08, 1e-9)
@@ -3889,7 +3889,7 @@ def _dedupe_price_candidates(candidates: list[dict], price_ref: float, risk: flo
         if matched is None:
             unique.append(dict(cand))
             continue
-        # Ưu tiên pivot/liquidity/fib có score cao hơn; nếu tương đương giữ mức xa hơn theo source ổn định.
+        # Ưu tiên pivot/Fibonacci/EMA có score cao hơn; nếu tương đương giữ mức theo source ổn định.
         if float(cand.get("score", 0.0)) > float(matched.get("score", 0.0)):
             matched.update(cand)
     return unique
@@ -3904,9 +3904,9 @@ def _collect_tp_target_candidates(
 ) -> list[dict]:
     """Thu thập target cấu trúc để sửa TP1/TP2 nếu model đặt quá sát.
 
-    LONG lấy các swing high / liquidity trên / fib phía trên Entry.
-    SHORT lấy các swing low / liquidity dưới / fib phía dưới Entry.
-    Đây chỉ là target ứng viên; validator vẫn quyết định cuối cùng theo RR.
+    LONG lấy swing high, Fibonacci, EMA và biên cấu trúc phía trên Entry.
+    SHORT lấy swing low, Fibonacci, EMA và biên cấu trúc phía dưới Entry.
+    Không dùng vùng thanh lý/thanh khoản suy đoán từ OHLCV.
     """
     direction = (pred.get("direction") or "").upper()
     if direction not in ("LONG", "SHORT"):
@@ -3958,24 +3958,6 @@ def _collect_tp_target_candidates(
         else:
             add(struct.get("recent_low"), f"đáy gần {label}", weight + 0.15)
             add(struct.get("major_low"), f"biên thấp {label}", weight + 0.05)
-
-    # 3) Liquidity box đối diện, nhưng chỉ làm target nếu nó đủ RR; không ép bám mép box hẹp.
-    try:
-        zones = _liquidity_zones_by_windows(timeframe_data, mode, price_ref)
-        if direction == "LONG":
-            for role, score in [("near", 1.6), ("main", 1.45), ("deep", 1.25)]:
-                zone = zones.get(f"upper_{role}")
-                if zone and zone[0] is not None and zone[1] is not None:
-                    add(float(zone[0]), f"liquidity trên {role} mép gần", score)
-                    add(float(zone[1]), f"liquidity trên {role} mép xa", score * 0.9)
-        else:
-            for role, score in [("near", 1.6), ("main", 1.45), ("deep", 1.25)]:
-                zone = zones.get(f"lower_{role}")
-                if zone and zone[0] is not None and zone[1] is not None:
-                    add(float(zone[1]), f"liquidity dưới {role} mép gần", score)
-                    add(float(zone[0]), f"liquidity dưới {role} mép xa", score * 0.9)
-    except Exception:
-        pass
 
     # Loại target cực xa bất thường so với risk/khung để tránh TP bị kéo ảo.
     # SCALP giữ target trong khoảng ~5R hoặc 2.8% giá; SWING rộng hơn.
@@ -4406,10 +4388,11 @@ def _build_model_level_catalog(
 ) -> dict[str, dict]:
     """Gom, xếp hạng và gắn ID cho các level model được phép dùng.
 
-    Mỗi phía chỉ giữ tối đa 6 cụm; các Fib/EMA/swing/liquidity gần nhau được gộp
-    thành một nguồn duy nhất để model không nhảy giữa nhiều mức gần như trùng.
+    Mỗi phía chỉ giữ tối đa 6 cụm từ cấu trúc, Fibonacci và EMA. Tham số ``zones``
+    chỉ được giữ để tương thích lời gọi cũ; pseudo-liquidation không còn được đưa
+    vào bản đồ level, prompt hay Python guard.
     """
-    zones = zones or _liquidity_zones_by_windows(timeframe_data, mode, price)
+    _ = zones
     main_label, structure_label, big_label = _mode_labels(mode)
     structure = structure or _structure_info(timeframe_data.get(structure_label), price)
     atr_ref = _current_atr(timeframe_data.get(_mode_trigger_label(mode)))
@@ -4429,21 +4412,6 @@ def _build_model_level_catalog(
         if not np.isfinite(val) or val <= 0 or abs(val - price) <= 1e-12:
             return
         raw.append({"low": val, "high": val, "anchor": val, "labels": [name], "score": float(score)})
-
-    def add_zone(zone, name: str, score: float) -> None:
-        if not zone or len(zone) < 2:
-            return
-        try:
-            low, high = sorted((float(zone[0]), float(zone[1])))
-        except Exception:
-            return
-        if not np.isfinite(low) or not np.isfinite(high) or low <= 0 or high <= 0:
-            return
-        # Vùng đang bao quanh current price không phải target/invalidation rõ; bỏ khỏi map ID.
-        if low <= price <= high:
-            return
-        anchor = low if low > price else high
-        raw.append({"low": low, "high": high, "anchor": anchor, "labels": [name], "score": float(score)})
 
     def add_structure(label: str, base_score: float) -> None:
         info = structure if label == structure_label else _structure_info(timeframe_data.get(label), price)
@@ -4465,11 +4433,6 @@ def _build_model_level_catalog(
         add_structure(structure_label, 2.35)
     if big_label not in (main_label, structure_label):
         add_structure(big_label, 1.70)
-
-    for side in ("lower", "upper"):
-        add_zone(zones.get(f"{side}_near"), f"vùng quét {side} gần", 2.30)
-        add_zone(zones.get(f"{side}_main"), f"vùng quét {side} chính", 2.10)
-        add_zone(zones.get(f"{side}_deep"), f"vùng quét {side} sâu", 1.65)
 
     def side_of(c: dict) -> str | None:
         if c["low"] > price:
@@ -4527,7 +4490,7 @@ def _format_model_level_map(
     structure: dict | None = None,
 ) -> str:
     """Bản đồ level đã gộp, có ID để model khai báo nguồn Entry/SL/TP."""
-    catalog = _build_model_level_catalog(timeframe_data, mode, price, zones, structure, max_per_side=6)
+    catalog = _build_model_level_catalog(timeframe_data, mode, price, None, structure, max_per_side=6)
 
     def compact(prefix: str, title: str) -> str:
         items = [catalog[k] for k in sorted(catalog) if k.startswith(prefix)]
@@ -4582,7 +4545,7 @@ def build_feature_engineering_block(
     trigger_label = _mode_trigger_label(mode)
     price = current_price or _last_close_from_data(timeframe_data)
     if price is None:
-        return "Dữ liệu kỹ thuật: Không đủ dữ liệu để tính cấu trúc, Fibonacci, ATR và vùng quét. Không được tự bịa các phần này."
+        return "Dữ liệu kỹ thuật: Không đủ dữ liệu để tính cấu trúc, Fibonacci và ATR. Không được tự bịa các phần này."
 
     main_df = timeframe_data.get(main_label)
     trigger_df = timeframe_data.get(trigger_label)
@@ -4592,13 +4555,12 @@ def build_feature_engineering_block(
     atr_trigger = _current_atr(trigger_df)
     atr_main = _current_atr(main_df)
     atr_structure = _current_atr(structure_df)
-    zones = _liquidity_zones_by_windows(timeframe_data, mode, price)
     structure = _structure_info(structure_df, price)
     risk = _risk_floor(timeframe_data, mode, price)
 
     fib = structure.get("fib", {})
 
-    level_map = _format_model_level_map(timeframe_data, mode, price, zones, structure)
+    level_map = _format_model_level_map(timeframe_data, mode, price, None, structure)
     plan_contract = _format_model_plan_contract(timeframe_data, mode, price)
 
     lines = [
@@ -4612,10 +4574,9 @@ def build_feature_engineering_block(
         f"- Trigger {trigger_label} đã đóng: {_consecutive_candles(trigger_df)} | {_wick_body_info(trigger_df)}",
         f"- Setup {main_label} đã đóng: {_consecutive_candles(main_df)} | {_wick_body_info(main_df)}",
         f"- Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}. Các level số đã được gộp duy nhất trong BẢN ĐỒ LEVEL ở trên.",
-        "- Vai trò vùng quét: Entry có thể tham khảo vùng gần/chính nếu hợp xu hướng và có xác nhận. Với SCALP, không dùng vùng thanh khoản dưới làm Entry LONG hoặc vùng thanh khoản trên làm Entry SHORT theo kiểu chạm-là-fill. Nếu cần thêm xác nhận, có thể ghi lệnh chờ kèm điều kiện rõ; chỉ chọn NO TRADE khi SL/TP, động lượng hoặc vùng vào không đạt.",
-        "- ATR và các vùng quét chỉ là dữ liệu tham khảo về biến động/cấu trúc; không dùng chúng như công thức máy móc để sinh SL hoặc TP.",
+        "- Entry/SL/TP chỉ được bám vào cấu trúc giá có thể kiểm chứng: đỉnh/đáy, Fibonacci, EMA, ATR và hành động giá từ nến đã đóng.",
+        "- Bot không cung cấp liquidation heatmap, vị thế đòn bẩy hay vùng thanh lý thật. Không được suy đoán hoặc tự tạo các dữ liệu đó từ OHLCV.",
         "- Python chỉ kiểm tra hình học và RR sau khi model đã chọn Entry/SL/TP theo cấu trúc. Không tạo TP từ phép nhân RR và không bóp SL để vượt guard.",
-        "- Ghi chú: Vùng quét là vùng thanh khoản kỹ thuật ước lượng theo cửa sổ thời gian, không phải dữ liệu thanh lý thật hay liquidation heatmap. Block này là bản đồ kỹ thuật nội bộ, không phải lệnh giao dịch chốt sẵn. Không show trực tiếp các vùng thanh khoản/thanh lý/heatmap ra user; chỉ dùng chúng để lập quyết định, Entry/SL/TP, lý do và rủi ro.",
     ]
     return "\n".join(lines)
 
@@ -4645,7 +4606,6 @@ def build_feature_snapshot(
 
     atr_main = _current_atr(main_df)
     atr_structure = _current_atr(structure_df)
-    zones = _liquidity_zones_by_windows(timeframe_data, mode, price)
     structure = _structure_info(structure_df, price)
     risk = _risk_floor(timeframe_data, mode, price)
     fib = structure.get("fib", {})
@@ -4674,8 +4634,6 @@ def build_feature_snapshot(
         compact_tf(big_label, big_df),
         f"Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}-{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}-{fmt(structure.get('major_high'))}",
         f"Fib {structure_label}: 0.382 {fmt(fib.get('0.382'))}, 0.5 {fmt(fib.get('0.5'))}, 0.618 {fmt(fib.get('0.618'))}",
-        f"Vùng dưới: {zones.get('label_near')} {_fmt_zone_tuple(zones.get('lower_near'), price)}; {zones.get('label_main')} {_fmt_zone_tuple(zones.get('lower_main'), price)}; {zones.get('label_deep')} {_fmt_zone_tuple(zones.get('lower_deep'), price)}",
-        f"Vùng trên: {zones.get('label_near')} {_fmt_zone_tuple(zones.get('upper_near'), price)}; {zones.get('label_main')} {_fmt_zone_tuple(zones.get('upper_main'), price)}; {zones.get('label_deep')} {_fmt_zone_tuple(zones.get('upper_deep'), price)}",
         f"ATR/risk: ATR {main_label} {fmt(atr_main)}, ATR {structure_label} {fmt(atr_structure)}, rủi ro tham chiếu {fmt(risk)}",
         f"Nến {main_label}: {_consecutive_candles(main_df)}; {_wick_body_info(main_df)}",
     ]
@@ -4819,6 +4777,23 @@ def get_current_price_str(symbol: str) -> tuple[str, float | None]:
 
 # ─── History formatter ────────────────────────
 
+def _sanitize_feature_snapshot_for_model(value: str | None) -> str:
+    """Loại pseudo-liquidation khỏi snapshot cũ trước khi đưa lại cho model.
+
+    Các dòng DB đã lưu ở phiên bản trước có thể còn ``Vùng dưới``/``Vùng trên``.
+    Không cần migration DB; lớp đọc history bỏ hai phần này để prompt mới sạch ngay.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "No feature snapshot."
+    parts = [part.strip() for part in text.split(" | ") if part.strip()]
+    blocked_prefixes = (
+        "vùng dưới:", "vùng trên:", "liquidity", "thanh khoản",
+        "thanh lý", "stop-pool", "stop pool",
+    )
+    clean = [part for part in parts if not part.lower().startswith(blocked_prefixes)]
+    return " | ".join(clean) or "No feature snapshot."
+
 def format_prediction_history(history: list[dict]) -> str:
     if not history:
         return "No previous analysis for this symbol/mode."
@@ -4853,7 +4828,7 @@ def format_prediction_history(history: list[dict]) -> str:
         reason = p.get("result_reason") or "Outcome not checked yet."
         decision_reason = p.get("reasoning_summary") or "No decision reasoning summary."
         snapshot = p.get("market_snapshot") or "No market snapshot."
-        feature_snapshot = p.get("feature_snapshot") or "No feature snapshot."
+        feature_snapshot = _sanitize_feature_snapshot_for_model(p.get("feature_snapshot"))
         lines.append(
             f"- #{i} {p['created_at'][:16]} {p['direction']} {p['result']} ({checked}); "
             f"Entry {entry}, SL {fmt(p['sl'])}, TP1 {fmt(p['tp1'])}, TP2 {fmt(p['tp2'])}. "
@@ -5172,7 +5147,7 @@ def _history_to_json(history: list[dict]) -> dict:
                 # Keep history compact; full market/feature snapshots are very token-heavy
                 # and can make JSON input larger than the old text prompt.
                 "market_snapshot_summary": _truncate_text(p.get("market_snapshot"), 300),
-                "feature_snapshot_summary": _truncate_text(p.get("feature_snapshot"), 300),
+                "feature_snapshot_summary": _truncate_text(_sanitize_feature_snapshot_for_model(p.get("feature_snapshot")), 300),
             }
             for p in history[:PREDICTION_HISTORY_COUNT]
         ],
@@ -5207,14 +5182,13 @@ def build_model_input_payload(
 
     main_label, structure_label, big_label = _mode_labels(mode)
     trigger_label = _mode_trigger_label(mode)
-    zones = _liquidity_zones_by_windows(timeframe_data, mode, price) if price else {}
     structure_df = timeframe_data.get(structure_label)
     if structure_df is None or structure_df.empty:
         structure_df = timeframe_data.get(main_label)
     structure = _structure_info(structure_df, price) if price else {}
 
     return {
-        "schema_version": "teopard_model_input_v3_compact_candles_json",
+        "schema_version": "teopard_model_input_v4_no_pseudo_liquidation",
         "task": {
             "symbol": symbol,
             "mode": mode_label,
@@ -5244,14 +5218,7 @@ def build_model_input_payload(
             "minimum_stop_distance": _json_float(_minimum_stop_distance(timeframe_data, mode, price), 4) if price else None,
             "structural_sl_buffer": _json_float(_structural_sl_buffer(timeframe_data, mode, price), 4) if price else None,
             "structure": _structure_to_json(structure),
-            "liquidity_zones_estimated_from_ohlcv": {
-                "method": zones.get("liquidity_method"),
-                "labels": {"near": zones.get("label_near"), "main": zones.get("label_main"), "deep": zones.get("label_deep")},
-                "lower": {role: _zone_to_json(zones.get(f"lower_{role}")) for role in ("near", "main", "deep")},
-                "upper": {role: _zone_to_json(zones.get(f"upper_{role}")) for role in ("near", "main", "deep")},
-                "important_note": "These are estimated stop/liquidity pools from OHLCV, not real liquidation heatmap. Do not list them to user.",
-            },
-                    },
+        },
         "timeframes": {
             label: _json_timeframe_summary(label, df, mode, candle_limit=_timeframe_contract(mode, label).get("closed_candle_limit"))
             for label, df in timeframe_data.items()
@@ -5266,11 +5233,11 @@ def build_model_input_payload(
             "rule": "If an old LONG is waiting for pullback, its Entry is not a SHORT TP. If an old SHORT is waiting for pullback, its Entry is not a LONG TP.",
         },
         "model_instructions": [
-            "Use only data inside this JSON payload and the system prompt. Do not invent news, order book, funding, open interest, or real liquidation heatmap.",
+            "Use only data inside this JSON payload and the system prompt. Do not invent news, order book, funding, open interest, liquidation heatmap, or leveraged-position data.",
             "Respect timeframe_data_contract strictly: SCALP uses 15M for entry/timing, 1H for setup, 4H for bias, 1D for macro; SWING uses 1H for secondary timing, 4H for setup/entry, 1D for main trend, 1W for macro.",
             "Compare LONG, SHORT, and NO_TRADE internally before deciding. Do not print the comparison.",
             "If choosing LONG/SHORT, provide concrete Entry/SL/TP numbers in the required output JSON. If choosing NO_TRADE, omit trade levels or set them null.",
-            "Do not show liquidity zones, heatmap, raw feature blocks, or internal labels to the user. Python will render your JSON into the old Telegram format.",
+            "The bot supplies no liquidation zones or heatmap. Do not infer them from OHLCV. Do not show raw feature blocks or internal labels to the user.",
             "If current price is inside a valid Entry and confirmation is enough, mark activation as immediate. Otherwise make it a waiting plan with clear confirmation conditions.",
             "Do not chase price when an old plan exists and price has already moved far away from its Entry. Keep, cancel, or replace it with a clear reason.",
         ],
@@ -5321,7 +5288,7 @@ def build_user_prompt(
         "- Nếu LONG/SHORT, trước block rubric bắt buộc có block [[TEOPARD_PLAN_SOURCES]] gồm ENTRY, SL, TP1, TP2 và dùng đúng ID A1..A6/B1..B6 trong BẢN ĐỒ LEVEL; ENTRY được phép CURRENT khi giá đang nằm trong Entry và xác nhận đã đủ. Python sẽ ẩn block này.",
         "- Cuối phản hồi bắt buộc có block [[TEOPARD_RUBRIC]] đúng key và đủ 11 dòng điểm; Python sẽ ẩn block, clamp từng mục và cộng tổng.",
         "- Không tự in tổng Độ mạnh setup/Độ chắc chắn; Python sẽ tính và chèn hai tổng sau dòng QUYẾT ĐỊNH.",
-        "- Không in riêng danh sách thanh khoản/heatmap/vùng quét; chỉ dùng nội bộ để chọn Entry/SL/TP và giải thích ngắn.",
+        "- Bot không cung cấp dữ liệu thanh lý/heatmap; không được suy đoán chúng từ OHLCV. Chỉ dùng cấu trúc, Fibonacci, EMA, ATR, volume và nến đã đóng.",
         "- Nếu chưa đủ setup hợp lý thì chọn NO TRADE.",
     ]
     return "\n".join(str(x) for x in parts if x is not None)
@@ -6681,15 +6648,10 @@ def _validate_actionable_trade_plan(
     output: str | None = None,
 ) -> list[str]:
     """
-    Python guard để tránh lưu/auto-check các kế hoạch dễ bị LOSS do chỉ cần chạm Entry.
+    Python guard để tránh lưu/auto-check các kế hoạch sai hình học hoặc quá nhiễu.
 
-    Lý do thêm guard:
-    - Auto-check hiện tại chỉ biết giá chạm Entry là ENTRY_FILLED.
-    - Với LONG tại liquidity pool dưới hoặc SHORT tại liquidity pool trên, setup đúng phải chờ
-      quét thanh khoản + rút râu/đóng nến xác nhận. Nếu lưu như limit order chạm-là-fill thì rất dễ
-      bắt dao rơi/bắt đỉnh và SL bị quét ngay.
-    - Vì vậy plan nào thiếu khoảng SL tối thiểu hoặc là scalp pending entry quá xa giá hiện tại
-      sẽ bị lưu REJECTED_PLAN và trả NO_TRADE an toàn cho user.
+    Guard chỉ dùng cấu trúc, Fibonacci, EMA, ATR, RR và nến đã đóng. Nó không dùng
+    pseudo-liquidation hay heatmap suy đoán từ OHLCV.
     """
     errors: list[str] = []
     direction = (pred.get("direction") or "").upper()

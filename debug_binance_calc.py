@@ -6,9 +6,9 @@ Usage:
   python debug_binance_calc.py BTC short --llm-output last_output.txt
   python debug_binance_calc.py ETH swing
 
-It fetches Binance candles, computes the same indicators/liquidity/structural SL/RR
-logic used by analyze.py, and prints why a parsed LLM trade would be accepted or
-rejected.
+It fetches Binance candles, computes the same indicators/structure/SL/RR logic
+used by analyze.py, and prints why a parsed LLM trade would be accepted or rejected.
+Pseudo-liquidation zones are intentionally not calculated or printed.
 """
 from __future__ import annotations
 
@@ -25,22 +25,6 @@ except Exception:
 
 import analyze
 
-
-def _z(zone, price=None):
-    try:
-        return analyze._fmt_zone_tuple(zone, price)
-    except Exception:
-        return str(zone)
-
-
-def _print_zones(timeframe_data, mode, price):
-    zones = analyze._liquidity_zones_by_windows(timeframe_data, mode, price)
-    print("\n=== INTERNAL ESTIMATED LIQUIDITY ZONES ===")
-    for side in ("lower", "upper"):
-        print(f"{side.upper()}:")
-        for role in ("near", "main", "deep"):
-            zone = zones.get(f"{side}_{role}")
-            print(f"  {role:>5}: {_z(zone, price)}")
 
 
 def _print_atr_and_risk(timeframe_data, mode, price):
@@ -122,7 +106,6 @@ def main():
     print(f"\nCURRENT_PRICE={analyze.fmt(price)}")
 
     _print_atr_and_risk(timeframe_data, args.mode, price)
-    _print_zones(timeframe_data, args.mode, price)
     _print_structural_levels(timeframe_data, args.mode, price)
 
     if args.llm_output:

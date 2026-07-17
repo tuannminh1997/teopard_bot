@@ -1,175 +1,86 @@
-🐆 Teopard Bot - Hướng dẫn sử dụng
+🐆 Teopard Bot — Hướng dẫn sử dụng
 
 1. Kích hoạt tài khoản
 /start - Bắt đầu bot
-/whoami - Xem Telegram User ID của bạn
+/whoami - Xem Telegram User ID
 
-Nếu tài khoản chưa được kích hoạt, hãy gửi User ID cho admin để được thêm vào whitelist.
+Nếu chưa được kích hoạt, gửi User ID cho admin để thêm vào whitelist.
 
-2. Phân tích coin
-Gõ mã coin, ví dụ:
-BTC
-ETH
-SOL
+2. Phân tích thủ công
+Gõ mã coin, ví dụ: BTC, ETH hoặc SOL, sau đó chọn:
+- Scalp: 15M timing, 1H setup chính, 4H xác nhận xu hướng, 1D bối cảnh lớn.
+- Swing: 1H timing phụ, 4H setup, 1D xu hướng chính, 1W bối cảnh lớn.
 
-Sau đó chọn:
-- Scalp: phân tích ngắn hạn 15M / 1H / 4H
-- Swing: phân tích dài hạn 4H / 1D / 1W
+Bot dùng nến đã đóng để xác nhận. Nến đang chạy chỉ dùng tham khảo.
+
+Dữ liệu gửi AI gồm EMA, RSI, MACD, volume, ATR, Fibonacci, cấu trúc, đỉnh/đáy và hành động giá từ nến. Bot không gửi vùng thanh lý/heatmap suy đoán từ OHLCV.
 
 3. Lệnh user
-/listsymbols - Xem danh sách coin được phép phân tích
-/stats - Xem thống kê win/loss của chính bạn
-/stats BTC - Xem thống kê BTCUSDT của chính bạn
-/history - Xem 5 dự đoán gần nhất của chính bạn
-/history BTC - Xem lịch sử BTCUSDT của chính bạn
-/dashboard - Xem dashboard nhanh của chính bạn
-/help - Xem hướng dẫn này
+/listsymbols - Xem danh sách coin được phép
+/stats - Thống kê của chính bạn
+/stats BTC - Thống kê BTCUSDT của chính bạn
+/history - Xem 5 lệnh gần nhất của chính bạn
+/history BTC - Xem lịch sử BTCUSDT
+/dashboard - Dashboard nhanh
+/help - Xem hướng dẫn
 
-Lưu ý: User thường chỉ xem được lịch sử/dashboard của chính mình, không xem được prediction của user khác.
+Phân tích manual LONG/SHORT hợp lệ chỉ tạo lệnh nháp. Chỉ khi bấm “✅ Tôi đã đặt lệnh theo phân tích này”, bot mới lưu vào history và theo dõi Entry/TP/SL. Nếu không bấm, phân tích chỉ để tham khảo.
 
-Bot tính sẵn dữ liệu kỹ thuật trước khi gửi AI: EMA, RSI, MACD, khối lượng, ATR, cấu trúc giá, Fibonacci, vùng quét Long/Short và rủi ro tối thiểu. AI sẽ tự phân tích và tự đặt Entry/SL/TP; Python kiểm tra lại logic trước khi hiển thị.
-
-Từ V19, bot KHÔNG tự đưa mọi phân tích LONG/SHORT vào history nữa. Sau khi bot trả phân tích, nếu bạn thật sự đặt lệnh/chọn theo dõi kế hoạch đó, hãy bấm nút “✅ Tôi đã đặt lệnh theo phân tích này”. Chỉ khi bấm nút này bot mới lưu vào DB; nếu Entry chưa khớp thì giữ PENDING_ENTRY, khi giá chạm Entry mới theo dõi WIN/LOSS và dùng làm lịch sử học lại cho lần phân tích sau. Nếu không bấm, phân tích chỉ là tham khảo và không xuất hiện trong /history, /stats, /dashboard.
-
-4. Auto-check kết quả
-Scalp:
-- Chờ Entry tối đa 12h
-- Nếu khớp Entry, theo dõi tối đa 72h
-- Check mỗi 1h
-- Chấm TP/SL bằng nến 15M
-
-Swing:
-- Chờ Entry tối đa 24h
-- Nếu khớp Entry, theo dõi tối đa 7 ngày
-- Check mỗi 12h
-- Chấm TP/SL bằng nến 1H
-
-Bot chỉ tự động check các lệnh bạn đã xác nhận “đã trade theo bot”. Bot cập nhật DB nhưng không gửi thông báo kết quả tự động cho user/admin nữa. User muốn xem kết quả thì chủ động dùng /history, /stats hoặc /dashboard.
-
-5. Lệnh admin
-Admin dùng lệnh user như người dùng bình thường:
-/stats - Xem thống kê của chính admin
-/history - Xem lịch sử của chính admin
-/dashboard - Xem dashboard của chính admin
-
-Admin muốn xem toàn hệ thống thì dùng lệnh riêng:
-/statsall - Xem thống kê toàn bộ user
-/statsall BTC - Xem thống kê BTCUSDT toàn bộ user
-/historyall - Xem lịch sử toàn bộ user
-/historyall BTC - Xem lịch sử BTCUSDT toàn bộ user
-/dashboardall - Xem dashboard toàn bộ hệ thống
-
-Lệnh quản trị:
-/adduser <user_id> - Thêm user vào whitelist
-/removeuser <user_id> - Xóa user khỏi whitelist
-/listusers - Xem danh sách whitelist
-/setlimit <user_id> <số lượt> - Set giới hạn lượt/ngày
-/resetusage <user_id> - Reset lượt dùng hôm nay
-/addsymbol BTC - Thêm symbol
-/removesymbol BTC - Xóa symbol
-/checknow - Admin: ép kiểm tra toàn bộ prediction đang mở ngay lập tức; chỉ cập nhật DB và báo số lượng, không gửi kết quả cho user/admin
-/clearhistory CONFIRM - Xóa toàn bộ lịch sử prediction, giữ whitelist và symbol
-/cleardrafts CONFIRM - Xóa riêng lệnh nháp của bạn, giữ nguyên history
-/cleardrafts ALL CONFIRM - Admin: xóa lệnh nháp toàn hệ thống, giữ nguyên history
-
-Telegram menu không hiện lệnh có tham số, nên các lệnh như /stats BTC, /history BTC, /adduser 123456789 phải gõ tay.
-
-Ghi chú admin: Admin dùng /historyall hoặc /historyall BTC sẽ thấy thêm User ID và Chat ID của từng prediction để biết lệnh đó thuộc user nào. /history chỉ xem lịch sử của chính admin nên không hiện User ID.
-
-Ghi chú học lại: Khi bạn phân tích coin, Claude chỉ dùng lịch sử phân tích của chính tài khoản bạn cho cùng coin/mode. Lịch sử của user khác không được đưa vào prompt học lại. Admin vẫn xem được thống kê/lịch sử toàn hệ thống khi dùng /statsall, /historyall, /dashboardall.
-
-Ghi chú học lại nâng cao: Lịch sử đưa cho AI cuối học gồm 5 phân tích gần nhất của chính bạn cho cùng coin/mode. Mỗi lịch sử có Entry/SL/TP, kết quả WIN/LOSS, lý do kết quả, reasoning cũ, market snapshot và feature snapshot gồm cấu trúc, Fibonacci, vùng quét, ATR/risk, EMA/RSI/MACD/volume.
-
-Ghi chú lưu lịch sử: Bot chỉ giữ 5 lệnh hiển thị gần nhất cho mỗi user để DB không phình lâu dài. /history show tối đa 5 lệnh đó; lệnh thứ 6 sẽ làm lệnh hiển thị cũ nhất của user bị xóa khỏi DB. Bản ghi học ẩn NO_TRADE/REJECTED_PLAN được giới hạn riêng và không hiện trong /history.
-
-
-Cập nhật format phản hồi:
-- Bắt buộc có đủ các mục Thanh khoản, Quyết định, Entry/SL/TP, Kích hoạt và Rủi ro.
-- Bot không dùng cụm “swing gần/swing lớn” trong output cho user; thay bằng “đỉnh/đáy gần/biên lớn”.
-- Nếu Claude trả thiếu format, Python không tự sửa nội dung; bot ẩn phản hồi đó, trả thông báo “chưa đủ dữ liệu hợp lệ để tạo phân tích” cho user và lưu hidden REJECTED_PLAN để học/debug.
-
-V4.8 compact output guard update:
-- Output cho user dùng format rút gọn: không hiện riêng “Bối cảnh” và “Cấu trúc”.
-- Bot vẫn gửi dữ liệu EMA/RSI/MACD/ATR/Fibonacci/cấu trúc/vùng quét cho Claude để phân tích nội bộ.
-- Prompt vẫn yêu cầu Claude có đủ Thanh khoản, Quyết định, Entry/SL/TP, Kích hoạt và Rủi ro, nhưng Python không ẩn phản hồi nếu Claude thiếu format.
-
-
-Bản cập nhật thông báo lỗi:
-- Claude trả LONG/SHORT thì bot hiển thị trực tiếp. Nếu parse đủ Entry/SL/TP thì bot lưu auto-check; nếu không đủ số thì không auto-check.
-- Lỗi vẫn được lưu hidden dạng REJECTED_PLAN để phục vụ learning/debug, không xuất hiện trong history/stats/dashboard.
-
-Cập nhật Sonnet Analyst Mode:
-- AI bây giờ được quyền chọn NO_TRADE nếu chưa có setup rõ, thay vì bị ép phải ra LONG/SHORT.
-- Bot gửi thêm market regime và raw candle context cho AI để đọc hành vi giá tốt hơn.
-- Nếu AI chọn NO_TRADE, bot hiển thị phản hồi NO_TRADE của AI cho user; NO_TRADE không auto-check.
-- NO_TRADE được lưu ẩn để học lại, không hiện trong /history, /stats, /dashboard và không auto-check.
-
-
-Ghi chú bản completion guard:
-- Bot không dùng Python risk/format guard để sửa hoặc chặn lệnh Claude.
-- Nếu phản hồi Claude bị cụt rõ ràng, bot gọi Claude trả lại bản hoàn chỉnh; Python không tự viết hay sửa Entry/SL/TP.
-- Có thể chỉnh LLM_MAX_OUTPUT_TOKENS trong Railway, mặc định 12000.
-
-
-Ghi chú model AI:
-- Admin có thể đổi provider trên Railway Variables.
-- Claude mặc định: AI_PROVIDER=anthropic, CLAUDE_MODEL=claude-sonnet-5.
-- Claude phân tích chính dùng ANTHROPIC_EFFORT=max mặc định. Có thể đổi high/xhigh/max trên Railway.
-- Claude summary dùng ANTHROPIC_SUMMARY_EFFORT=high mặc định.
-- Test GLM 5.2 qua OpenRouter: AI_PROVIDER=openrouter, OPENROUTER_MODEL=z-ai/glm-5.2.
-- GLM phân tích chính dùng OPENROUTER_REASONING_EFFORT=xhigh; nếu dùng GLM mà không khai báo biến này, code mặc định xhigh.
-- Summary GLM mặc định tắt reasoning: OPENROUTER_SUMMARY_REASONING_EFFORT=off, LLM_SUMMARY_MAX_OUTPUT_TOKENS=600.
-
-Ghi chú OpenRouter/GLM:
-- Nếu dùng GLM 5.2 qua OpenRouter, bot mặc định dùng reasoning xhigh cho phân tích chính nếu bạn không set OPENROUTER_REASONING_EFFORT.
-- Railway log sẽ hiện call_type=main/summary và effort=... để dễ đọc chi phí.
-- Lịch sử học lại vẫn giữ 5 phân tích gần nhất của chính user cho cùng coin/mode.
-
-Ghi chú kế hoạch đang mở:
-- Khi phân tích lại cùng coin/mode, bot gửi thêm kế hoạch cũ đang chờ/đã khớp cho AI để tránh hiểu nhầm.
-- LONG chờ hồi không phải tín hiệu SHORT về vùng Entry; SHORT chờ hồi không phải tín hiệu LONG về vùng Entry.
-- Nếu giá đã chạy xa khỏi Entry cũ, AI phải nêu giữ/hủy/thay thế kế hoạch, không được đuổi giá nếu chưa có vùng vào mới rõ.
-
-Ghi chú Z.AI native V16:
-- Muốn chạy GLM chính chủ Z.AI: AI_PROVIDER=zai, ZAI_API_KEY=..., ZAI_MODEL=glm-5.2, ZAI_BASE_URL=https://api.z.ai/api/paas/v4.
-- ZAI_REASONING_EFFORT mặc định max; lần retry cũng giữ max để ưu tiên chất lượng phân tích.
-- ZAI_SUMMARY_REASONING_EFFORT mặc định none để summary nhanh và rẻ hơn.
-- Muốn quay lại OpenRouter: AI_PROVIDER=openrouter, OPENROUTER_MODEL=z-ai/glm-5.2 hoặc deepseek/deepseek-v4-pro.
-- Muốn quay lại Claude native: AI_PROVIDER=anthropic.
-
-
-Cập nhật V19 - lưu history theo xác nhận user:
-- Phân tích LONG/SHORT hợp lệ chỉ tạo lệnh nháp kèm nút xác nhận.
-- Chỉ khi user bấm “✅ Tôi đã đặt lệnh theo phân tích này”, bot mới lưu vào bảng predictions; nếu Entry chưa khớp thì auto-check chờ ENTRY_FILLED trước khi tính WIN/LOSS.
-- NO TRADE, REJECTED_PLAN và phân tích chưa xác nhận không còn được đưa vào /history hoặc learning prompt.
-- /history đánh số lại từ #1 đến #5 theo danh sách đang hiển thị, không dùng ID DB nhảy số.
-- /clearhistory báo riêng số lệnh đã trade/đang theo dõi, tổng dòng predictions cũ và số lệnh nháp bị xóa.
-- /cleardrafts chỉ xóa bảng lệnh nháp/candidate, không đụng lịch sử đã trade.
-
-6. Auto Scan Mode
+4. Auto Scan
 /autoscanon BTC - Bật Auto Scan cho BTCUSDT
 /autoscanoff - Tắt Auto Scan
-/autoscanstatus - Xem trạng thái Auto Scan
-/autoscanlog - Xem log các lần quét gần nhất
+/autoscanstatus - Xem trạng thái
+/autoscanlog - Xem 5 log quét gần nhất
 
-Auto Scan là mode riêng, quét theo nến đã đóng. DeepSeek chấm mini-rubric riêng cho LONG và SHORT rồi Python tự cộng điểm. Nếu một hướng đủ điểm và đủ chênh lệch mới gọi AI cuối phân tích đầy đủ như mode thủ công; DeepSeek được phép trả NEUTRAL. Điểm DeepSeek là điểm lọc nhanh /100, không phải xác suất thắng. AI cuối vẫn có thể chọn NO TRADE sau khi lập Entry/SL/TP và chấm full rubric. Nếu AI cuối đủ ngưỡng confidence thì bot tự gửi tín hiệu và tự lưu theo dõi, không cần bấm nút xác nhận.
+Flow:
+- DeepSeek V4 Flash quét mini-rubric LONG và SHORT mỗi 15 phút.
+- Python tự cộng điểm; điểm Flash là điểm lọc nhanh /100, không phải xác suất thắng.
+- Chỉ khi hướng tốt nhất đủ ngưỡng và đủ chênh lệch mới gọi DeepSeek V4 Pro phân tích đầy đủ.
+- V4 Pro lập LONG/SHORT/NO TRADE, Entry, SL, TP rồi Python guard kiểm tra lần cuối.
+- Tín hiệu Auto Scan gửi thành công được lưu đồng thời vào /history và /autoscanlog.
 
-Auto Scan chỉ cho 1 symbol/tài khoản để tiết kiệm tài nguyên. Ví dụ: /autoscanon BTC
+Quota và giờ nghỉ:
+- Mặc định tối đa 5 lần bắt đầu gọi AI cuối trong một ngày Auto Scan.
+- Đủ quota: toàn bộ Auto Scan dừng; không gọi Binance, Flash hoặc Pro.
+- Auto Scan nghỉ từ 00:00 đến trước 07:00 giờ Việt Nam.
+- 07:00 hôm sau: quota reset và Auto Scan tự bật lại nếu bị dừng do quota/giờ nghỉ.
+- /autoscanoff thủ công sẽ không tự bật lại.
 
-Ghi chú giờ nghỉ Auto Scan:
-- Auto Scan tự nghỉ từ 00:00 đến trước 07:00 theo giờ Việt Nam.
-- Lúc 07:00, bot tự bật lại nếu Auto Scan đang bật trước giờ nghỉ.
-- Nếu bạn chủ động dùng /autoscanoff trong đêm, sáng bot sẽ không tự bật lại.
+5. History và học lại
+- /history và /autoscanlog đều giữ 5 bản ghi gần nhất mỗi user.
+- Số history đưa vào prompt AI được điều khiển bởi PREDICTION_HISTORY_COUNT, mặc định 3; đây là biến khác với số bản ghi hiển thị.
+- AI chỉ nhận history của đúng user, symbol và mode.
+- Feature snapshot mới không chứa vùng thanh lý ước lượng.
+- Snapshot cũ trong database được tự lọc trước khi đưa lại cho AI; không cần xóa bot.db.
 
-Cập nhật quota Auto Scan:
-- DeepSeek quét mỗi 15 phút khi Auto Scan đang bật.
-- Chỉ khi DeepSeek thấy setup đủ tốt mới gọi AI cuối; mỗi lần bắt đầu gọi AI cuối tính 1 lượt.
-- Mặc định tối đa 5 lượt gọi AI cuối/ngày cho mỗi tài khoản.
-- Lượt thứ 5 vẫn được xử lý, sau đó toàn bộ Auto Scan tự dừng; DeepSeek cũng không quét thêm.
-- 07:00 sáng hôm sau theo giờ Việt Nam, quota reset về 0/5 và Auto Scan tự bật lại.
+6. Auto-check
+Scalp:
+- Chờ Entry tối đa 12 giờ.
+- Sau khi khớp Entry, theo dõi tối đa 72 giờ.
+- Check mỗi 1 giờ bằng nến 15M.
 
+Swing:
+- Chờ Entry tối đa 24 giờ.
+- Sau khi khớp Entry, theo dõi tối đa 7 ngày.
+- Check mỗi 12 giờ bằng nến 1H.
 
-Cập nhật DeepSeek V4 Pro:
-- DeepSeek V4 Flash tiếp tục làm prefilter mini-rubric.
-- DeepSeek V4 Pro là AI phân tích cuối cho manual và Auto Scan khi `AI_PROVIDER=deepseek`.
-- Quota Auto Scan tính theo mỗi lần bắt đầu gọi AI cuối, kể cả AI cuối trả NO TRADE hoặc bị guard từ chối.
+Bot cập nhật kết quả trong database. Xem bằng /history, /stats hoặc /dashboard.
+
+7. Lệnh admin
+/adduser <user_id> - Thêm user
+/removeuser <user_id> - Xóa user
+/listusers - Xem whitelist
+/setlimit <user_id> <số lượt> - Đặt giới hạn manual/ngày
+/resetusage <user_id> - Reset lượt manual
+/addsymbol BTC - Thêm symbol
+/removesymbol BTC - Xóa symbol
+/statsall - Thống kê toàn hệ thống
+/historyall - Lịch sử toàn hệ thống
+/dashboardall - Dashboard toàn hệ thống
+/checknow - Ép check prediction đang mở
+/clearhistory CONFIRM - Xóa history, giữ whitelist và symbol
+/cleardrafts CONFIRM - Xóa draft của bạn
+/cleardrafts ALL CONFIRM - Xóa draft toàn hệ thống
+
+8. Dữ liệu thanh lý
+Bot hiện không có liquidation heatmap, order book, funding, open interest hoặc vị thế đòn bẩy thật. Vì vậy bot không tự suy ra “vùng thanh lý” từ swing/ATR/râu nến. Rút râu hoặc quét đỉnh/đáy đã xảy ra vẫn được dùng như hành động giá thông thường, không được gọi là dữ liệu thanh lý thật.
