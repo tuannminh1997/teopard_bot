@@ -28,7 +28,7 @@ Auto Scan:
 
 Bản này không truyền vùng thanh lý/thanh khoản ước lượng từ OHLCV cho Flash hoặc Pro.
 
-- BẢN ĐỒ LEVEL chỉ gồm cấu trúc, đỉnh/đáy, Fibonacci và EMA.
+- BẢN ĐỒ LEVEL chỉ gồm cấu trúc, đỉnh/đáy, Fibonacci và EMA7/EMA25/EMA50.
 - ATR, volume, RSI, MACD và nến đã đóng vẫn được gửi bình thường.
 - Râu nến/cú quét đỉnh-đáy đã xảy ra được coi là hành động giá, không phải dữ liệu thanh lý thật.
 - Auto-adjust TP, nếu bật, chỉ lấy target cấu trúc/Fibonacci; không dùng liquidity box ước lượng.
@@ -45,14 +45,21 @@ SCALP:
 - 4H: xác nhận xu hướng.
 - 1D: bối cảnh lớn.
 
-SWING:
+SWING core:
 
-- 1H: timing phụ.
 - 4H: setup và vùng vào.
-- 1D: xu hướng chính.
+- 1D: xu hướng chính/quyết định.
 - 1W: bối cảnh lớn.
+- 1H: timing phụ, không tự quyết định bias.
 
-Chỉ nến đã đóng được dùng làm xác nhận. Nến đang chạy chỉ dùng tham khảo.
+Chỉ nến đã đóng được dùng làm xác nhận. Nến live 1H/4H/1D được tách riêng để mô tả tiến độ, volume theo tiến độ và tương tác EMA; đây không phải rule ép hướng.
+
+Snapshot quyết định đồng bộ:
+
+- Flash và AI cuối dùng cùng một snapshot được tạo một lần cho mỗi lượt phân tích.
+- SCALP: chuỗi biến đổi 15M/1H/4H, live 1H/4H; 1D macro.
+- SWING: chuỗi biến đổi 4H/1D/1W, live 4H/1D; 1H timing phụ.
+- Snapshot gồm return 1/3/6 nến, EMA slope, RSI/MACD delta, pivot high/low, taker buy ratio và touch/retest/acceptance quanh EMA7/25/50.
 
 ## Railway
 

@@ -107,6 +107,8 @@ def main():
 
     _print_atr_and_risk(timeframe_data, args.mode, price)
     _print_structural_levels(timeframe_data, args.mode, price)
+    print("\n=== SYNCHRONIZED DECISION SNAPSHOT ===")
+    print(analyze.build_synchronized_decision_snapshot(timeframe_data, args.mode, price))
 
     if args.llm_output:
         _validate_llm_output(Path(args.llm_output), timeframe_data, args.mode, price)

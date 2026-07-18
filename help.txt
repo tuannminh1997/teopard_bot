@@ -9,11 +9,11 @@ Nếu chưa được kích hoạt, gửi User ID cho admin để thêm vào whit
 2. Phân tích thủ công
 Gõ mã coin, ví dụ: BTC, ETH hoặc SOL, sau đó chọn:
 - Scalp: 15M timing, 1H setup chính, 4H xác nhận xu hướng, 1D bối cảnh lớn.
-- Swing: 1H timing phụ, 4H setup, 1D xu hướng chính, 1W bối cảnh lớn.
+- Swing core: 4H setup/vùng vào, 1D xu hướng chính, 1W bối cảnh lớn. 1H chỉ timing phụ.
 
-Bot dùng nến đã đóng để xác nhận. Nến đang chạy chỉ dùng tham khảo.
+Bot dùng nến đã đóng để xác nhận. Nến đang chạy được tách riêng để phát hiện sớm giá chạm/rút khỏi EMA, nhưng không được coi là nến đã xác nhận.
 
-Dữ liệu gửi AI gồm EMA, RSI, MACD, volume, ATR, Fibonacci, cấu trúc, đỉnh/đáy và hành động giá từ nến. Bot không gửi vùng thanh lý/heatmap suy đoán từ OHLCV.
+Flash và AI cuối nhận cùng một snapshot. Snapshot có EMA7/25/50, return 1/3/6 nến, thay đổi RSI/MACD, chuỗi đỉnh/đáy, taker buy ratio, volume chuẩn hóa theo tiến độ và tương tác EMA live. Bot không gửi vùng thanh lý/heatmap suy đoán từ OHLCV.
 
 3. Lệnh user
 /listsymbols - Xem danh sách coin được phép

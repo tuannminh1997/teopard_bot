@@ -4257,7 +4257,7 @@ def _timeframe_regime_details(label: str, df: pd.DataFrame | None) -> dict:
         "ema_state": ema_state,
         "text": (
             f"{label}: {_label_vi(trend_tag)}, {_label_vi(vol_tag)}, {_label_vi(volume_tag)}; "
-            f"EMA={_label_vi(ema_state)}, RSI14={fmt(rsi,1)}, ATR%={fmt(atr_pct,2)}, Vol={fmt(vol_ratio,2)}x"
+            f"EMA={_label_vi(ema_state)}, RSI14={_fmt_metric(rsi,1)}, ATR%={fmt(atr_pct,2)}, Vol={fmt(vol_ratio,2)}x"
         ),
     }
 
@@ -4361,9 +4361,9 @@ def build_raw_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mod
 def build_live_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
     """Tách nến đang chạy khỏi nến đã đóng để chỉ dùng tham khảo, không xác nhận."""
     if mode == "short":
-        labels = ["15M", "1H"]
+        labels = ["15M", "1H", "4H"]
     else:
-        labels = ["1H", "4H"]
+        labels = ["1H", "4H", "1D"]
     blocks = ["LIVE_CANDLE_CONTEXT — NẾN ĐANG CHẠY, CHỈ THAM KHẢO:"]
     blocks.append("- Không dùng nến đang chạy để xác nhận entry/đảo chiều. Chỉ dùng để biết giá hiện tại đang di chuyển ra sao so với nến đã đóng.")
     for label in labels:
@@ -4375,6 +4375,299 @@ def build_live_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mo
         blocks.append(f"- {label} live: {_format_candle_compact(row)}")
     return "\n".join(blocks)
 
+
+_TIMEFRAME_SECONDS_BY_LABEL = {
+    "15M": 15 * 60,
+    "1H": 60 * 60,
+    "4H": 4 * 60 * 60,
+    "1D": 24 * 60 * 60,
+    "1W": 7 * 24 * 60 * 60,
+}
+
+
+def _fmt_metric(value, decimals: int = 2) -> str:
+    number = _safe_float(value)
+    if number is None or not np.isfinite(number):
+        return "N/A"
+    return f"{number:.{max(0, int(decimals))}f}"
+
+
+def _pct_delta(new_value, old_value) -> float | None:
+    new_num = _safe_float(new_value)
+    old_num = _safe_float(old_value)
+    if new_num is None or old_num is None or abs(old_num) <= 1e-12:
+        return None
+    return (new_num - old_num) / abs(old_num) * 100.0
+
+
+def _closed_metric_delta(df: pd.DataFrame | None, column: str, bars: int) -> float | None:
+    data = _closed_candles(df)
+    if data is None or len(data) <= bars or column not in data.columns:
+        return None
+    return _safe_float(data.iloc[-1].get(column)) - _safe_float(data.iloc[-1 - bars].get(column)) \
+        if _safe_float(data.iloc[-1].get(column)) is not None and _safe_float(data.iloc[-1 - bars].get(column)) is not None else None
+
+
+def _closed_return_pct(df: pd.DataFrame | None, bars: int) -> float | None:
+    data = _closed_candles(df)
+    if data is None or len(data) <= bars:
+        return None
+    return _pct_delta(data.iloc[-1].get("close"), data.iloc[-1 - bars].get("close"))
+
+
+def _closed_ema_slope_pct(df: pd.DataFrame | None, column: str, bars: int = 3) -> float | None:
+    data = _closed_candles(df)
+    if data is None or len(data) <= bars or column not in data.columns:
+        return None
+    return _pct_delta(data.iloc[-1].get(column), data.iloc[-1 - bars].get(column))
+
+
+def _taker_buy_ratio(row) -> float | None:
+    if row is None:
+        return None
+    volume = _safe_float(row.get("volume"))
+    taker = _safe_float(row.get("taker_buy_volume"))
+    if volume is None or taker is None or volume <= 0:
+        return None
+    return taker / volume * 100.0
+
+
+def _taker_ratio_average(df: pd.DataFrame | None, bars: int) -> float | None:
+    data = _closed_candles(df)
+    if data is None or data.empty:
+        return None
+    values = [_taker_buy_ratio(row) for _, row in data.tail(bars).iterrows()]
+    values = [v for v in values if v is not None and np.isfinite(v)]
+    return float(np.mean(values)) if values else None
+
+
+def _last_pivot_values(df: pd.DataFrame | None, side: str, count: int = 3) -> list[float]:
+    data = _closed_candles(df)
+    if data is None or data.empty:
+        return []
+    try:
+        pivots = _find_pivots(data, side, lookback=min(120, len(data)), left=2, right=2)
+    except Exception:
+        pivots = []
+    values: list[float] = []
+    key = "high" if side == "high" else "low"
+    for item in pivots[-count:]:
+        value = _safe_float(item.get("price") if isinstance(item, dict) else None)
+        if value is None and isinstance(item, dict):
+            value = _safe_float(item.get(key))
+        if value is not None:
+            values.append(value)
+    if values:
+        return values[-count:]
+    # Fallback: use rolling local extrema so the model still receives an ordered sequence.
+    series = data[key].astype(float)
+    local = []
+    for idx in range(2, max(2, len(series) - 2)):
+        window = series.iloc[idx - 2: idx + 3]
+        value = float(series.iloc[idx])
+        if (side == "high" and value >= float(window.max())) or (side == "low" and value <= float(window.min())):
+            local.append(value)
+    return local[-count:]
+
+
+def _sequence_shape(values: list[float], high_side: bool) -> str:
+    if len(values) < 2:
+        return "N/A"
+    eps = max(abs(values[-1]) * 1e-5, 1e-9)
+    deltas = [values[i] - values[i - 1] for i in range(1, len(values))]
+    if all(d > eps for d in deltas):
+        return "đỉnh cao dần" if high_side else "đáy cao dần"
+    if all(d < -eps for d in deltas):
+        return "đỉnh thấp dần" if high_side else "đáy thấp dần"
+    return "đan xen"
+
+
+def _format_values(values: list[float]) -> str:
+    return "→".join(fmt(v) for v in values) if values else "N/A"
+
+
+def _live_candle_progress(row, label: str) -> float | None:
+    if row is None:
+        return None
+    start = row.get("timestamp")
+    end = row.get("close_time")
+    try:
+        start_ts = pd.Timestamp(start)
+        end_ts = pd.Timestamp(end)
+        if start_ts.tzinfo is None:
+            start_ts = start_ts.tz_localize("UTC")
+        if end_ts.tzinfo is None:
+            end_ts = end_ts.tz_localize("UTC")
+        now_ts = pd.Timestamp.now(tz="UTC")
+        duration = max((end_ts - start_ts).total_seconds(), 1.0)
+        return max(0.0, min(1.0, (now_ts - start_ts).total_seconds() / duration))
+    except Exception:
+        duration = float(_TIMEFRAME_SECONDS_BY_LABEL.get(label, 0) or 0)
+        return None if duration <= 0 else 0.0
+
+
+def _ema_interaction_text(row, ema_column: str, current_price: float, atr: float | None) -> str:
+    ema = _safe_float(row.get(ema_column)) if row is not None else None
+    open_ = _safe_float(row.get("open")) if row is not None else None
+    high = _safe_float(row.get("high")) if row is not None else None
+    low = _safe_float(row.get("low")) if row is not None else None
+    if None in (ema, open_, high, low) or ema is None or ema <= 0:
+        return f"{ema_column.upper().replace('_', '')}:N/A"
+    distance_pct = (current_price - ema) / ema * 100.0
+    atr_num = _safe_float(atr, 0.0) or 0.0
+    distance_atr = (current_price - ema) / atr_num if atr_num > 0 else None
+    tol = max(abs(ema) * 0.00025, atr_num * 0.04, 1e-9)
+    touched = low - tol <= ema <= high + tol
+    state = "trên" if current_price > ema + tol else "dưới" if current_price < ema - tol else "sát"
+    if touched:
+        if open_ < ema - tol and current_price < ema - tol and high >= ema - tol:
+            state = "test từ dưới rồi quay lại dưới"
+        elif open_ > ema + tol and current_price > ema + tol and low <= ema + tol:
+            state = "test từ trên rồi quay lại trên"
+        elif open_ < ema - tol and current_price > ema + tol:
+            state = "xuyên lên và đang giữ trên"
+        elif open_ > ema + tol and current_price < ema - tol:
+            state = "xuyên xuống và đang giữ dưới"
+        else:
+            state = "đang chạm"
+    dist_text = f"{distance_pct:+.2f}%"
+    if distance_atr is not None:
+        dist_text += f"/{distance_atr:+.2f}ATR"
+    return f"{ema_column.upper().replace('_', '')} {fmt(ema)} ({state}; dist {dist_text})"
+
+
+def _lower_confirmation_text(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    lower_label: str | None,
+    reference_level: float | None,
+    bars: int = 3,
+) -> str:
+    if not lower_label or reference_level is None:
+        return ""
+    lower = _closed_candles(timeframe_data.get(lower_label))
+    if lower is None or lower.empty:
+        return f"; {lower_label} giữ level: N/A"
+    closes = [float(v) for v in lower.tail(bars)["close"].tolist()]
+    above = sum(v > reference_level for v in closes)
+    below = sum(v < reference_level for v in closes)
+    return f"; {lower_label} {len(closes)} close gần nhất: trên {above}, dưới {below}"
+
+
+def _closed_transition_line(label: str, df: pd.DataFrame | None) -> str:
+    data = _closed_candles(df)
+    if data is None or data.empty:
+        return f"- {label} closed: N/A"
+    last = data.iloc[-1]
+    close = _safe_float(last.get("close"))
+    r1, r3, r6 = (_closed_return_pct(df, n) for n in (1, 3, 6))
+    rsi = _safe_float(last.get("rsi_14"))
+    rsi_d3 = _closed_metric_delta(df, "rsi_14", 3)
+    rsi_d6 = _closed_metric_delta(df, "rsi_14", 6)
+    macd = _safe_float(last.get("macd_hist"))
+    macd_d3 = _closed_metric_delta(df, "macd_hist", 3)
+    ema7_s3 = _closed_ema_slope_pct(df, "ema_7", 3)
+    ema25_s3 = _closed_ema_slope_pct(df, "ema_25", 3)
+    ema7 = _safe_float(last.get("ema_7"))
+    ema25 = _safe_float(last.get("ema_25"))
+    ema50 = _safe_float(last.get("ema_50"))
+    dist7 = ((close - ema7) / ema7 * 100.0) if close is not None and ema7 else None
+    dist25 = ((close - ema25) / ema25 * 100.0) if close is not None and ema25 else None
+    dist50 = ((close - ema50) / ema50 * 100.0) if close is not None and ema50 else None
+    highs = _last_pivot_values(df, "high", 3)
+    lows = _last_pivot_values(df, "low", 3)
+    taker_now = _taker_buy_ratio(last)
+    taker3 = _taker_ratio_average(df, 3)
+    taker6 = _taker_ratio_average(df, 6)
+    return (
+        f"- {label} closed | ret1/3/6 {_fmt_metric(r1,2)}%/{_fmt_metric(r3,2)}%/{_fmt_metric(r6,2)}% | "
+        f"RSI14 {_fmt_metric(rsi,1)} Δ3 {_fmt_metric(rsi_d3,1)} Δ6 {_fmt_metric(rsi_d6,1)} | "
+        f"MACDh {_fmt_metric(macd,6)} Δ3 {_fmt_metric(macd_d3,6)} | "
+        f"EMA slope3 E7 {_fmt_metric(ema7_s3,3)}% E25 {_fmt_metric(ema25_s3,3)}%; "
+        f"close-dist E7/E25/E50 {_fmt_metric(dist7,2)}%/{_fmt_metric(dist25,2)}%/{_fmt_metric(dist50,2)}% | "
+        f"H {_format_values(highs)} ({_sequence_shape(highs, True)}); "
+        f"L {_format_values(lows)} ({_sequence_shape(lows, False)}) | "
+        f"TakerBuy now/avg3/avg6 {_fmt_metric(taker_now,1)}%/{_fmt_metric(taker3,1)}%/{_fmt_metric(taker6,1)}%"
+    )
+
+
+def _live_transition_line(
+    label: str,
+    df: pd.DataFrame | None,
+    current_price: float,
+    timeframe_data: dict[str, pd.DataFrame | None],
+    lower_label: str | None = None,
+) -> str:
+    if df is None or df.empty or len(df) < 2:
+        return f"- {label} live: N/A"
+    row = df.iloc[-1]
+    progress = _live_candle_progress(row, label)
+    atr = _safe_float(_analysis_row(df).get("atr_14")) if _analysis_row(df) is not None else None
+    open_ = _safe_float(row.get("open"))
+    high = _safe_float(row.get("high"))
+    low = _safe_float(row.get("low"))
+    rng = (high - low) if high is not None and low is not None else None
+    range_atr = (rng / atr) if rng is not None and atr and atr > 0 else None
+    close_location = ((current_price - low) / rng * 100.0) if rng and low is not None else None
+    body_atr = ((current_price - open_) / atr) if open_ is not None and atr and atr > 0 else None
+    volume = _safe_float(row.get("volume"))
+    closed_vol_avg = None
+    closed = _closed_candles(df)
+    if closed is not None and not closed.empty:
+        closed_vol_avg = _safe_float(closed.tail(20)["volume"].mean())
+    expected_ratio = None
+    if volume is not None and closed_vol_avg and progress and progress > 0:
+        expected_ratio = volume / max(closed_vol_avg * progress, 1e-12)
+    taker = _taker_buy_ratio(row)
+    ema7 = _safe_float(row.get("ema_7"))
+    confirm = _lower_confirmation_text(timeframe_data, lower_label, ema7)
+    early_note = "; mới mở, trọng lượng thấp" if progress is not None and progress < 0.12 else ""
+    return (
+        f"- {label} live | progress {_fmt_metric((progress or 0)*100,1)}%{early_note} | "
+        f"O/H/L/P {fmt(open_)}/{fmt(high)}/{fmt(low)}/{fmt(current_price)} | "
+        f"body {_fmt_metric(body_atr,2)}ATR; range {_fmt_metric(range_atr,2)}ATR; vị trí giá {_fmt_metric(close_location,1)}% từ đáy | "
+        f"vol theo tiến độ {_fmt_metric(expected_ratio,2)}x; TakerBuy {_fmt_metric(taker,1)}% | "
+        f"{_ema_interaction_text(row, 'ema_7', current_price, atr)}; "
+        f"{_ema_interaction_text(row, 'ema_25', current_price, atr)}; "
+        f"{_ema_interaction_text(row, 'ema_50', current_price, atr)}{confirm}"
+    )
+
+
+def build_synchronized_decision_snapshot(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+) -> str:
+    """Một snapshot duy nhất dùng nguyên văn cho cả Flash và model cuối.
+
+    Python chỉ tính và mô tả trạng thái/diễn biến. Không veto, không cộng điểm và
+    không ép LONG/SHORT. Nến đã đóng và nến live được tách rõ để tránh nhìn trễ
+    nhưng vẫn không biến nến live thành xác nhận đã hoàn tất.
+    """
+    price = current_price or _last_close_from_data(timeframe_data)
+    if price is None:
+        return "SYNCHRONIZED_DECISION_SNAPSHOT: không đủ dữ liệu."
+    snapshot_time = utc_now().isoformat(timespec="seconds")
+    if mode == "short":
+        closed_labels = ["15M", "1H", "4H", "1D"]
+        live_specs = [("15M", None), ("1H", "15M"), ("4H", "1H")]
+        core_note = "SCALP core 15M/1H/4H; 1D chỉ macro."
+    else:
+        closed_labels = ["1H", "4H", "1D", "1W"]
+        live_specs = [("1H", None), ("4H", "1H"), ("1D", "4H")]
+        core_note = "SWING core 4H/1D/1W; 1H chỉ timing phụ."
+    lines = [
+        f"SYNCHRONIZED_DECISION_SNAPSHOT id={snapshot_time} price={fmt(price)}",
+        f"- {core_note}",
+        "- Đây là dữ liệu mô tả trung lập dùng giống hệt cho Flash và AI cuối; không phải lệnh hay rule ép hướng.",
+        "CHUYỂN ĐỘNG TỪ NẾN ĐÃ ĐÓNG:",
+    ]
+    lines.extend(_closed_transition_line(label, timeframe_data.get(label)) for label in closed_labels)
+    lines.append("NẾN ĐANG CHẠY VÀ TƯƠNG TÁC EMA — CHƯA PHẢI XÁC NHẬN ĐÓNG NẾN:")
+    lines.extend(
+        _live_transition_line(label, timeframe_data.get(label), float(price), timeframe_data, lower_label)
+        for label, lower_label in live_specs
+    )
+    return "\n".join(lines)
 
 
 
@@ -4425,6 +4718,7 @@ def _build_model_level_catalog(
         data = _closed_candles(df) if df is not None else None
         if data is not None and not data.empty:
             row = data.iloc[-1]
+            add_point(row.get("ema_7"), f"EMA7 {label}", base_score + 0.10)
             add_point(row.get("ema_25"), f"EMA25 {label}", base_score + 0.15)
             add_point(row.get("ema_50"), f"EMA50 {label}", base_score + 0.20)
 
@@ -4613,7 +4907,9 @@ def build_feature_snapshot(
     def compact_tf(label: str, df: pd.DataFrame | None) -> str:
         if df is None or df.empty:
             return f"{label}: N/A"
-        last = df.iloc[-1]
+        last = _analysis_row(df)
+        if last is None:
+            return f"{label}: N/A"
         if last["ema_7"] > last["ema_25"] > last["ema_50"]:
             ema = "EMA tăng"
         elif last["ema_7"] < last["ema_25"] < last["ema_50"]:
@@ -4702,7 +4998,7 @@ def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
         f"  {str(row['timestamp'])[:16]} O:{fmt(row['open'])} H:{fmt(row['high'])} "
         f"L:{fmt(row['low'])} C:{fmt(row['close'])} "
         f"RSI14:{fmt(row['rsi_14'],1)} Vol:{fmt(row['vol_ratio'],2)}x"
-        for _, row in closed_df.tail(10).iterrows()
+        for _, row in closed_df.tail(6).iterrows()
     )
 
     return "\n".join([
@@ -4715,7 +5011,7 @@ def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
         f"  Volume={fmt(last['vol_ratio'],2)}x → {vol_lbl}",
         f"  Nến đã đóng: {_consecutive_candles(df)} | {_wick_body_info(df)}",
         f"  High/Low 50 nến: {fmt(key_high)} / {fmt(key_low)}",
-        f"  10 nến đã đóng gần nhất:",
+        f"  6 nến đã đóng gần nhất:",
         candles,
     ])
 
@@ -5188,7 +5484,7 @@ def build_model_input_payload(
     structure = _structure_info(structure_df, price) if price else {}
 
     return {
-        "schema_version": "teopard_model_input_v4_no_pseudo_liquidation",
+        "schema_version": "teopard_model_input_v5_synchronized_transition",
         "task": {
             "symbol": symbol,
             "mode": mode_label,
@@ -5234,7 +5530,8 @@ def build_model_input_payload(
         },
         "model_instructions": [
             "Use only data inside this JSON payload and the system prompt. Do not invent news, order book, funding, open interest, liquidation heatmap, or leveraged-position data.",
-            "Respect timeframe_data_contract strictly: SCALP uses 15M for entry/timing, 1H for setup, 4H for bias, 1D for macro; SWING uses 1H for secondary timing, 4H for setup/entry, 1D for main trend, 1W for macro.",
+            "Respect timeframe_data_contract strictly: SCALP core frames are 15M/1H/4H with 1D macro; SWING core frames are 4H/1D/1W with 1H secondary timing.",
+            "Use live-candle EMA interaction and transition metrics as early descriptive evidence only; never relabel them as closed-candle confirmation.",
             "Compare LONG, SHORT, and NO_TRADE internally before deciding. Do not print the comparison.",
             "If choosing LONG/SHORT, provide concrete Entry/SL/TP numbers in the required output JSON. If choosing NO_TRADE, omit trade levels or set them null.",
             "The bot supplies no liquidation zones or heatmap. Do not infer them from OHLCV. Do not show raw feature blocks or internal labels to the user.",
@@ -5253,6 +5550,7 @@ def build_user_prompt(
     history: list[dict],
     feature_block: str | None = None,
     open_signal_context: str | None = None,
+    decision_snapshot: str | None = None,
 ) -> str:
     """Text prompt input cho model chính.
 
@@ -5274,6 +5572,8 @@ def build_user_prompt(
         "",
         feature_block or "Dữ liệu kỹ thuật do Python tính sẵn: không có.",
         "",
+        decision_snapshot or "SYNCHRONIZED_DECISION_SNAPSHOT: không có.",
+        "",
         open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có.",
         "",
         format_prediction_history(history),
@@ -5288,7 +5588,8 @@ def build_user_prompt(
         "- Nếu LONG/SHORT, trước block rubric bắt buộc có block [[TEOPARD_PLAN_SOURCES]] gồm ENTRY, SL, TP1, TP2 và dùng đúng ID A1..A6/B1..B6 trong BẢN ĐỒ LEVEL; ENTRY được phép CURRENT khi giá đang nằm trong Entry và xác nhận đã đủ. Python sẽ ẩn block này.",
         "- Cuối phản hồi bắt buộc có block [[TEOPARD_RUBRIC]] đúng key và đủ 11 dòng điểm; Python sẽ ẩn block, clamp từng mục và cộng tổng.",
         "- Không tự in tổng Độ mạnh setup/Độ chắc chắn; Python sẽ tính và chèn hai tổng sau dòng QUYẾT ĐỊNH.",
-        "- Bot không cung cấp dữ liệu thanh lý/heatmap; không được suy đoán chúng từ OHLCV. Chỉ dùng cấu trúc, Fibonacci, EMA, ATR, volume và nến đã đóng.",
+        "- Bot không cung cấp dữ liệu thanh lý/heatmap; không được suy đoán chúng từ OHLCV. Dùng cấu trúc, Fibonacci, EMA, ATR, volume, nến đã đóng và block nến live trung lập đã được Python tách riêng.",
+        "- Nến live giúp nhận biết sớm tương tác EMA/chuyển động đang hình thành, nhưng không được mô tả như một nến đã đóng hoặc một xác nhận đã hoàn tất.",
         "- Nếu chưa đủ setup hợp lý thì chọn NO TRADE.",
     ]
     return "\n".join(str(x) for x in parts if x is not None)
@@ -7024,6 +7325,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     current_price_str, current_price = get_current_price_str(binance_symbol)
     feature_block                    = build_feature_engineering_block(timeframe_data, mode, current_price)
     feature_snapshot                 = build_feature_snapshot(timeframe_data, mode, current_price)
+    decision_snapshot                = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
     market_snapshot                  = build_market_snapshot(
         timeframe_data,
         fear_greed_info,
@@ -7041,6 +7343,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         history=history,
         feature_block=feature_block,
         open_signal_context=open_signal_context,
+        decision_snapshot=decision_snapshot,
     )
 
     raw_output = request_claude_analysis(system_prompt, user_prompt)
@@ -7152,6 +7455,7 @@ async def prepare_analysis_context(
     current_price_str, current_price = price_tuple
     feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
     feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
+    decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
     market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
     open_signal_context = format_open_signal_context(open_signals, current_price)
     user_prompt = build_user_prompt(
@@ -7163,6 +7467,7 @@ async def prepare_analysis_context(
         history=history,
         feature_block=feature_block,
         open_signal_context=open_signal_context,
+        decision_snapshot=decision_snapshot,
     )
     return {
         "timeframe_data": timeframe_data,
@@ -7175,6 +7480,7 @@ async def prepare_analysis_context(
         "open_signal_context": open_signal_context,
         "feature_block": feature_block,
         "feature_snapshot": feature_snapshot,
+        "decision_snapshot": decision_snapshot,
         "market_snapshot": market_snapshot,
         "user_prompt": user_prompt,
     }
@@ -7916,6 +8222,7 @@ def build_deepseek_prefilter_text(
     current_price_str: str,
     feature_snapshot: str | None,
     feature_block: str | None,
+    decision_snapshot: str | None,
     history: list[dict],
     open_signal_context: str | None,
 ) -> str:
@@ -7945,7 +8252,10 @@ def build_deepseek_prefilter_text(
         "- Khả năng hình thành setup tiềm năng: tối đa 15 điểm.",
         "Tổng tối đa: 100 điểm cho LONG và 100 điểm cho SHORT.",
         "",
-        "SNAPSHOT KỸ THUẬT RÚT GỌN:",
+        "SNAPSHOT QUYẾT ĐỊNH ĐỒNG BỘ VỚI AI CUỐI:",
+        decision_snapshot or "SYNCHRONIZED_DECISION_SNAPSHOT: không có.",
+        "",
+        "SNAPSHOT KỸ THUẬT/HISTORY RÚT GỌN:",
         compact_feature,
         "",
         open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có.",
@@ -8253,6 +8563,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     open_signal_context = ctx["open_signal_context"]
     feature_block = ctx["feature_block"]
     feature_snapshot = ctx["feature_snapshot"]
+    decision_snapshot = ctx["decision_snapshot"]
     market_snapshot = ctx["market_snapshot"]
     prefilter_text = build_deepseek_prefilter_text(
         symbol=binance_symbol,
@@ -8260,6 +8571,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         current_price_str=current_price_str,
         feature_snapshot=feature_snapshot,
         feature_block=feature_block,
+        decision_snapshot=decision_snapshot,
         history=history,
         open_signal_context=open_signal_context,
     )
