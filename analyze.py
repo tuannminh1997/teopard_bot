@@ -3831,14 +3831,12 @@ def _trade_plan_guard_thresholds(mode: str) -> dict[str, float]:
         return {
             "tp1_r": _env_float("TEOPARD_MIN_TP1_R_SCALP", 0.70),
             "tp2_r": _env_float("TEOPARD_MIN_TP2_R_SCALP", 1.20),
-            "tp2_sep": _env_float("TEOPARD_TP2_SEPARATION_MULT_SCALP", 1.35),
             "tp1_atr": _env_float("TEOPARD_MIN_TP1_ATR_MULT_SCALP", 0.50),
             "tp2_atr": _env_float("TEOPARD_MIN_TP2_ATR_MULT_SCALP", 1.00),
         }
     return {
         "tp1_r": _env_float("TEOPARD_MIN_TP1_R_SWING", 0.80),
         "tp2_r": _env_float("TEOPARD_MIN_TP2_R_SWING", 1.50),
-        "tp2_sep": _env_float("TEOPARD_TP2_SEPARATION_MULT_SWING", 1.40),
         "tp1_atr": _env_float("TEOPARD_MIN_TP1_ATR_MULT_SWING", 0.50),
         "tp2_atr": _env_float("TEOPARD_MIN_TP2_ATR_MULT_SWING", 1.00),
     }
@@ -3867,7 +3865,7 @@ MIN_SETUP_STRENGTH = _env_float("TEOPARD_MIN_SETUP_STRENGTH", MIN_SIGNAL_SCORE)
 MIN_REVERSAL_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_REVERSAL_CONFIDENCE", 50.0)
 MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = _env_float("TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE", 52.0)
 
-# Rubric cuối 100 điểm. Model tự chấm; Python chỉ parse tổng và guard lỗi cứng.
+# Rubric cuối 100 điểm. Model tự chấm; Python chỉ parse tổng và gate theo Điểm tín hiệu.
 SIGNAL_SCORE_WEIGHTS = {
     "huong_boi_canh_da_khung": 30.0,
     "entry_timing": 20.0,
@@ -4013,9 +4011,10 @@ def _normalize_trade_plan_structural_tps(
     current_price: float | None,
     output: str | None = None,
 ) -> tuple[dict, str | None]:
-    """Nếu TP1/TP2 quá sát sau khi SL đã chuẩn hóa, thử chuyển sang target cấu trúc kế tiếp.
+    """Nếu TP1/TP2 không đạt RR tối thiểu sau khi SL đã chuẩn hóa, thử target cấu trúc kế tiếp.
 
-    Nếu không có target cấu trúc đủ RR, validator sẽ reject thành NO TRADE.
+    Không ép khoảng cách TP2 theo một tỷ lệ cố định so với TP1. TP2 phải do
+    cấu trúc thị trường quyết định; validator chỉ kiểm tra hình học và RR tối thiểu.
     """
     direction = (pred.get("direction") or "").upper()
     if direction not in ("LONG", "SHORT"):
@@ -4045,7 +4044,6 @@ def _normalize_trade_plan_structural_tps(
     guards = _trade_plan_guard_thresholds(mode)
     min_tp1_r = float(guards["tp1_r"])
     min_tp2_r = float(guards["tp2_r"])
-    tp2_sep = float(guards["tp2_sep"])
 
     if rr1 < min_tp1_r:
         threshold = edge + risk * min_tp1_r if direction == "LONG" else edge - risk * min_tp1_r
@@ -4064,9 +4062,9 @@ def _normalize_trade_plan_structural_tps(
     reward2 = rr.get("reward2") or reward2
     rr2 = rr.get("rr2") or 0.0
 
-    need_tp2 = rr2 < min_tp2_r or reward2 <= reward1 * tp2_sep
+    need_tp2 = rr2 < min_tp2_r
     if need_tp2:
-        min_reward2 = max(risk * min_tp2_r, reward1 * tp2_sep)
+        min_reward2 = risk * min_tp2_r
         threshold = edge + min_reward2 if direction == "LONG" else edge - min_reward2
         cand = _pick_tp_candidate(candidates, direction, threshold)
         if cand:
@@ -6430,14 +6428,12 @@ def _python_setup_score_breakdown(
     guards = _trade_plan_guard_thresholds(mode)
     min_tp1_r = float(guards["tp1_r"])
     min_tp2_r = float(guards["tp2_r"])
-    tp2_sep = float(guards["tp2_sep"])
     if risk <= 0:
         rr_points = 0.0
     else:
         rr_points = 0.0
-        rr_points += min(rr1 / max(min_tp1_r, 1e-9), 1.0) * 8.0
-        rr_points += min(rr2 / max(min_tp2_r, 1e-9), 1.0) * 8.0
-        rr_points += 2.0 if reward2 > reward1 * tp2_sep else max(0.0, reward2 / max(reward1 * tp2_sep, 1e-9)) * 2.0
+        rr_points += min(rr1 / max(min_tp1_r, 1e-9), 1.0) * 9.0
+        rr_points += min(rr2 / max(min_tp2_r, 1e-9), 1.0) * 9.0
         if atr_val > 0:
             rr_points += 1.0 if reward1 >= atr_val * float(guards["tp1_atr"]) else 0.0
             rr_points += 1.0 if reward2 >= atr_val * float(guards["tp2_atr"]) else 0.0
@@ -7593,114 +7589,19 @@ def _validate_actionable_trade_plan(
     current_price: float | None,
     output: str | None = None,
 ) -> list[str]:
-    """
-    Python guard để tránh lưu/auto-check các kế hoạch sai hình học hoặc quá nhiễu.
+    """Gate duy nhất cho kế hoạch LONG/SHORT: Điểm tín hiệu của model.
 
-    Guard chỉ dùng cấu trúc, Fibonacci, EMA, ATR, RR và nến đã đóng. Nó không dùng
-    pseudo-liquidation hay heatmap suy đoán từ OHLCV.
+    Entry, SL, TP1 và TP2 là kết quả phân tích của model và được giữ nguyên.
+    Python không còn reject kế hoạch vì RR, ATR, độ rộng Entry, khoảng cách SL/TP,
+    nguồn level, setup đảo chiều hay quan hệ hình học giữa các mức giá.
+
+    Việc thiếu/không parse được số được xử lý riêng như lỗi dữ liệu kỹ thuật để
+    không lưu một record hỏng; nó không được diễn giải thành đánh giá thị trường.
     """
-    errors: list[str] = []
     direction = (pred.get("direction") or "").upper()
     if direction not in ("LONG", "SHORT"):
-        return errors
-
-    errors.extend(_validate_model_scores(pred, mode))
-    if mode == "short":
-        errors.extend(_validate_scalp_reversal_quality(pred, timeframe_data, output))
-
-    required = ("entry_low", "entry_high", "sl", "tp1", "tp2")
-    missing = [name for name in required if pred.get(name) is None]
-    if missing:
-        return ["Thiếu số Entry/SL/TP nên không được lưu auto-check: " + ", ".join(missing)]
-
-    errors.extend(_validate_structural_plan_sources(pred, timeframe_data, mode, current_price))
-
-    entry_low = float(pred["entry_low"])
-    entry_high = float(pred["entry_high"])
-    if entry_low > entry_high:
-        entry_low, entry_high = entry_high, entry_low
-    sl = float(pred["sl"])
-    tp1 = float(pred["tp1"])
-    tp2 = float(pred["tp2"])
-    price = float(current_price) if current_price is not None else None
-
-    if pred.get("_structural_sl_error"):
-        errors.append(str(pred.get("_structural_sl_error")))
-
-    risk_ref = _risk_floor(timeframe_data, mode, price or ((entry_low + entry_high) / 2.0))
-    min_stop = _minimum_stop_distance(timeframe_data, mode, price or ((entry_low + entry_high) / 2.0))
-    pred["_risk_reference"] = risk_ref
-    pred["_min_stop_distance"] = min_stop
-    # Hình học dùng SL cuối cùng xuất cho user/tracking. RR guard mặc định dùng SL cấu trúc
-    # gốc trước lớp đệm % thêm, để TEOPARD_EXTRA_SL_BUFFER_PCT không làm kèo bị NO TRADE.
-    if direction == "LONG":
-        if sl >= entry_low:
-            errors.append("LONG sai hình học: SL phải nằm dưới toàn bộ vùng Entry.")
-        if tp1 <= entry_high:
-            errors.append("LONG sai hình học: TP1 phải nằm trên toàn bộ vùng Entry.")
-        if tp2 < tp1:
-            errors.append("LONG sai hình học: TP2 không được thấp hơn TP1.")
-        final_risk = max(entry_high - sl, 0.0)
-    else:
-        if sl <= entry_high:
-            errors.append("SHORT sai hình học: SL phải nằm trên toàn bộ vùng Entry.")
-        if tp1 >= entry_low:
-            errors.append("SHORT sai hình học: TP1 phải nằm dưới toàn bộ vùng Entry.")
-        if tp2 > tp1:
-            errors.append("SHORT sai hình học: TP2 không được cao hơn TP1.")
-        final_risk = max(sl - entry_low, 0.0)
-
-    rr_guard = _plan_worst_case_risk_reward(pred, use_rr_guard_sl=True, use_rr_guard_tp=True)
-    risk = float(rr_guard.get("risk") or 0.0)
-    reward1 = float(rr_guard.get("reward1") or 0.0)
-    reward2 = float(rr_guard.get("reward2") or 0.0)
-
-    min_risk = min_stop
-    if final_risk <= 0:
-        errors.append("Risk Entry-SL không hợp lệ.")
-    elif not _guard_is_off() and final_risk < min_risk:
-        errors.append(
-            f"SL cuối vẫn quá sát Entry: risk bất lợi {fmt(final_risk)} USDT < ngưỡng chống nhiễu {fmt(min_risk)} USDT."
-        )
-
-    # RR guard không tính phần nới SL thêm theo %. Muốn ép RR theo SL cuối cùng thì set
-    # TEOPARD_RR_USE_EXTRA_SL_BUFFER=1. Mặc định: buffer SL là phong cách quản trị rủi ro
-    # của user, không được tự làm Python đổi LONG/SHORT thành NO TRADE.
-    if risk > 0 and not _guard_is_off():
-        guards = _trade_plan_guard_thresholds(mode)
-        min_tp1_r = float(guards["tp1_r"])
-        min_tp2_r = float(guards["tp2_r"])
-        tp2_sep = float(guards["tp2_sep"])
-        rr1 = reward1 / risk
-        rr2 = reward2 / risk
-        if rr1 < min_tp1_r:
-            errors.append(f"TP1 không đủ bù rủi ro: RR1 khoảng {fmt(rr1, 2)}R < {fmt(min_tp1_r, 2)}R.")
-        if rr2 < min_tp2_r:
-            errors.append(f"TP2 không đủ bù rủi ro: RR2 khoảng {fmt(rr2, 2)}R < {fmt(min_tp2_r, 2)}R.")
-        if reward2 <= reward1 * tp2_sep:
-            errors.append(
-                f"TP2 quá sát TP1: reward TP2 phải ít nhất {fmt(tp2_sep, 2)} lần reward TP1."
-            )
-
-        atr_label, atr_value = _tp_noise_atr(timeframe_data, mode)
-        if atr_value is not None:
-            min_reward1 = atr_value * float(guards["tp1_atr"])
-            min_reward2 = atr_value * float(guards["tp2_atr"])
-            if reward1 < min_reward1:
-                errors.append(
-                    f"TP1 quá sát so với nhiễu {atr_label}: khoảng lời {fmt(reward1)} < {fmt(min_reward1)} USDT."
-                )
-            if reward2 < min_reward2:
-                errors.append(
-                    f"TP2 quá sát so với nhiễu {atr_label}: khoảng lời {fmt(reward2)} < {fmt(min_reward2)} USDT."
-                )
-
-    # V29: Entry xa giá hiện tại nhưng model ghi "vào ngay" không còn bị ép NO TRADE.
-    # Output sẽ được _normalize_pending_entry_activation() đổi thành lệnh chờ PENDING_ENTRY.
-    # Validator giữ lỗi hình học, nguồn level, RR/ATR, SL/TP và confidence.
-
-    return errors
-
+        return []
+    return _validate_model_scores(pred, mode)
 
 def _guarded_no_trade_output(
     symbol: str,
@@ -8000,20 +7901,13 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
     pred = _attach_plan_sources(parse_prediction_from_output(output), raw_output)
 
-    # V32 model-authoritative flow:
-    # - Model tự chọn Entry/SL/TP từ dữ liệu Binance + level map Python cung cấp.
-    # - Python mặc định KHÔNG tự nhảy SL/TP sang mức khác, để output cuối giữ đúng phân tích model.
-    # - Python validate hình học, nguồn level, RR và noise floor ATR; chỉ áp buffer SL/TP theo sở thích user nếu user set biến Railway.
-    # - Có thể bật lại auto-adjust bằng TEOPARD_PYTHON_ADJUST_SL=1 hoặc TEOPARD_PYTHON_ADJUST_TP=1.
+    # Model-authoritative flow:
+    # - Model tự chọn và chịu trách nhiệm toàn bộ Entry/SL/TP.
+    # - Python giữ nguyên tuyệt đối các con số model trả về.
+    # - Gate duy nhất là Điểm tín hiệu; Python không reject theo RR/ATR/cấu trúc/hình học.
     direction = (pred.get("direction") or "").upper()
 
     if direction in ("LONG", "SHORT"):
-        if _python_adjusts_model_sl():
-            pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
-        if _python_adjusts_model_tp():
-            pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
-        pred, output = _apply_extra_sl_buffer_to_plan(pred, output)
-        pred, output = _apply_extra_tp_buffers_to_plan(pred, output)
         output = _normalize_pending_entry_activation(output, pred, current_price)
         pred, output = apply_python_objective_scores(pred, output, timeframe_data, mode, current_price)
 
@@ -8183,20 +8077,13 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
     pred = _attach_plan_sources(parse_prediction_from_output(output), raw_output)
 
-    # V32 model-authoritative flow:
-    # - Model tự chọn Entry/SL/TP từ dữ liệu Binance + level map Python cung cấp.
-    # - Python mặc định KHÔNG tự nhảy SL/TP sang mức khác, để output cuối giữ đúng phân tích model.
-    # - Python validate hình học, nguồn level, RR và noise floor ATR; chỉ áp buffer SL/TP theo sở thích user nếu user set biến Railway.
-    # - Có thể bật lại auto-adjust bằng TEOPARD_PYTHON_ADJUST_SL=1 hoặc TEOPARD_PYTHON_ADJUST_TP=1.
+    # Model-authoritative flow:
+    # - Model tự chọn và chịu trách nhiệm toàn bộ Entry/SL/TP.
+    # - Python giữ nguyên tuyệt đối các con số model trả về.
+    # - Gate duy nhất là Điểm tín hiệu; Python không reject theo RR/ATR/cấu trúc/hình học.
     direction = (pred.get("direction") or "").upper()
 
     if direction in ("LONG", "SHORT"):
-        if _python_adjusts_model_sl():
-            pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
-        if _python_adjusts_model_tp():
-            pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
-        pred, output = _apply_extra_sl_buffer_to_plan(pred, output)
-        pred, output = _apply_extra_tp_buffers_to_plan(pred, output)
         output = _normalize_pending_entry_activation(output, pred, current_price)
         pred, output = apply_python_objective_scores(pred, output, timeframe_data, mode, current_price)
 
@@ -9388,7 +9275,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     user_prompt = ctx["user_prompt"]
     flash_note = "\n\nLỌC NHANH DEEPSEEK FLASH — CHỈ BÁO RẰNG SNAPSHOT ĐÁNG PHÂN TÍCH SÂU:\n" + (
         "- Lớp lọc nhanh đã đạt điều kiện gọi AI cuối, nhưng điểm LONG/SHORT của Flash không được đưa vào đây để tránh neo hướng.\n"
-        "- Bạn phải tự chọn LONG / SHORT / NO TRADE từ dữ liệu đầy đủ bên trên và tự chấm một Điểm tín hiệu duy nhất. Python chỉ parse điểm đó và guard lỗi cứng Entry/SL/TP/RR."
+        "- Bạn phải tự chọn LONG / SHORT / NO TRADE từ dữ liệu đầy đủ bên trên và tự chấm một Điểm tín hiệu duy nhất. Python chỉ parse kết quả và dùng Điểm tín hiệu làm gate duy nhất."
     )
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt + flash_note)
     scored_output, _score_meta = finalize_model_scoring_output(raw_output)
@@ -9412,16 +9299,15 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     # Flash chỉ là prefilter tiết kiệm chi phí; AI cuối vẫn tự quyết định từ dữ liệu đầy đủ.
     # Python chỉ hậu kiểm hướng AI cuối bằng dữ liệu khách quan sau khi model chọn xong.
 
+    # Gate cuối duy nhất: Điểm tín hiệu do AI cuối trả về.
+    # data_support_score của Python chỉ giữ để debug, không bao giờ chặn gửi tín hiệu.
     signal_gate_failed = final_conf < AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
-    data_gate_failed = AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE and final_data_support < AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
 
-    if signal_gate_failed or data_gate_failed:
+    if signal_gate_failed:
         mismatch_note = ""
         if pre_direction in {"LONG", "SHORT"} and direction in {"LONG", "SHORT"} and direction != pre_direction:
             mismatch_note = f" DeepSeek Flash lọc nhanh nghiêng {pre_direction}, nhưng AI cuối chọn {direction}; đây chỉ là thông tin debug, không ép hướng AI cuối."
-        data_note = f" Kiểm tra dữ liệu Python tham khảo: {final_data_support}/100; không chặn mặc định."
-        if AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE:
-            data_note = f" Kiểm tra dữ liệu Python: {final_data_support}/100; đang bật gate AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE."
+        data_note = f" Kiểm tra dữ liệu Python tham khảo: {final_data_support}/100; chỉ debug, không dùng để chặn."
         return log_and_return(
             "glm",
             "rejected",
@@ -9439,12 +9325,6 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if _auto_scan_recently_sent(user_id, binance_symbol, mode, direction=direction):
         return log_and_return("cooldown", "skipped", "direction cooldown", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
-    if _python_adjusts_model_sl():
-        pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
-    if _python_adjusts_model_tp():
-        pred, output = _normalize_trade_plan_structural_tps(pred, timeframe_data, mode, current_price, output)
-    pred, output = _apply_extra_sl_buffer_to_plan(pred, output)
-    pred, output = _apply_extra_tp_buffers_to_plan(pred, output)
     output = _normalize_pending_entry_activation(output, pred, current_price)
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
