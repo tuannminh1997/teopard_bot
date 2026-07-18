@@ -135,9 +135,9 @@ Bản này đổi cách chấm điểm cuối:
 
 - Model vẫn chọn LONG/SHORT/NO TRADE và lập Entry/SL/TP.
 - Model vẫn trả rubric nội bộ để kiểm tra format/fallback.
-- Python chấm lại Độ mạnh setup và Điểm chắc chắn bằng dữ liệu cứng.
+- Python chấm lại Chất lượng kế hoạch và Điểm chắc chắn bằng dữ liệu cứng.
 
-Độ mạnh setup chỉ đo chất lượng kế hoạch:
+Chất lượng kế hoạch chỉ đo chất lượng kế hoạch:
 
 - Entry đúng vùng kỹ thuật.
 - SL nằm ngoài điểm vô hiệu.
@@ -155,4 +155,15 @@ Bản này đổi cách chấm điểm cuối:
 - Volume và taker flow.
 - Mức mâu thuẫn/kịch bản đối lập.
 
-Output public đổi từ “Độ chắc chắn: x%” sang “Điểm chắc chắn: x/100” để tránh hiểu nhầm đây là xác suất thắng đã được backtest.
+Output public đổi từ “Điểm chắc chắn: x%” sang “Điểm chắc chắn: x/100” để tránh hiểu nhầm đây là xác suất thắng đã được backtest.
+
+## V41 — model-authoritative evidence flow
+
+Bản này bỏ việc đưa preferred_direction, LONG support và SHORT support vào prompt AI cuối để tránh Python neo hướng model. DeepSeek Flash vẫn tự lọc nhanh từ snapshot kỹ thuật rút gọn để tiết kiệm chi phí, nhưng kết quả Flash không ép hướng AI cuối.
+
+AI cuối nhận dữ liệu đầy đủ đã cải thiện: snapshot đồng bộ, EMA7/25/50 interaction, nến live 1H/4H chuẩn hóa theo tiến độ, chuỗi RSI/MACD/EMA/return, high/low cấu trúc và taker imbalance. Sau khi AI cuối tự chọn LONG/SHORT/NO TRADE, Python mới hậu kiểm Điểm chắc chắn và Chất lượng kế hoạch Entry/SL/TP.
+
+Log vì vậy đọc theo thứ tự:
+- DeepSeek Flash: lọc nhanh ứng viên LONG/SHORT từ snapshot rút gọn để tiết kiệm chi phí.
+- AI cuối: tự quyết định LONG/SHORT/NO TRADE từ dữ liệu đầy đủ, không bị scorecard Python dẫn hướng.
+- Python: hậu kiểm Điểm chắc chắn và Chất lượng kế hoạch.

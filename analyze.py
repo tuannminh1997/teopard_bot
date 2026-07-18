@@ -5554,6 +5554,7 @@ def build_user_prompt(
     feature_block: str | None = None,
     open_signal_context: str | None = None,
     decision_snapshot: str | None = None,
+    direction_scorecard: str | None = None,
 ) -> str:
     """Text prompt input cho model chính.
 
@@ -5572,6 +5573,8 @@ def build_user_prompt(
         "",
         "VAI TRÒ TIMEFRAME:",
         _mode_role_text(mode),
+        "",
+        "LƯU Ý QUYỀN QUYẾT ĐỊNH: Python không gửi preferred_direction, LONG support hay SHORT support cho model cuối. Model phải tự chọn LONG/SHORT/NO TRADE từ dữ liệu kỹ thuật, snapshot đồng bộ và kế hoạch đang mở bên dưới.",
         "",
         feature_block or "Dữ liệu kỹ thuật do Python tính sẵn: không có.",
         "",
@@ -6681,6 +6684,147 @@ def apply_python_objective_scores(
     scored["_score_engine"] = "python_objective_v39"
     return scored, _insert_public_scores(output, setup_strength, confidence)
 
+
+def _objective_direction_payload(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+) -> dict:
+    """Objective direction support used only for Python post-scoring/debug, not final-model prompting.
+
+    This is NOT a trade decision and does not create Entry/SL/TP. It measures how much
+    the same market snapshot supports LONG and SHORT before any LLM writes a plan.
+    V41: this payload must not be injected into final-model prompts, because it can
+    anchor the model toward Python's preferred direction. The model gets evidence;
+    Python scores the chosen direction afterward.
+    """
+    scores: dict[str, dict] = {}
+    for direction in ("LONG", "SHORT"):
+        pred = {"direction": direction}
+        breakdown = _python_confidence_score_breakdown(pred, timeframe_data, mode, current_price)
+        total = _rubric_total(breakdown, CONFIDENCE_SCORE_WEIGHTS)
+        scores[direction] = {"total": int(round(total or 0)), "breakdown": breakdown}
+
+    long_total = int(scores["LONG"]["total"])
+    short_total = int(scores["SHORT"]["total"])
+    gap = abs(long_total - short_total)
+    if long_total > short_total:
+        preferred = "LONG"
+    elif short_total > long_total:
+        preferred = "SHORT"
+    else:
+        preferred = "NEUTRAL"
+    if gap < AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP:
+        preferred = "NEUTRAL"
+
+    return {
+        "long_score": long_total,
+        "short_score": short_total,
+        "gap": gap,
+        "preferred_direction": preferred,
+        "scores": scores,
+        "engine": "python_direction_support_debug_v41",
+    }
+
+
+def _format_direction_breakdown_short(breakdown: dict | None) -> str:
+    if not isinstance(breakdown, dict):
+        return "không có breakdown"
+    labels = [
+        ("dong_thuan_huong_da_khung", "đa khung"),
+        ("cau_truc_thi_truong", "cấu trúc"),
+        ("price_action_ema_interaction", "EMA/giá"),
+        ("dien_bien_momentum", "momentum"),
+        ("volume_taker_flow", "volume/taker"),
+        ("mau_thuan_kich_ban_doi_lap", "ít mâu thuẫn"),
+    ]
+    parts = []
+    for key, label in labels:
+        value = breakdown.get(key)
+        if value is None:
+            continue
+        try:
+            parts.append(f"{label} {float(value):.0f}")
+        except Exception:
+            pass
+    return ", ".join(parts) if parts else "không có breakdown"
+
+
+def build_python_direction_scorecard(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+    payload: dict | None = None,
+) -> str:
+    payload = payload or _objective_direction_payload(timeframe_data, mode, current_price)
+    long_score = int(payload.get("long_score") or 0)
+    short_score = int(payload.get("short_score") or 0)
+    gap = int(payload.get("gap") or 0)
+    preferred = str(payload.get("preferred_direction") or "NEUTRAL")
+    scores = payload.get("scores") or {}
+    long_bd = ((scores.get("LONG") or {}).get("breakdown") or {}) if isinstance(scores, dict) else {}
+    short_bd = ((scores.get("SHORT") or {}).get("breakdown") or {}) if isinstance(scores, dict) else {}
+    if preferred == "NEUTRAL":
+        meaning = "hai hướng gần cân bằng hoặc chưa đủ chênh lệch; dùng để debug hậu kiểm, không dùng để nhắc model cuối."
+    else:
+        meaning = f"dữ liệu định lượng debug nghiêng {preferred}; không gửi kết luận này vào prompt model cuối để tránh neo hướng."
+    return "\n".join([
+        "DEBUG PYTHON DIRECTION SUPPORT — KHÔNG GỬI CHO MODEL CUỐI:",
+        f"- LONG support: {long_score}/100 | {_format_direction_breakdown_short(long_bd)}.",
+        f"- SHORT support: {short_score}/100 | {_format_direction_breakdown_short(short_bd)}.",
+        f"- Hướng support nhỉnh hơn trong debug: {preferred} | chênh {gap} điểm.",
+        f"- Cách đọc: {meaning}",
+    ])
+
+
+def _evaluate_objective_direction_gate(payload: dict | None) -> dict:
+    payload = payload if isinstance(payload, dict) else {}
+    try:
+        long_score = max(0, min(100, int(round(float(payload.get("long_score") or 0)))))
+    except Exception:
+        long_score = 0
+    try:
+        short_score = max(0, min(100, int(round(float(payload.get("short_score") or 0)))))
+    except Exception:
+        short_score = 0
+    gap = abs(long_score - short_score)
+    if long_score > short_score:
+        raw_direction = "LONG"
+    elif short_score > long_score:
+        raw_direction = "SHORT"
+    else:
+        raw_direction = "NEUTRAL"
+    direction = raw_direction if raw_direction != "NEUTRAL" and gap >= AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP else "NEUTRAL"
+    best_score = max(long_score, short_score)
+    above_threshold = best_score >= AUTO_SCAN_MIN_PREFILTER_CONFIDENCE
+    should_call = bool(direction in {"LONG", "SHORT"} and above_threshold)
+    if direction == "NEUTRAL":
+        reason = (
+            f"Direction support debug gần cân bằng: LONG {long_score}/100, SHORT {short_score}/100; "
+            f"chênh {gap} điểm, cần tối thiểu {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm."
+        )
+    elif not above_threshold:
+        reason = (
+            f"Direction support debug nghiêng {direction} {best_score}/100 nhưng dưới ngưỡng lọc nhanh "
+            f"{AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100."
+        )
+    else:
+        reason = (
+            f"Direction support debug nghiêng {direction} {best_score}/100, hướng đối diện "
+            f"{min(long_score, short_score)}/100, chênh {gap} điểm; gọi AI cuối."
+        )
+    return {
+        "long_score": long_score,
+        "short_score": short_score,
+        "direction": direction,
+        "raw_direction": raw_direction,
+        "best_score": best_score,
+        "gap": gap,
+        "should_call_glm": should_call,
+        "reason": reason,
+    }
+
+
 def _extract_rubric_breakdowns(output: str | None) -> tuple[dict, dict]:
     """Đọc block máy [[TEOPARD_RUBRIC]] do model trả ở cuối output."""
     text = output or ""
@@ -6759,12 +6903,12 @@ def _insert_public_scores(
         text,
         flags=re.IGNORECASE | re.MULTILINE,
     )
-    text = re.sub(r"^\s*Độ\s+mạnh\s+setup\s*:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"^\s*(?:Độ\s+mạnh\s+setup|Chất\s+lượng\s+kế\s+hoạch)\s*:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
     text = re.sub(r"^\s*(?:Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn)\s*:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
 
     setup_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
     confidence_text = f"{confidence:.0f}/100" if confidence is not None else "N/A"
-    score_lines = [f"Độ mạnh setup: {setup_text}", f"Điểm chắc chắn: {confidence_text}"]
+    score_lines = [f"Chất lượng kế hoạch: {setup_text}", f"Điểm chắc chắn: {confidence_text}"]
 
     lines = text.splitlines()
     for index, line in enumerate(lines):
@@ -7764,6 +7908,10 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     feature_block                    = build_feature_engineering_block(timeframe_data, mode, current_price)
     feature_snapshot                 = build_feature_snapshot(timeframe_data, mode, current_price)
     decision_snapshot                = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
+    # Direction support is intentionally NOT sent to the final model.
+    # Python only uses objective scoring after the model chooses LONG/SHORT.
+    direction_scorecard_payload      = None
+    direction_scorecard              = None
     market_snapshot                  = build_market_snapshot(
         timeframe_data,
         fear_greed_info,
@@ -7782,6 +7930,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         feature_block=feature_block,
         open_signal_context=open_signal_context,
         decision_snapshot=decision_snapshot,
+        direction_scorecard=direction_scorecard,
     )
 
     raw_output = request_claude_analysis(system_prompt, user_prompt)
@@ -7895,6 +8044,10 @@ async def prepare_analysis_context(
     feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
     feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
     decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
+    # V41: do not send LONG/SHORT support scorecard into model prompts.
+    # This prevents Python from anchoring the model direction.
+    direction_scorecard_payload = None
+    direction_scorecard = None
     market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
     open_signal_context = format_open_signal_context(open_signals, current_price)
     user_prompt = build_user_prompt(
@@ -7907,6 +8060,7 @@ async def prepare_analysis_context(
         feature_block=feature_block,
         open_signal_context=open_signal_context,
         decision_snapshot=decision_snapshot,
+        direction_scorecard=direction_scorecard,
     )
     return {
         "timeframe_data": timeframe_data,
@@ -7920,6 +8074,8 @@ async def prepare_analysis_context(
         "feature_block": feature_block,
         "feature_snapshot": feature_snapshot,
         "decision_snapshot": decision_snapshot,
+        "direction_scorecard": direction_scorecard,
+        "direction_scorecard_payload": direction_scorecard_payload,
         "market_snapshot": market_snapshot,
         "user_prompt": user_prompt,
     }
@@ -8665,6 +8821,7 @@ def build_deepseek_prefilter_text(
     decision_snapshot: str | None,
     history: list[dict],
     open_signal_context: str | None,
+    direction_scorecard: str | None = None,
 ) -> str:
     """Text input rút gọn cho DeepSeek prefilter, không dùng JSON.
 
@@ -8677,6 +8834,7 @@ def build_deepseek_prefilter_text(
     return "\n".join([
         f"AUTO SCAN PREFILTER — {symbol} {mode_label}",
         current_price_str,
+        "Lưu ý: Python không gửi preferred_direction cho DeepSeek Flash. Flash tự chấm LONG/SHORT từ snapshot kỹ thuật rút gọn bên dưới; kết quả chỉ dùng để tiết kiệm lượt AI cuối, không ép hướng AI cuối.",
         "Nhiệm vụ: dùng mini-rubric để lọc nhanh xem có đáng gọi AI cuối phân tích sâu không.",
         "Không chốt lệnh, không tạo Entry/SL/TP, không gửi user.",
         "Chấm riêng LONG và SHORT bằng số nguyên trong đúng giới hạn từng tiêu chí.",
@@ -9004,7 +9162,10 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     feature_block = ctx["feature_block"]
     feature_snapshot = ctx["feature_snapshot"]
     decision_snapshot = ctx["decision_snapshot"]
+    direction_scorecard = None
+    direction_scorecard_payload = None
     market_snapshot = ctx["market_snapshot"]
+
     prefilter_text = build_deepseek_prefilter_text(
         symbol=binance_symbol,
         mode=mode,
@@ -9014,26 +9175,22 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         decision_snapshot=decision_snapshot,
         history=history,
         open_signal_context=open_signal_context,
+        direction_scorecard=None,
     )
 
     prefilter = await asyncio.to_thread(request_deepseek_prefilter, prefilter_text)
-
-    # DeepSeek mini-rubric: Python tự cộng điểm, chọn hướng và quyết định có gọi AI cuối.
     gate = _evaluate_deepseek_prefilter_gate(prefilter)
-    long_score = gate["long_score"]
-    short_score = gate["short_score"]
-    pre_direction = gate["direction"]
-    pre_conf = gate["best_score"]
+    pre_direction = gate.get("direction")
+    pre_conf = gate.get("best_score")
+    deepseek_direction = pre_direction
+    deepseek_conf = pre_conf
+    deepseek_reason = gate.get("reason")
 
-    if not gate["should_call_glm"]:
-        model_reason = str(prefilter.get("reason") or "").strip()
-        reason_text = gate["reason"]
-        if model_reason:
-            reason_text += f" DeepSeek: {model_reason[:180]}"
+    if not gate.get("should_call_glm"):
         return log_and_return(
             "deepseek",
             "rejected",
-            reason_text,
+            gate.get("reason") or "DeepSeek Flash không thấy ứng viên LONG/SHORT đủ mạnh để gọi AI cuối.",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
         )
@@ -9047,7 +9204,13 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         )
 
     user_prompt = ctx["user_prompt"]
-    raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
+    flash_note = "\n\nLỌC NHANH DEEPSEEK FLASH — THAM KHẢO, KHÔNG PHẢI LỆNH:\n" + (
+        f"- DeepSeek mini-rubric: LONG {gate.get('long_score', 0)}/100, SHORT {gate.get('short_score', 0)}/100, "
+        f"hướng nhỉnh hơn {deepseek_direction} {deepseek_conf}/100.\n"
+        f"- Ghi chú Flash: {str(deepseek_reason or prefilter.get('reason') or '')[:240]}\n"
+        "- DeepSeek Flash chỉ là lớp lọc nhanh để tiết kiệm chi phí; AI cuối không bị ép cùng hướng và phải tự quyết định từ dữ liệu đầy đủ. Python chỉ chấm hậu kiểm sau khi AI cuối chọn hướng."
+    )
+    raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt + flash_note)
     scored_output, _score_meta = finalize_model_scoring_output(raw_output)
     output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
     pred = _attach_plan_sources(parse_prediction_from_output(output), raw_output)
@@ -9065,12 +9228,20 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if direction not in {"LONG", "SHORT"}:
         return log_and_return("glm", "rejected", "AI cuối không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
 
+    # Không chặn cứng chỉ vì hướng AI cuối khác DeepSeek Flash.
+    # Flash chỉ là prefilter tiết kiệm chi phí; AI cuối vẫn tự quyết định từ dữ liệu đầy đủ.
+    # Python chỉ hậu kiểm hướng AI cuối bằng dữ liệu khách quan sau khi model chọn xong.
+
     if final_conf < AUTO_SCAN_MIN_FINAL_CONFIDENCE or final_setup < AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH:
+        mismatch_note = ""
+        if pre_direction in {"LONG", "SHORT"} and direction in {"LONG", "SHORT"} and direction != pre_direction:
+            mismatch_note = f" DeepSeek Flash lọc nhanh nghiêng {pre_direction}, nhưng AI cuối chọn {direction}; Python hậu kiểm hướng {direction} theo dữ liệu khách quan."
         return log_and_return(
             "glm",
             "rejected",
-            f"Tín hiệu cuối đạt Điểm chắc chắn {final_conf}/100 và Độ mạnh setup {final_setup}/100; "
-            f"ngưỡng gửi là {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100 và {AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH}/100.",
+            f"Tín hiệu cuối đạt Điểm chắc chắn {final_conf}/100 và Chất lượng kế hoạch Entry/SL/TP {final_setup}/100; "
+            f"ngưỡng gửi là {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100 và {AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH}/100."
+            f"{mismatch_note}",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
             final_direction=direction,

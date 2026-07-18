@@ -78,6 +78,16 @@ def _validate_llm_output(path: Path, timeframe_data, mode, price):
         print("ACCEPTED / CAN_TRACK")
 
 
+def _print_direction_scorecard(timeframe_data, mode, price):
+    print("\n=== PYTHON DIRECTION SUPPORT DEBUG (NOT SENT TO FINAL MODEL) ===")
+    try:
+        payload = analyze._objective_direction_payload(timeframe_data, mode, price)
+        print(analyze.build_python_direction_scorecard(timeframe_data, mode, price, payload))
+        print(analyze._evaluate_objective_direction_gate(payload))
+    except Exception as exc:
+        print(f"Cannot build direction support debug: {exc}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("symbol", help="BTC, ETH, or BTCUSDT/ETHUSDT")
@@ -106,6 +116,7 @@ def main():
     print(f"\nCURRENT_PRICE={analyze.fmt(price)}")
 
     _print_atr_and_risk(timeframe_data, args.mode, price)
+    _print_direction_scorecard(timeframe_data, args.mode, price)
     _print_structural_levels(timeframe_data, args.mode, price)
     print("\n=== SYNCHRONIZED DECISION SNAPSHOT ===")
     print(analyze.build_synchronized_decision_snapshot(timeframe_data, args.mode, price))
