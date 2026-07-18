@@ -8239,6 +8239,9 @@ def init_auto_scan_db() -> None:
                 status            TEXT NOT NULL,
                 pre_direction     TEXT,
                 pre_confidence    INTEGER,
+                pre_long_score    INTEGER,
+                pre_short_score   INTEGER,
+                pre_gap           INTEGER,
                 final_direction   TEXT,
                 final_confidence  INTEGER,
                 reason            TEXT,
@@ -8263,6 +8266,16 @@ def init_auto_scan_db() -> None:
                 conn.execute(f"ALTER TABLE auto_scan_settings ADD COLUMN {col} {definition}")
             except sqlite3.OperationalError:
                 pass
+        for col, definition in [
+            ("pre_long_score", "INTEGER"),
+            ("pre_short_score", "INTEGER"),
+            ("pre_gap", "INTEGER"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE auto_scan_logs ADD COLUMN {col} {definition}")
+            except sqlite3.OperationalError:
+                pass
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_settings_enabled ON auto_scan_settings(enabled)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_signals_user_symbol_mode ON auto_scan_signals(user_id, symbol, mode, sent_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_logs_user_id ON auto_scan_logs(user_id, id DESC)")
@@ -8740,6 +8753,9 @@ def _record_auto_scan_log(
     reason: str | None = None,
     pre_direction: str | None = None,
     pre_confidence: int | None = None,
+    pre_long_score: int | None = None,
+    pre_short_score: int | None = None,
+    pre_gap: int | None = None,
     final_direction: str | None = None,
     final_confidence: int | None = None,
     prediction_id: int | None = None,
@@ -8750,11 +8766,13 @@ def _record_auto_scan_log(
             """
             INSERT INTO auto_scan_logs
                 (user_id, chat_id, symbol, mode, scan_slot, scanned_at, stage, status,
-                 pre_direction, pre_confidence, final_direction, final_confidence, reason, prediction_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 pre_direction, pre_confidence, pre_long_score, pre_short_score, pre_gap,
+                 final_direction, final_confidence, reason, prediction_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (user_id, chat_id, symbol, mode, scan_slot, iso(utc_now()), stage, status,
-             pre_direction, pre_confidence, final_direction, final_confidence, reason, prediction_id),
+             pre_direction, pre_confidence, pre_long_score, pre_short_score, pre_gap,
+             final_direction, final_confidence, reason, prediction_id),
         )
         if user_id is not None:
             conn.execute(
@@ -8782,6 +8800,7 @@ def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
         rows = conn.execute(
             """
             SELECT scanned_at, symbol, mode, stage, status, pre_direction, pre_confidence,
+                   pre_long_score, pre_short_score, pre_gap,
                    final_direction, final_confidence, reason, prediction_id
             FROM auto_scan_logs
             WHERE user_id=?
@@ -8790,7 +8809,11 @@ def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
             """,
             (user_id, limit),
         ).fetchall()
-    keys = ["scanned_at", "symbol", "mode", "stage", "status", "pre_direction", "pre_confidence", "final_direction", "final_confidence", "reason", "prediction_id"]
+    keys = [
+        "scanned_at", "symbol", "mode", "stage", "status",
+        "pre_direction", "pre_confidence", "pre_long_score", "pre_short_score", "pre_gap",
+        "final_direction", "final_confidence", "reason", "prediction_id",
+    ]
     return [dict(zip(keys, row)) for row in rows]
 
 
@@ -9182,6 +9205,11 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     gate = _evaluate_deepseek_prefilter_gate(prefilter)
     pre_direction = gate.get("direction")
     pre_conf = gate.get("best_score")
+    prefilter_score_kwargs = {
+        "pre_long_score": gate.get("long_score"),
+        "pre_short_score": gate.get("short_score"),
+        "pre_gap": gate.get("gap"),
+    }
     deepseek_direction = pre_direction
     deepseek_conf = pre_conf
     deepseek_reason = gate.get("reason")
@@ -9193,6 +9221,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             gate.get("reason") or "DeepSeek Flash không thấy ứng viên LONG/SHORT đủ mạnh để gọi AI cuối.",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
+            **prefilter_score_kwargs,
         )
 
     quota = reserve_auto_scan_glm_call(user_id)
@@ -9200,7 +9229,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         return log_and_return(
             "quota", "skipped",
             f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
-            pre_direction=pre_direction, pre_confidence=pre_conf,
+            pre_direction=pre_direction, pre_confidence=pre_conf, **prefilter_score_kwargs,
         )
 
     user_prompt = ctx["user_prompt"]
@@ -9223,10 +9252,10 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:
             return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
-        return log_and_return("glm", "rejected", "AI cuối chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+        return log_and_return("glm", "rejected", "AI cuối chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     if direction not in {"LONG", "SHORT"}:
-        return log_and_return("glm", "rejected", "AI cuối không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+        return log_and_return("glm", "rejected", "AI cuối không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     # Không chặn cứng chỉ vì hướng AI cuối khác DeepSeek Flash.
     # Flash chỉ là prefilter tiết kiệm chi phí; AI cuối vẫn tự quyết định từ dữ liệu đầy đủ.
@@ -9246,10 +9275,11 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             pre_confidence=pre_conf,
             final_direction=direction,
             final_confidence=final_conf,
+            **prefilter_score_kwargs,
         )
 
     if _auto_scan_recently_sent(user_id, binance_symbol, mode, direction=direction):
-        return log_and_return("cooldown", "skipped", "direction cooldown", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+        return log_and_return("cooldown", "skipped", "direction cooldown", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     if _python_adjusts_model_sl():
         pred, output = _normalize_trade_plan_structural_sl(pred, timeframe_data, mode, current_price, output)
@@ -9262,11 +9292,11 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
-        return log_and_return("guard", "rejected", "guard rejected", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+        return log_and_return("guard", "rejected", "guard rejected", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     can_track = all(pred.get(k) is not None for k in ("entry_low", "entry_high", "sl", "tp1", "tp2"))
     if not can_track:
-        return log_and_return("glm", "rejected", "missing trade levels", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf)
+        return log_and_return("glm", "rejected", "missing trade levels", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     reasoning_summary = build_local_reasoning_summary(output)
     prediction_id = await asyncio.to_thread(
@@ -9304,6 +9334,9 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         "confidence": final_conf,
         "pre_direction": pre_direction,
         "pre_confidence": pre_conf,
+        "pre_long_score": gate.get("long_score"),
+        "pre_short_score": gate.get("short_score"),
+        "pre_gap": gate.get("gap"),
         "final_direction": direction,
         "final_confidence": final_conf,
     }
@@ -9355,6 +9388,9 @@ async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
                             reason="Đã gửi tín hiệu Auto Scan và lưu đồng thời vào history cùng Auto Scan log.",
                             pre_direction=result.get("pre_direction"),
                             pre_confidence=result.get("pre_confidence"),
+                            pre_long_score=result.get("pre_long_score"),
+                            pre_short_score=result.get("pre_short_score"),
+                            pre_gap=result.get("pre_gap"),
                             final_direction=result.get("final_direction") or result.get("direction"),
                             final_confidence=result.get("final_confidence") if result.get("final_confidence") is not None else result.get("confidence"),
                             prediction_id=result.get("prediction_id"),

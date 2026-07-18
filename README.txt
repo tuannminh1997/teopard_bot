@@ -167,3 +167,8 @@ Log vì vậy đọc theo thứ tự:
 - DeepSeek Flash: lọc nhanh ứng viên LONG/SHORT từ snapshot rút gọn để tiết kiệm chi phí.
 - AI cuối: tự quyết định LONG/SHORT/NO TRADE từ dữ liệu đầy đủ, không bị scorecard Python dẫn hướng.
 - Python: hậu kiểm Điểm chắc chắn và Chất lượng kế hoạch.
+
+Cập nhật V42 - Auto Scan log dễ đọc hơn:
+- DeepSeek prefilter không còn hiển thị kiểu “NEUTRAL 43/100”.
+- Khi LONG và SHORT gần cân bằng, /autoscanstatus và /autoscanlog hiển thị cả hai điểm: “LONG x/100 | SHORT y/100 (gần cân bằng, chênh z)”.
+- Log mới lưu riêng điểm LONG, điểm SHORT và độ chênh để debug rõ ràng hơn; log cũ vẫn được đọc lại từ phần ghi chú nếu có.

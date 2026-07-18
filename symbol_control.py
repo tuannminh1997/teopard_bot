@@ -698,6 +698,68 @@ def _display_scan_score(direction, confidence, *, source: str) -> str:
         return f"{label} {confidence}/100"
     return f"{label} {confidence}/100"
 
+
+def _int_or_none(value):
+    try:
+        if value is None or value == "":
+            return None
+        return int(round(float(value)))
+    except Exception:
+        return None
+
+
+def _extract_prefilter_pair(item: dict | None) -> tuple[int | None, int | None, int | None]:
+    """Return (long_score, short_score, gap) for DeepSeek prefilter display.
+
+    New logs store these fields directly. Old logs can still be readable because the
+    reason usually contains: LONG 42/100, SHORT 43/100; chênh 1 điểm.
+    """
+    item = item or {}
+    long_score = _int_or_none(item.get("pre_long_score"))
+    short_score = _int_or_none(item.get("pre_short_score"))
+    gap = _int_or_none(item.get("pre_gap"))
+    if long_score is not None and short_score is not None:
+        if gap is None:
+            gap = abs(long_score - short_score)
+        return long_score, short_score, gap
+
+    import re
+    reason = str(item.get("reason") or "")
+    m = re.search(r"LONG\s+(\d+)\s*/\s*100\s*,\s*SHORT\s+(\d+)\s*/\s*100", reason, flags=re.IGNORECASE)
+    if m:
+        long_score = int(m.group(1))
+        short_score = int(m.group(2))
+        gap_m = re.search(r"chênh\s+(\d+)", reason, flags=re.IGNORECASE)
+        gap = int(gap_m.group(1)) if gap_m else abs(long_score - short_score)
+        return long_score, short_score, gap
+    return long_score, short_score, gap
+
+
+def _display_prefilter_score(item: dict | None) -> str:
+    """DeepSeek prefilter user-facing display.
+
+    Avoid showing `NEUTRAL 43/100`, because 43 is just the stronger side's score.
+    For neutral/gap rejects, show both LONG and SHORT so the log is self-explanatory.
+    """
+    item = item or {}
+    direction = _display_scan_direction(item.get("pre_direction"))
+    confidence = _int_or_none(item.get("pre_confidence"))
+    long_score, short_score, gap = _extract_prefilter_pair(item)
+
+    if long_score is not None and short_score is not None:
+        if gap is None:
+            gap = abs(long_score - short_score)
+        if direction == "NEUTRAL":
+            return f"LONG {long_score}/100 | SHORT {short_score}/100 (gần cân bằng, chênh {gap})"
+        if direction in {"LONG", "SHORT"}:
+            other_label = "SHORT" if direction == "LONG" else "LONG"
+            other_score = short_score if direction == "LONG" else long_score
+            main_score = long_score if direction == "LONG" else short_score
+            return f"{direction} {main_score}/100 | {other_label} {other_score}/100 (chênh {gap})"
+
+    # Fallback for very old logs.
+    return _display_scan_score(item.get("pre_direction"), item.get("pre_confidence"), source="deepseek")
+
 async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import (
         get_auto_scan_runtime_status, _parse_auto_scan_symbols_text, _auto_scan_symbols_from_env_or_db,
@@ -717,7 +779,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
     last_log = status.get("last_log") or {}
     last_line = "Chưa có log scan."
     if last_log:
-        pre = _display_scan_score(last_log.get('pre_direction'), last_log.get('pre_confidence'), source="deepseek")
+        pre = _display_prefilter_score(last_log)
         final = _display_scan_score(last_log.get('final_direction'), last_log.get('final_confidence'), source="glm")
         last_line = (
             f"{_auto_scan_format_dt(last_log.get('scanned_at'))} | "
@@ -768,7 +830,7 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines = ["🧾 Auto Scan log gần nhất:"]
     for item in reversed(logs):
         mode_label = "SCALP" if item.get("mode") == "short" else "SWING"
-        pre = _display_scan_score(item.get('pre_direction'), item.get('pre_confidence'), source="deepseek")
+        pre = _display_prefilter_score(item)
         final = _display_scan_score(item.get('final_direction'), item.get('final_confidence'), source="glm")
         pid = f" | prediction #{item.get('prediction_id')}" if item.get("prediction_id") else ""
         lines.append(

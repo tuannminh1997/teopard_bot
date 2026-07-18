@@ -118,3 +118,8 @@ Cập nhật Model-authoritative evidence flow V41:
 - DeepSeek Flash tự lọc nhanh từ snapshot kỹ thuật rút gọn, chỉ để quyết định có đáng gọi AI cuối không; Flash không ép hướng AI cuối.
 - AI cuối nhận dữ liệu đầy đủ đã cải thiện: snapshot đồng bộ, EMA7/25/50 interaction, nến live chuẩn hóa, chuỗi RSI/MACD/EMA/return, high/low cấu trúc và taker imbalance.
 - Sau khi AI cuối tự chọn LONG/SHORT/NO TRADE, Python mới hậu kiểm Điểm chắc chắn và Chất lượng kế hoạch Entry/SL/TP.
+
+Cập nhật V42 - Auto Scan log dễ đọc hơn:
+- DeepSeek prefilter không còn hiển thị kiểu “NEUTRAL 43/100”.
+- Khi LONG và SHORT gần cân bằng, /autoscanstatus và /autoscanlog hiển thị cả hai điểm: “LONG x/100 | SHORT y/100 (gần cân bằng, chênh z)”.
+- Log mới lưu riêng điểm LONG, điểm SHORT và độ chênh để debug rõ ràng hơn; log cũ vẫn được đọc lại từ phần ghi chú nếu có.
