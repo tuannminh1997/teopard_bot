@@ -4819,14 +4819,18 @@ def _format_model_level_map(
             level_text = fmt(low) if abs(high - low) <= 1e-9 else f"{fmt(low)}–{fmt(high)}"
             dist = abs(float(item["anchor"]) - price)
             pct = dist / max(price, 1e-12) * 100.0
-            labels = " + ".join(item.get("labels", [])[:3])
-            parts.append(f"{item['id']}={level_text} ({labels}, cách {fmt(dist)} / {pct:.2f}%)")
+            labels = " + ".join(item.get("labels", [])[:5])
+            kind = "vùng" if abs(high - low) > 1e-9 else "mốc neo"
+            parts.append(
+                f"{item['id']}={level_text} [{kind}] ({labels}, cách {fmt(dist)} / {pct:.2f}%)"
+            )
         return title + ": " + "; ".join(parts)
 
     return "\n".join([
         "BẢN ĐỒ LEVEL ĐÃ GỘP — dùng ID trong block nguồn, không show user:",
         compact("A", "- Phía trên giá"),
         compact("B", "- Phía dưới giá"),
+        "- Mốc neo là giá tham chiếu cấu trúc, KHÔNG phải hai biên Entry. Model phải tự đọc nến/EMA/cụm level để tạo vùng giao dịch có bề rộng thực tế quanh mốc neo; không được lấy mốc rồi cộng/trừ vài chữ số thập phân tùy ý.",
         "- CURRENT chỉ được dùng làm nguồn Entry khi giá hiện tại nằm trong vùng Entry và xác nhận đã đủ.",
     ])
 
@@ -4845,12 +4849,14 @@ def _format_model_plan_contract(
     return "\n".join([
         "NGUYÊN TẮC LẬP ENTRY/SL/TP — dùng nội bộ, không show user:",
         f"- Vai trò timeframe: {_mode_role_text(mode)}",
-        "1. Entry phải nằm tại một vùng kỹ thuật rõ ràng, không đuổi theo giá.",
-        "2. SL phải nằm ngoài điểm vô hiệu của ý tưởng giao dịch. Không đặt SL chỉ dựa trên một khoảng phần trăm hoặc ATR tùy ý.",
-        "3. TP1 và TP2 phải nằm tại các mục tiêu cấu trúc có ý nghĩa theo hướng giao dịch. TP1 là mục tiêu gần đáng chốt; TP2 là mục tiêu mở rộng kế tiếp. Không đặt TP chỉ để đạt một tỷ lệ RR tối thiểu.",
-        "4. Sau khi chọn các mức theo cấu trúc, mới kiểm tra RR. Nếu RR không đáng thực hiện, hãy cải thiện Entry hoặc chọn NO TRADE; không bóp SL và không bịa TP để làm đẹp RR.",
-        "- Trình tự: chọn ID nguồn level → chọn Entry, SL, TP1, TP2 bám nguồn đó → kiểm tra RR → giữ kế hoạch hoặc NO TRADE.",
-        "- Nếu LONG/SHORT, bắt buộc khai báo ID nguồn trong block [[TEOPARD_PLAN_SOURCES]]. Không chọn số nằm giữa hai level nếu không có nguồn cấu trúc rõ; Python còn reject TP quá sát theo RR và ATR nhưng không công bố mốc để tránh neo số.",
+        "1. Trước tiên phải viết nội bộ luận điểm giao dịch: hướng, vùng vô hiệu và hai mục tiêu cấu trúc. Chỉ sau đó mới chọn con số; không bắt đầu từ việc tìm một bộ số có RR đẹp.",
+        "2. Entry là một vùng đấu giá thực tế, không phải một điểm giả dạng thành range. Hai biên phải xuất phát từ biên nến, cụm EMA/Fibonacci hoặc nhiều level hội tụ trong dữ liệu. Cấm tạo vùng chỉ rộng vài tick/vài chữ số thập phân nếu dữ liệu không cho thấy một vùng hẹp như vậy.",
+        "3. ID nguồn ENTRY là mốc neo của vùng, không bắt buộc là một trong hai biên. Hãy dùng raw candles và độ biến động đang có để quyết định hai biên bằng phân tích của chính model; không dùng công thức cố định và không chờ Python sửa.",
+        "4. SL phải nằm ngoài điểm vô hiệu thật của luận điểm. TP1/TP2 phải là các mục tiêu cấu trúc kế tiếp, theo đúng thứ tự khoảng cách; không chọn các số trung gian chỉ để làm đẹp RR.",
+        "5. Tự kiểm tra tính thực dụng trước khi trả lời: Entry có đủ rộng để giá thật sự khớp nhưng không quá rộng; SL không nằm trong nhiễu thông thường; TP1/TP2 không phải các số nội suy vô căn cứ; kế hoạch vẫn hợp lý khi nhìn bằng đơn vị phần trăm và ATR của chính dữ liệu.",
+        "6. Nếu không thể giải thích nguồn của từng biên Entry và từng mức SL/TP từ dữ liệu đã cho, chọn NO TRADE thay vì xuất số có độ chính xác giả.",
+        "- Trình tự bắt buộc: luận điểm → chọn ID nguồn → tạo vùng Entry từ hành vi giá thật → chọn invalidation/targets → kiểm tra RR → giữ kế hoạch hoặc NO TRADE.",
+        "- Nếu LONG/SHORT, bắt buộc khai báo ID nguồn trong block [[TEOPARD_PLAN_SOURCES]]. Python chỉ parse/validate; mọi con số công khai phải là kết quả phân tích nguyên bản của model.",
     ])
 
 def build_feature_engineering_block(

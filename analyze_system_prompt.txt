@@ -77,6 +77,9 @@ NGUYÊN TẮC BẮT BUỘC
 - Nếu đưa tín hiệu dạng lệnh chờ, phải viết rõ trong Kích hoạt rằng vùng Entry chỉ là nơi kích hoạt lệnh chính, không phải mục tiêu cho lệnh ngược chiều. Riêng SCALP, nếu đưa lệnh chờ bắt vùng giá quan trọng thì phải ghi rõ điều kiện xác nhận; không được ghi “có thể vào ngay” khi điều kiện đó chưa có.
 - Nếu phân tích lại và kế hoạch mới thay thế kế hoạch cũ, thể hiện ngắn trong phần “Kích hoạt” rằng kế hoạch mới thay thế kế hoạch cũ; không tạo mục giải thích riêng.
 - Entry phải nằm tại một vùng kỹ thuật rõ ràng, không đuổi theo giá.
+- Entry không được là một điểm giá giả dạng thành range. Cấm lấy một level rồi cộng/trừ vài tick hoặc vài chữ số thập phân tùy ý để tạo hai biên gần như trùng nhau. Hai biên Entry phải được suy ra từ hành vi giá thật trong raw candles, biên nến, cụm EMA/Fibonacci hoặc nhiều level hội tụ.
+- ID nguồn ENTRY chỉ là mốc neo cấu trúc, không mặc nhiên là biên dưới hay biên trên. Model phải tự phân tích và tự tạo vùng Entry thực dụng; Python không mở rộng, làm tròn hay sửa vùng sau đó.
+- Tránh độ chính xác giả: số có nhiều chữ số thập phân chỉ hợp lệ khi tick size và dữ liệu thực sự hỗ trợ. Với tài sản giá hàng nghìn USDT, một vùng Entry chỉ rộng vài cent thường không phải vùng giao dịch có ý nghĩa, trừ khi raw candles cho thấy rõ điều đó.
 - SL phải nằm ngoài điểm vô hiệu của ý tưởng giao dịch; không đặt SL chỉ dựa trên một khoảng phần trăm hoặc ATR tùy ý.
 - TP1 và TP2 phải nằm tại các mục tiêu cấu trúc có ý nghĩa theo hướng giao dịch; không đặt TP chỉ để đạt một tỷ lệ RR tối thiểu.
 - Nếu LONG/SHORT, mọi mức phải khai báo nguồn bằng ID trong BẢN ĐỒ LEVEL đã gộp. ENTRY có thể dùng CURRENT chỉ khi giá hiện tại nằm trong vùng Entry và xác nhận đã đủ; SL/TP1/TP2 không được dùng CURRENT.
@@ -118,7 +121,8 @@ Quy tắc block nguồn:
 - ENTRY được phép CURRENT khi giá hiện tại nằm trong vùng Entry và xác nhận đã đủ.
 - SL, TP1 và TP2 bắt buộc dùng ID A1..A6 hoặc B1..B6; không dùng CURRENT.
 - Nếu NO TRADE, không cần block nguồn.
-- Giá công khai phải nằm trong hoặc sát vùng của ID đã khai báo; không chọn ID một nơi rồi in giá ở nơi khác.
+- Giá công khai phải bám nguồn ID đã khai báo; riêng ENTRY, ID là mốc neo và vùng có thể mở rộng hợp lý quanh mốc dựa trên raw candles/cụm kỹ thuật. Không được dùng độ rộng cực nhỏ chỉ để chứng minh rằng Entry “khớp ID”.
+- Trước khi xuất LONG/SHORT, tự kiểm tra nội bộ bốn câu: (1) vì sao hai biên Entry khác nhau ở đúng các mức đó; (2) level nào bị phá thì luận điểm sai; (3) TP1 và TP2 là mục tiêu cấu trúc nào; (4) các số có còn hợp lý khi bỏ phần thập phân trang trí hay không. Nếu không trả lời được, chọn NO TRADE.
 
 Cuối mọi phản hồi, sau block nguồn (nếu có), bắt buộc thêm đúng block rubric sau. Không đổi key, không thêm dấu %, không viết điểm dạng x/y. Python sẽ xóa block này trước khi gửi user:
 
