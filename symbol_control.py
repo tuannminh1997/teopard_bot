@@ -612,7 +612,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Mode đang quét: {modes}.\n"
         f"DeepSeek mini-rubric tối thiểu: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100.\n"
         f"Chênh lệch LONG/SHORT tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm.\n"
-        f"AI cuối gửi tín hiệu tối thiểu: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100.\n"
+        f"Điểm tín hiệu AI cuối tối thiểu: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100.\n"
         f"Giới hạn gọi AI cuối: {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
         "Đủ quota thì Auto Scan tự dừng; 07:00 sáng hôm sau tự bật và reset quota.\n"
         "Giờ nghỉ tự động: 00:00-07:00 theo giờ Việt Nam; sáng bot tự bật lại nếu trước đó đang bật.\n"
@@ -738,12 +738,15 @@ def _extract_prefilter_pair(item: dict | None) -> tuple[int | None, int | None, 
 def _display_prefilter_score(item: dict | None) -> str:
     """DeepSeek prefilter user-facing display.
 
-    Avoid showing `NEUTRAL 43/100`, because 43 is just the stronger side's score.
-    For neutral/gap rejects, show both LONG and SHORT so the log is self-explanatory.
+    Avoid showing fake `LONG 0 / SHORT 0` when the Flash response was not parseable.
+    0/100 should only be shown when it was a real parsed score.
     """
     item = item or {}
+    reason = str(item.get("reason") or "")
+    if "Không parse được mini-rubric" in reason or "Khong parse duoc mini-rubric" in reason:
+        return "Không parse được mini-rubric"
+
     direction = _display_scan_direction(item.get("pre_direction"))
-    confidence = _int_or_none(item.get("pre_confidence"))
     long_score, short_score, gap = _extract_prefilter_pair(item)
 
     if long_score is not None and short_score is not None:
@@ -806,7 +809,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         f"AI cuối: {get_ai_model_name()} ({get_ai_provider_label()})\n"
         f"Ngưỡng mini-rubric DeepSeek: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100\n"
         f"Chênh lệch hướng tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm\n"
-        f"Ngưỡng gửi tín hiệu AI cuối: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100\n"
+        f"Ngưỡng Điểm tín hiệu AI cuối: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100\n"
         f"Quota gọi AI cuối hôm nay: {status.get('glm_calls_today', 0)}/{AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} "
         f"(còn {status.get('glm_calls_remaining', AUTO_SCAN_MAX_GLM_CALLS_PER_DAY)} lượt)\n"
         f"Cooldown cùng symbol/mode: {AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES} phút\n"

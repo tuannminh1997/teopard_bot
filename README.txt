@@ -83,8 +83,7 @@ DEEPSEEK_FINAL_RETRY_REASONING_EFFORT="high"
 AUTO_SCAN_INTERVAL_SECONDS="900"
 AUTO_SCAN_MIN_PREFILTER_CONFIDENCE="62"
 AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP="5"
-AUTO_SCAN_MIN_FINAL_CONFIDENCE="62"
-AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH="62"
+AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE="62"
 AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY="5"
 AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES="180"
 AUTO_SCAN_SLEEP_HOUR_VN="0"
@@ -129,15 +128,15 @@ Admin:
 - `/clearhistory CONFIRM`
 - `/cleardrafts ALL CONFIRM`
 
-## Scoring V39 — Python objective scores
+## Scoring V43 — model confidence + Python plan quality
 
-Bản này đổi cách chấm điểm cuối:
+Bản này đổi lại cách chấm điểm cuối để tránh Python over-filter:
 
 - Model vẫn chọn LONG/SHORT/NO TRADE và lập Entry/SL/TP.
 - Model vẫn trả rubric nội bộ để kiểm tra format/fallback.
-- Python chấm lại Chất lượng kế hoạch và Điểm chắc chắn bằng dữ liệu cứng.
+- Python chỉ chấm lại một Điểm tín hiệu duy nhất do model cuối tự chấm. Python chỉ parse điểm này và guard lỗi cứng Entry/SL/TP/RR.
 
-Chất lượng kế hoạch chỉ đo chất lượng kế hoạch:
+Rubric Điểm tín hiệu gồm 5 mục: hướng/bối cảnh, Entry/timing, SL/TP/RR, mâu thuẫn/rủi ro nhiễu và thực thi thực tế.
 
 - Entry đúng vùng kỹ thuật.
 - SL nằm ngoài điểm vô hiệu.
@@ -146,7 +145,7 @@ Chất lượng kế hoạch chỉ đo chất lượng kế hoạch:
 - Điều kiện kích hoạt rõ.
 - Rủi ro nhiễu/thực thi.
 
-Điểm chắc chắn chỉ đo hướng model chọn có được dữ liệu ủng hộ hay không:
+Điểm tín hiệu do model cuối tự đánh giá dựa trên dữ liệu được cung cấp:
 
 - Đồng thuận hướng đa khung.
 - Cấu trúc thị trường.
@@ -155,20 +154,39 @@ Chất lượng kế hoạch chỉ đo chất lượng kế hoạch:
 - Volume và taker flow.
 - Mức mâu thuẫn/kịch bản đối lập.
 
-Output public đổi từ “Điểm chắc chắn: x%” sang “Điểm chắc chắn: x/100” để tránh hiểu nhầm đây là xác suất thắng đã được backtest.
+Output public chỉ dùng “Điểm tín hiệu: x/100”; không còn Chất lượng kế hoạch/Độ chắc chắn/Độ mạnh setup.
 
 ## V41 — model-authoritative evidence flow
 
 Bản này bỏ việc đưa preferred_direction, LONG support và SHORT support vào prompt AI cuối để tránh Python neo hướng model. DeepSeek Flash vẫn tự lọc nhanh từ snapshot kỹ thuật rút gọn để tiết kiệm chi phí, nhưng kết quả Flash không ép hướng AI cuối.
 
-AI cuối nhận dữ liệu đầy đủ đã cải thiện: snapshot đồng bộ, EMA7/25/50 interaction, nến live 1H/4H chuẩn hóa theo tiến độ, chuỗi RSI/MACD/EMA/return, high/low cấu trúc và taker imbalance. Sau khi AI cuối tự chọn LONG/SHORT/NO TRADE, Python mới hậu kiểm Điểm chắc chắn và Chất lượng kế hoạch Entry/SL/TP.
+AI cuối nhận dữ liệu đầy đủ đã cải thiện: snapshot đồng bộ, EMA7/25/50 interaction, nến live 1H/4H chuẩn hóa theo tiến độ, chuỗi RSI/MACD/EMA/return, high/low cấu trúc và taker imbalance. Sau khi AI cuối tự chọn LONG/SHORT/NO TRADE, Python chỉ parse Điểm tín hiệu và guard lỗi cứng Entry/SL/TP/RR.
 
 Log vì vậy đọc theo thứ tự:
 - DeepSeek Flash: lọc nhanh ứng viên LONG/SHORT từ snapshot rút gọn để tiết kiệm chi phí.
 - AI cuối: tự quyết định LONG/SHORT/NO TRADE từ dữ liệu đầy đủ, không bị scorecard Python dẫn hướng.
-- Python: hậu kiểm Điểm chắc chắn và Chất lượng kế hoạch.
+- Python: chỉ parse Điểm tín hiệu và guard lỗi cứng Entry/SL/TP/RR.
 
 Cập nhật V42 - Auto Scan log dễ đọc hơn:
 - DeepSeek prefilter không còn hiển thị kiểu “NEUTRAL 43/100”.
 - Khi LONG và SHORT gần cân bằng, /autoscanstatus và /autoscanlog hiển thị cả hai điểm: “LONG x/100 | SHORT y/100 (gần cân bằng, chênh z)”.
 - Log mới lưu riêng điểm LONG, điểm SHORT và độ chênh để debug rõ ràng hơn; log cũ vẫn được đọc lại từ phần ghi chú nếu có.
+
+## V42 Auto Scan prefilter
+- DeepSeek Flash chấm điểm lọc nhanh LONG/SHORT. Python chỉ parse, cộng điểm, kiểm tra ngưỡng và độ chênh để quyết định có gọi AI cuối hay không.
+- Nếu không parse được format của Flash, /autoscanlog sẽ ghi "Không parse được mini-rubric", không hiển thị LONG 0/SHORT 0 như điểm thật.
+- AI cuối không nhận điểm LONG/SHORT của Flash để tránh bị neo hướng; AI cuối vẫn tự quyết định LONG / SHORT / NO TRADE từ snapshot đầy đủ.
+
+
+Cập nhật V43 - không dùng Python confidence làm gate mặc định:
+- AI cuối vẫn tự chọn LONG/SHORT/NO TRADE và tự chấm Điểm tín hiệu qua rubric nội bộ.
+- Python không chấm rubric cuối; chỉ guard lỗi cứng Entry/SL/TP/RR.
+- Điểm kiểm tra dữ liệu Python vẫn được tính để debug, nhưng không chặn Auto Scan mặc định vì dễ quá bảo thủ trong thị trường chuyển pha.
+- Muốn bật lại gate dữ liệu Python thì set AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE=1, nhưng mặc định nên để 0.
+
+
+Cập nhật V44 - một rubric cuối duy nhất:
+- AI cuối tự chọn LONG/SHORT/NO TRADE và tự chấm Điểm tín hiệu /100.
+- Python không tự chấm confidence/setup nữa; chỉ parse Điểm tín hiệu, lọc ngưỡng và guard lỗi cứng Entry/SL/TP/RR.
+- Output user chỉ còn: QUYẾT ĐỊNH, Điểm tín hiệu, Entry/SL/TP, Kích hoạt và Rủi ro. Không hiện Kịch bản chính, Chất lượng kế hoạch hay Điểm tin cậy AI.
+- Auto Scan gửi user khi Điểm tín hiệu >= AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE và kế hoạch không lỗi cứng.

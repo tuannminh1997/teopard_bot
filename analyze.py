@@ -143,8 +143,16 @@ AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
     0,
     min(100, int(os.getenv("AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP", "5"))),
 )
-AUTO_SCAN_MIN_FINAL_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", "62"))
-AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH = int(os.getenv("AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH", "62"))
+# V44: Auto Scan dùng 1 rubric cuối duy nhất do AI cuối tự chấm: Điểm tín hiệu /100.
+# Tên mới được ưu tiên; tên cũ giữ fallback để deploy không vỡ nếu Railway còn biến cũ.
+AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE = int(os.getenv(
+    "AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE",
+    os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", "62"),
+))
+# Backward-compatible aliases. Không còn dùng 2 gate confidence + setup nữa.
+AUTO_SCAN_MIN_FINAL_CONFIDENCE = AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
+AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH = AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
+AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE = os.getenv("AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE", "0").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES", "180"))
 AUTO_SCAN_MAX_SYMBOLS_PER_RUN = 1  # Auto Scan chỉ cho 1 symbol/user để tránh lãng phí tài nguyên.
 AUTO_SCAN_SEND_NO_TRADE = os.getenv("AUTO_SCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -3847,14 +3855,28 @@ def _tp_noise_atr(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> 
         atr_val = None
     return label, atr_val
 
-MIN_ACTION_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", 62.0)
-MIN_ACTION_CONFIDENCE_SWING = _env_float("TEOPARD_MIN_SWING_CONFIDENCE", MIN_ACTION_CONFIDENCE_SCALP)
-MIN_SETUP_STRENGTH = _env_float("TEOPARD_MIN_SETUP_STRENGTH", 62.0)
+# V44 scoring: chỉ còn 1 điểm cuối do model cuối tự chấm: Điểm tín hiệu /100.
+# Tên mới được ưu tiên; tên cũ giữ fallback để DB/Railway cũ không vỡ.
+MIN_SIGNAL_SCORE = _env_float(
+    "TEOPARD_MIN_SIGNAL_SCORE",
+    _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", 62.0),
+)
+MIN_ACTION_CONFIDENCE_SCALP = MIN_SIGNAL_SCORE
+MIN_ACTION_CONFIDENCE_SWING = _env_float("TEOPARD_MIN_SWING_CONFIDENCE", MIN_SIGNAL_SCORE)
+MIN_SETUP_STRENGTH = _env_float("TEOPARD_MIN_SETUP_STRENGTH", MIN_SIGNAL_SCORE)
 MIN_REVERSAL_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_REVERSAL_CONFIDENCE", 50.0)
 MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = _env_float("TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE", 52.0)
 
-# V39 scoring: model chọn hướng/kế hoạch, Python chấm lại bằng dữ liệu khách quan.
-# Setup Strength chỉ đo chất lượng kế hoạch Entry-SL-TP, tránh đếm trùng xu hướng/momentum.
+# Rubric cuối 100 điểm. Model tự chấm; Python chỉ parse tổng và guard lỗi cứng.
+SIGNAL_SCORE_WEIGHTS = {
+    "huong_boi_canh_da_khung": 30.0,
+    "entry_timing": 20.0,
+    "sl_tp_rr": 25.0,
+    "mau_thuan_rui_ro_nhieu": 15.0,
+    "thuc_thi_thuc_te": 10.0,
+}
+
+# Legacy weights giữ lại cho debug/data_support nội bộ và đọc output cũ nếu cần.
 SETUP_SCORE_WEIGHTS = {
     "entry_dung_vung": 25.0,
     "sl_dung_diem_vo_hieu": 20.0,
@@ -3863,8 +3885,6 @@ SETUP_SCORE_WEIGHTS = {
     "dieu_kien_kich_hoat_ro": 10.0,
     "rui_ro_nhieu_thuc_thi": 10.0,
 }
-
-# Confidence đo mức dữ liệu ủng hộ hướng model đã chọn, không đo lại Entry/SL/TP.
 CONFIDENCE_SCORE_WEIGHTS = {
     "dong_thuan_huong_da_khung": 20.0,
     "cau_truc_thi_truong": 20.0,
@@ -5592,11 +5612,11 @@ def build_user_prompt(
         "- Quyết định cuối cùng chỉ là LONG, SHORT hoặc NO TRADE.",
         "- Nếu LONG/SHORT phải có đủ Entry, SL, TP1, TP2 là số cụ thể.",
         "- Nếu LONG/SHORT, trước block rubric bắt buộc có block [[TEOPARD_PLAN_SOURCES]] gồm ENTRY, SL, TP1, TP2 và dùng đúng ID A1..A6/B1..B6 trong BẢN ĐỒ LEVEL; ENTRY được phép CURRENT khi giá đang nằm trong Entry và xác nhận đã đủ. Python sẽ ẩn block này.",
-        "- Cuối phản hồi bắt buộc có block [[TEOPARD_RUBRIC]] đúng key mới và đủ 12 dòng điểm; Python sẽ ẩn block rồi chấm lại bằng dữ liệu cứng.",
-        "- Không tự in tổng Độ mạnh setup/Điểm chắc chắn; Python sẽ chấm lại khách quan và chèn hai tổng sau dòng QUYẾT ĐỊNH.",
+        "- Cuối phản hồi bắt buộc có block [[TEOPARD_RUBRIC]] đúng key V44 và đủ 5 dòng SIGNAL; Python sẽ ẩn block, cộng thành Điểm tín hiệu /100 và dùng điểm đó để filter.",
+        "- Không tự in Điểm tín hiệu trong phần public; Python sẽ chèn đúng một dòng Điểm tín hiệu dưới dòng QUYẾT ĐỊNH.",
         "- Bot không cung cấp dữ liệu thanh lý/heatmap; không được suy đoán chúng từ OHLCV. Dùng cấu trúc, Fibonacci, EMA, ATR, volume, nến đã đóng và block nến live trung lập đã được Python tách riêng.",
         "- Nến live giúp nhận biết sớm tương tác EMA/chuyển động đang hình thành, nhưng không được mô tả như một nến đã đóng hoặc một xác nhận đã hoàn tất.",
-        "- Nếu chưa đủ setup hợp lý thì chọn NO TRADE.",
+        "- Nếu Điểm tín hiệu dưới ngưỡng hoặc chưa đủ setup hợp lý thì chọn NO TRADE.",
     ]
     return "\n".join(str(x) for x in parts if x is not None)
 
@@ -6668,21 +6688,31 @@ def apply_python_objective_scores(
     mode: str,
     current_price: float | None,
 ) -> tuple[dict, str]:
-    """Override model rubric with Python objective scores for final user text and guards."""
+    """V44: không để Python chấm điểm cuối nữa.
+
+    Model cuối tự chấm 1 rubric duy nhất: Điểm tín hiệu /100. Python chỉ tính
+    data_support_score và plan_quality_debug để lưu debug/log nếu cần, không chèn
+    ra output và không dùng làm gate mặc định.
+    """
     direction = (pred.get("direction") or "").upper()
     if direction not in ("LONG", "SHORT"):
         return pred, output
+
     scored = dict(pred)
-    setup_breakdown = _python_setup_score_breakdown(scored, timeframe_data, mode, current_price, output)
-    confidence_breakdown = _python_confidence_score_breakdown(scored, timeframe_data, mode, current_price)
-    setup_strength = _rubric_total(setup_breakdown, SETUP_SCORE_WEIGHTS)
-    confidence = _rubric_total(confidence_breakdown, CONFIDENCE_SCORE_WEIGHTS)
-    scored["setup_strength"] = setup_strength
-    scored["confidence"] = confidence
-    scored["setup_score_breakdown"] = setup_breakdown
-    scored["confidence_score_breakdown"] = confidence_breakdown
-    scored["_score_engine"] = "python_objective_v39"
-    return scored, _insert_public_scores(output, setup_strength, confidence)
+    try:
+        setup_breakdown = _python_setup_score_breakdown(scored, timeframe_data, mode, current_price, output)
+        scored["plan_quality_debug"] = _rubric_total(setup_breakdown, SETUP_SCORE_WEIGHTS)
+        scored["setup_score_breakdown_debug"] = setup_breakdown
+    except Exception:
+        scored["plan_quality_debug"] = None
+    try:
+        data_support_breakdown = _python_confidence_score_breakdown(scored, timeframe_data, mode, current_price)
+        scored["data_support_score"] = _rubric_total(data_support_breakdown, CONFIDENCE_SCORE_WEIGHTS)
+        scored["data_support_breakdown"] = data_support_breakdown
+    except Exception:
+        scored["data_support_score"] = None
+    scored["_score_engine"] = "model_signal_score_python_hard_guard_v44"
+    return scored, output
 
 
 def _objective_direction_payload(
@@ -6826,7 +6856,7 @@ def _evaluate_objective_direction_gate(payload: dict | None) -> dict:
 
 
 def _extract_rubric_breakdowns(output: str | None) -> tuple[dict, dict]:
-    """Đọc block máy [[TEOPARD_RUBRIC]] do model trả ở cuối output."""
+    """Legacy parser for old 2-rubric blocks. Kept for backward compatibility."""
     text = output or ""
     match = re.search(
         r"\[\[TEOPARD_RUBRIC\]\]([\s\S]*?)\[\[/TEOPARD_RUBRIC\]\]",
@@ -6857,6 +6887,47 @@ def _extract_rubric_breakdowns(output: str | None) -> tuple[dict, dict]:
     return setup, confidence
 
 
+def _extract_signal_rubric_breakdown(output: str | None) -> dict:
+    """V44 parser: one final model-scored rubric named SIGNAL."""
+    text = output or ""
+    match = re.search(
+        r"\[\[TEOPARD_RUBRIC\]\]([\s\S]*?)\[\[/TEOPARD_RUBRIC\]\]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return {}
+    breakdown: dict[str, float] = {}
+    aliases = {
+        "huong_boi_canh_da_khung": "huong_boi_canh_da_khung",
+        "huong_va_boi_canh_da_khung": "huong_boi_canh_da_khung",
+        "direction_context": "huong_boi_canh_da_khung",
+        "entry_timing": "entry_timing",
+        "entry_va_timing": "entry_timing",
+        "sl_tp_rr": "sl_tp_rr",
+        "sltp_rr": "sl_tp_rr",
+        "mau_thuan_rui_ro_nhieu": "mau_thuan_rui_ro_nhieu",
+        "mau_thuan_va_rui_ro_nhieu": "mau_thuan_rui_ro_nhieu",
+        "contradiction_noise": "mau_thuan_rui_ro_nhieu",
+        "thuc_thi_thuc_te": "thuc_thi_thuc_te",
+        "execution": "thuc_thi_thuc_te",
+    }
+    for raw_line in match.group(1).splitlines():
+        line = raw_line.strip()
+        m = re.fullmatch(
+            r"(?:SIGNAL|SCORE|FINAL)\s+([a-z0-9_]+)\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            continue
+        raw_key = m.group(1).lower()
+        key = aliases.get(raw_key, raw_key)
+        if key in SIGNAL_SCORE_WEIGHTS:
+            breakdown[key] = float(m.group(2))
+    return breakdown
+
+
 def _remove_rubric_block(output: str | None) -> str:
     return re.sub(
         r"\n?\s*\[\[TEOPARD_RUBRIC\]\][\s\S]*?\[\[/TEOPARD_RUBRIC\]\]\s*",
@@ -6867,10 +6938,10 @@ def _remove_rubric_block(output: str | None) -> str:
 
 
 def _extract_legacy_confidence(output: str | None) -> float | None:
-    """Chỉ dùng để tương thích output text cũ khi model lỡ thiếu rubric."""
+    """Compatibility parser: accepts old confidence labels and new Điểm tín hiệu."""
     text = output or ""
     patterns = [
-        r"(?:Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn)\s*:\s*([0-9]+(?:\.[0-9]+)?)(?:\s*(?:%|/\s*100))?",
+        r"(?:Điểm\s+tín\s+hiệu|Diem\s+tin\s+hieu|Signal\s+score|Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn|Điểm\s+tin\s+cậy\s+AI)\s*:\s*([0-9]+(?:\.[0-9]+)?)(?:\s*(?:%|/\s*100))?",
         r"QUYẾT\s+ĐỊNH[:\s]+(?:LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
         r"(?:📈|📉)?\s*(?:LONG|SHORT|NO[_\s-]?TRADE)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
     ]
@@ -6884,12 +6955,8 @@ def _extract_legacy_confidence(output: str | None) -> float | None:
     return None
 
 
-def _insert_public_scores(
-    output: str,
-    setup_strength: float | None,
-    confidence: float | None,
-) -> str:
-    """Bỏ % kiểu cũ và chèn hai tổng do Python tính ngay dưới QUYẾT ĐỊNH."""
+def _insert_public_signal_score(output: str, signal_score: float | None) -> str:
+    """Chèn đúng 1 dòng public: Điểm tín hiệu: x/100 dưới QUYẾT ĐỊNH."""
     text = output or ""
     text = re.sub(
         r"(^\s*🏆\s*QUYẾT\s+ĐỊNH\s*:\s*(?:LONG|SHORT|NO\s+TRADE))\s*[—\-]\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$",
@@ -6903,45 +6970,48 @@ def _insert_public_scores(
         text,
         flags=re.IGNORECASE | re.MULTILINE,
     )
-    text = re.sub(r"^\s*(?:Độ\s+mạnh\s+setup|Chất\s+lượng\s+kế\s+hoạch)\s*:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
-    text = re.sub(r"^\s*(?:Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn)\s*:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
-
-    setup_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
-    confidence_text = f"{confidence:.0f}/100" if confidence is not None else "N/A"
-    score_lines = [f"Chất lượng kế hoạch: {setup_text}", f"Điểm chắc chắn: {confidence_text}"]
+    text = re.sub(
+        r"^\s*(?:Độ\s+mạnh\s+setup|Chất\s+lượng\s+kế\s+hoạch|Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn|Điểm\s+tin\s+cậy\s+AI|Điểm\s+tín\s+hiệu)\s*:[^\n]*\n?",
+        "",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    score_text = f"Điểm tín hiệu: {signal_score:.0f}/100" if signal_score is not None else "Điểm tín hiệu: N/A"
 
     lines = text.splitlines()
     for index, line in enumerate(lines):
         if re.search(r"QUYẾT\s+ĐỊNH\s*:", line, flags=re.IGNORECASE):
-            lines[index + 1:index + 1] = score_lines
+            lines[index + 1:index + 1] = [score_text]
             return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-    return "\n".join(score_lines + [text]).strip()
+    return "\n".join([score_text, text]).strip()
+
+
+def _insert_public_scores(output: str, setup_strength: float | None, confidence: float | None) -> str:
+    """Compatibility wrapper. V44 chỉ show Điểm tín hiệu."""
+    return _insert_public_signal_score(output, confidence)
 
 
 def finalize_model_scoring_output(output: str | None) -> tuple[str, dict]:
-    """Model chấm từng mục; Python cộng tổng, ẩn rubric và render hai điểm public."""
+    """V44: model tự chấm 1 rubric SIGNAL; Python chỉ cộng tổng và ẩn block."""
     raw_text = output or ""
     has_rubric_block = bool(re.search(
         r"\[\[TEOPARD_RUBRIC\]\][\s\S]*?\[\[/TEOPARD_RUBRIC\]\]",
         raw_text,
         flags=re.IGNORECASE,
     ))
-    setup_breakdown, confidence_breakdown = _extract_rubric_breakdowns(raw_text)
-    setup_strength = _rubric_total(setup_breakdown, SETUP_SCORE_WEIGHTS)
-    confidence = _rubric_total(confidence_breakdown, CONFIDENCE_SCORE_WEIGHTS)
+    signal_breakdown = _extract_signal_rubric_breakdown(raw_text)
+    signal_score = _rubric_total(signal_breakdown, SIGNAL_SCORE_WEIGHTS)
+    if signal_score is None and not has_rubric_block:
+        signal_score = _extract_legacy_confidence(raw_text)
+
     clean = _remove_plan_sources_block(_remove_rubric_block(raw_text))
-
-    # Chỉ tương thích output hoàn toàn cũ không có block. Block đã có nhưng thiếu mục thì phải reject.
-    if confidence is None and not has_rubric_block:
-        confidence = _extract_legacy_confidence(clean)
-
-    clean = _insert_public_scores(clean, setup_strength, confidence)
+    clean = _insert_public_signal_score(clean, signal_score)
     return clean, {
-        "setup_strength": setup_strength,
-        "confidence": confidence,
-        "setup_score_breakdown": setup_breakdown,
-        "confidence_score_breakdown": confidence_breakdown,
+        "signal_score": signal_score,
+        "confidence": signal_score,
+        "signal_score_breakdown": signal_breakdown,
     }
+
 
 def _clean_decision(value: str | None) -> str:
     raw = str(value or "").upper().replace("-", "_").replace(" ", "_")
@@ -6956,12 +7026,16 @@ def parse_prediction_from_json_payload(payload: dict | None) -> dict:
     if not isinstance(payload, dict):
         return {"direction": "WAIT", "confidence": None, "entry_low": None, "entry_high": None, "sl": None, "tp1": None, "tp2": None}
     decision = _clean_decision(payload.get("decision"))
-    setup_strength = _rubric_total(payload.get("setup_score_breakdown"), SETUP_SCORE_WEIGHTS)
-    confidence = _rubric_total(payload.get("confidence_score_breakdown"), CONFIDENCE_SCORE_WEIGHTS)
-    if confidence is None:
-        confidence = _num_or_none(payload.get("confidence"))
+    signal_score = _rubric_total(payload.get("signal_score_breakdown"), SIGNAL_SCORE_WEIGHTS)
+    if signal_score is None:
+        signal_score = _num_or_none(payload.get("signal_score"))
+    if signal_score is None:
+        signal_score = _num_or_none(payload.get("confidence"))
+    setup_strength = None
+    confidence = signal_score
     return {
         "direction": decision,
+        "signal_score": signal_score,
         "setup_strength": setup_strength,
         "confidence": confidence,
         "entry_low": _num_or_none(payload.get("entry_low")),
@@ -6982,10 +7056,13 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
     mode_label = "SCALP" if mode == "short" else "SWING"
     symbol = str(payload.get("symbol") or fallback_symbol).upper()
     decision = _clean_decision(payload.get("decision"))
-    setup_strength = _rubric_total(payload.get("setup_score_breakdown"), SETUP_SCORE_WEIGHTS)
-    confidence = _rubric_total(payload.get("confidence_score_breakdown"), CONFIDENCE_SCORE_WEIGHTS)
-    if confidence is None:
-        confidence = _num_or_none(payload.get("confidence"))
+    signal_score = _rubric_total(payload.get("signal_score_breakdown"), SIGNAL_SCORE_WEIGHTS)
+    if signal_score is None:
+        signal_score = _num_or_none(payload.get("signal_score"))
+    if signal_score is None:
+        signal_score = _num_or_none(payload.get("confidence"))
+    setup_strength = None
+    confidence = signal_score
     current_price = _num_or_none(payload.get("current_price"))
     if current_price is None:
         current_price = fallback_current_price
@@ -6998,8 +7075,7 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
     lines = [
         f"🎯 {symbol} — {mode_label}",
         f"🏆 QUYẾT ĐỊNH: {decision.replace('_', ' ')}",
-        f"Độ mạnh setup: {setup_strength:.0f}/100" if setup_strength is not None else "Độ mạnh setup: N/A",
-        f"Điểm chắc chắn: {confidence:.0f}/100" if confidence is not None else "Điểm chắc chắn: N/A",
+        f"Điểm tín hiệu: {confidence:.0f}/100" if confidence is not None else "Điểm tín hiệu: N/A",
         current_price_line,
     ]
 
@@ -7107,7 +7183,7 @@ def parse_prediction_from_output(output: str) -> dict:
 
     setup_strength = None
     setup_match = re.search(
-        r"Độ\s+mạnh\s+setup\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/\s*100)?",
+        r"(?:Độ\s+mạnh\s+setup|Chất\s+lượng\s+kế\s+hoạch)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/\s*100)?",
         output,
         flags=re.IGNORECASE,
     )
@@ -7117,26 +7193,14 @@ def parse_prediction_from_output(output: str) -> dict:
         except Exception:
             setup_strength = None
 
-    confidence = None
-    # Ưu tiên tổng rubric do Python đã render; fallback format phần trăm cũ.
-    conf_patterns = [
-        r"(?:Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn)\s*:\s*([0-9]+(?:\.[0-9]+)?)(?:\s*(?:%|/\s*100))?",
-        r"QUYẾT\s+ĐỊNH[:\s]+(?:LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
-        r"(?:📈|📉)?\s*(?:LONG|SHORT|NO[_\s-]?TRADE)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
-    ]
-    for pat in conf_patterns:
-        cm = re.search(pat, output, flags=re.IGNORECASE)
-        if cm:
-            try:
-                confidence = float(cm.group(1))
-                break
-            except Exception:
-                pass
+    signal_score = _extract_legacy_confidence(output)
+    confidence = signal_score
 
     return {
         "direction":  direction,
-        "setup_strength": setup_strength,
+        "signal_score": signal_score,
         "confidence": confidence,
+        "setup_strength": setup_strength,
         "entry_low":  entry_low,
         "entry_high": entry_high,
         "sl":         sl,
@@ -7324,27 +7388,20 @@ def _closed_row_momentum_flags(timeframe_data: dict[str, pd.DataFrame | None], d
 
 
 def _validate_model_scores(pred: dict, mode: str) -> list[str]:
-    """Cả manual SCALP/SWING đều phải đạt confidence và setup strength tối thiểu."""
+    """V44: chỉ gate bằng Điểm tín hiệu do AI cuối tự chấm."""
     if _guard_is_off():
         return []
 
     errors: list[str] = []
-    setup_strength = _num_or_none(pred.get("setup_strength"))
-    confidence = _num_or_none(pred.get("confidence"))
-    confidence_min = MIN_ACTION_CONFIDENCE_SCALP if mode == "short" else MIN_ACTION_CONFIDENCE_SWING
+    signal_score = _num_or_none(pred.get("signal_score"))
+    if signal_score is None:
+        signal_score = _num_or_none(pred.get("confidence"))
 
-    if setup_strength is None:
-        errors.append("Python chưa tính được Độ mạnh setup đầy đủ cho kế hoạch này.")
-    elif setup_strength < MIN_SETUP_STRENGTH:
+    if signal_score is None:
+        errors.append("AI cuối chưa trả Điểm tín hiệu đầy đủ cho kế hoạch này.")
+    elif signal_score < MIN_SIGNAL_SCORE:
         errors.append(
-            f"Độ mạnh setup chỉ {setup_strength:.1f}/100, dưới ngưỡng tối thiểu {MIN_SETUP_STRENGTH:.1f}/100."
-        )
-
-    if confidence is None:
-        errors.append("Python chưa tính được Điểm chắc chắn đầy đủ cho kế hoạch này.")
-    elif confidence < confidence_min:
-        errors.append(
-            f"Điểm chắc chắn chỉ {confidence:.1f}/100, dưới ngưỡng tối thiểu {confidence_min:.1f}/100 cho mode này."
+            f"Điểm tín hiệu chỉ {signal_score:.1f}/100, dưới ngưỡng tối thiểu {MIN_SIGNAL_SCORE:.1f}/100."
         )
     return errors
 
@@ -7657,10 +7714,10 @@ def _guarded_no_trade_output(
     price_text = f" Giá hiện tại {fmt(current_price)} USDT." if current_price is not None else ""
     reason = errors[0] if errors else "Kế hoạch LONG/SHORT bị bộ lọc rủi ro từ chối."
     pred_data = pred or {}
-    setup_strength = _num_or_none(pred_data.get("setup_strength"))
-    confidence = _num_or_none(pred_data.get("confidence"))
-    setup_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
-    confidence_text = f"{confidence:.0f}/100" if confidence is not None else "N/A"
+    signal_score = _num_or_none(pred_data.get("signal_score"))
+    if signal_score is None:
+        signal_score = _num_or_none(pred_data.get("confidence"))
+    signal_text = f"{signal_score:.0f}/100" if signal_score is not None else "N/A"
 
     rejected_direction = str(pred_data.get("direction") or "").upper()
     direction_line = ""
@@ -7681,8 +7738,7 @@ def _guarded_no_trade_output(
         f"🏆 QUYẾT ĐỊNH: NO TRADE\n"
         f"{direction_line}"
         f"{structure_line}"
-        f"Độ mạnh setup: {setup_text}\n"
-        f"Điểm chắc chắn: {confidence_text}\n"
+        f"Điểm tín hiệu: {signal_text}\n"
         f"Giá hiện tại: {fmt(current_price)} USDT\n"
         f"⚠️ Rủi ro: {reason}{price_text} Bot không lưu tín hiệu này; nếu cố vào lệnh, nguy cơ bị nhiễu hoặc quét SL ngắn hạn còn cao."
     )
@@ -8884,7 +8940,7 @@ def build_deepseek_prefilter_text(
         "LỊCH SỬ USER RÚT GỌN:",
         history_text,
         "",
-        "FORMAT TRẢ VỀ BẮT BUỘC, KHÔNG JSON, KHÔNG MARKDOWN:",
+        "FORMAT TRẢ VỀ BẮT BUỘC — CHỈ 13 DÒNG, KHÔNG JSON, KHÔNG MARKDOWN, KHÔNG THÊM GẠCH ĐẦU DÒNG:",
         "LONG_TREND: <0-25>",
         "LONG_STRUCTURE: <0-25>",
         "LONG_MOMENTUM: <0-20>",
@@ -8895,8 +8951,9 @@ def build_deepseek_prefilter_text(
         "SHORT_MOMENTUM: <0-20>",
         "SHORT_CONFIRMATION: <0-15>",
         "SHORT_SETUP_ROOM: <0-15>",
+        "LONG_SCORE: <0-100>",
+        "SHORT_SCORE: <0-100>",
         "BEST: LONG hoặc SHORT hoặc NEUTRAL",
-        "CALL_GLM: YES hoặc NO",
         "REASON: <một câu rất ngắn>",
     ])
 
@@ -8910,15 +8967,92 @@ _DEEPSEEK_MINI_RUBRIC_WEIGHTS = {
 }
 
 
+def _prefilter_key_variants(key: str) -> list[str]:
+    """Accepted labels for the DeepSeek Flash mini-rubric parser.
+
+    Flash is a cheap prefilter model, so sometimes it returns small label variants
+    despite being asked for exact text. These variants keep the system robust while
+    still requiring real LONG/SHORT numeric evidence instead of silently turning a
+    parse failure into 0/100.
+    """
+    k = (key or "").strip().lower()
+    variants = {
+        "trend": ["trend", "xu_huong", "xu hướng", "huong", "hướng"],
+        "structure": ["structure", "cau_truc", "cấu trúc", "vi_tri", "vị trí", "price_structure"],
+        "momentum": ["momentum", "dong_luong", "động lượng", "macd", "rsi"],
+        "confirmation": ["confirmation", "xac_nhan", "xác nhận", "volume", "nen", "nến"],
+        "setup_room": ["setup_room", "setup room", "setup", "room", "kha_nang", "khả năng", "setup_potential"],
+    }
+    return variants.get(k, [k])
+
+
+def _read_number_after_label(text: str, label_pattern: str, maximum: int) -> int | None:
+    patterns = [
+        rf"{label_pattern}\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+        rf"{label_pattern}\s+(-?\d+(?:\.\d+)?)\s*/\s*{maximum}",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        try:
+            return max(0, min(maximum, int(round(float(match.group(1))))))
+        except Exception:
+            return None
+    return None
+
+
+def _extract_prefilter_side_block(raw: str, side: str) -> str:
+    # Matches formats such as:
+    # LONG:
+    # TREND: 12
+    # STRUCTURE: 20
+    pattern = rf"^\s*{side}\s*[:=]\s*(.*?)(?=^\s*(?:LONG|SHORT|BEST|CALL_GLM|REASON)\s*[:=]|\Z)"
+    match = re.search(pattern, raw, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+    return match.group(1) if match else ""
+
+
 def _parse_prefilter_item(raw: str, side: str, key: str, maximum: int) -> int | None:
-    pattern = rf"{side}_{key}\s*[:=]\s*(-?\d+(?:\.\d+)?)"
-    match = re.search(pattern, raw, flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return max(0, min(maximum, int(round(float(match.group(1))))))
-    except Exception:
-        return None
+    key_name = (key or "").strip().lower()
+    variants = _prefilter_key_variants(key_name)
+
+    # Exact/near-exact one-line labels: LONG_TREND, LONG TREND, LONG-TREND.
+    for variant in variants:
+        v = re.escape(variant).replace(r"\ ", r"[ _\-]*")
+        side_label = rf"{re.escape(side)}[ _\-]*{v}"
+        value = _read_number_after_label(raw, side_label, maximum)
+        if value is not None:
+            return value
+
+    # Block label fallback:
+    # LONG:
+    # TREND: 12
+    side_block = _extract_prefilter_side_block(raw, side)
+    if side_block:
+        for variant in variants:
+            v = re.escape(variant).replace(r"\ ", r"[ _\-]*")
+            value = _read_number_after_label(side_block, v, maximum)
+            if value is not None:
+                return value
+    return None
+
+
+def _parse_prefilter_total_score(raw: str, side: str) -> int | None:
+    side_esc = re.escape(side)
+    patterns = [
+        rf"^\s*{side_esc}\s*(?:_?SCORE|_?TOTAL)?\s*[:=]\s*(\d+(?:\.\d+)?)\s*(?:/\s*100)?",
+        rf"^\s*(?:SCORE|TOTAL|ĐIỂM|DIEM)\s+{side_esc}\s*[:=]\s*(\d+(?:\.\d+)?)\s*(?:/\s*100)?",
+        rf"{side_esc}\s*(?:score|total|điểm|diem)\s*[:=]\s*(\d+(?:\.\d+)?)\s*(?:/\s*100)?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        try:
+            return max(0, min(100, int(round(float(match.group(1))))))
+        except Exception:
+            return None
+    return None
 
 
 def _parse_deepseek_prefilter_text(text: str | None) -> dict:
@@ -8927,35 +9061,35 @@ def _parse_deepseek_prefilter_text(text: str | None) -> dict:
     found_items = 0
     for side in ("LONG", "SHORT"):
         for key, maximum in _DEEPSEEK_MINI_RUBRIC_WEIGHTS.items():
-            value = _parse_prefilter_item(raw, side, key.upper(), maximum)
+            value = _parse_prefilter_item(raw, side, key, maximum)
             if value is not None:
                 found_items += 1
                 breakdown[side][key] = value
             else:
                 breakdown[side][key] = 0
 
-    # Backward compatibility: nếu provider lỡ trả format cũ, vẫn đọc LONG_SCORE/SHORT_SCORE.
-    def legacy_score(name: str) -> int:
-        match = re.search(rf"{name}\s*[:=]\s*(\d+(?:\.\d+)?)", raw, flags=re.IGNORECASE)
-        if not match:
-            return 0
-        try:
-            return max(0, min(100, int(round(float(match.group(1))))))
-        except Exception:
-            return 0
+    long_total = _parse_prefilter_total_score(raw, "LONG")
+    short_total = _parse_prefilter_total_score(raw, "SHORT")
 
-    if found_items > 0:
+    rubric_complete = found_items == len(_DEEPSEEK_MINI_RUBRIC_WEIGHTS) * 2
+    used_total_score_fallback = False
+    if rubric_complete:
         long_score = sum(breakdown["LONG"].values())
         short_score = sum(breakdown["SHORT"].values())
-        rubric_complete = found_items == len(_DEEPSEEK_MINI_RUBRIC_WEIGHTS) * 2
+    elif long_total is not None and short_total is not None:
+        # Fallback when Flash gave totals but missed per-item labels. This is still
+        # better than logging fake LONG 0 / SHORT 0, and avoids losing a scan only
+        # because of cosmetic formatting drift.
+        long_score = long_total
+        short_score = short_total
+        used_total_score_fallback = True
     else:
-        long_score = legacy_score("LONG_SCORE")
-        short_score = legacy_score("SHORT_SCORE")
-        rubric_complete = False
+        long_score = 0
+        short_score = 0
 
     best_match = re.search(r"BEST\s*[:=]\s*(LONG|SHORT|NEUTRAL)", raw, flags=re.IGNORECASE)
     best = best_match.group(1).upper() if best_match else "NEUTRAL"
-    call_match = re.search(r"CALL_GLM\s*[:=]\s*(YES|NO)", raw, flags=re.IGNORECASE)
+    call_match = re.search(r"CALL_(?:GLM|FINAL|AI)\s*[:=]\s*(YES|NO)", raw, flags=re.IGNORECASE)
     model_call_glm = (call_match.group(1).upper() == "YES") if call_match else None
     reason_match = re.search(r"REASON\s*[:=]\s*(.+)", raw, flags=re.IGNORECASE | re.DOTALL)
     reason = reason_match.group(1).strip()[:300] if reason_match else raw.strip()[:300]
@@ -8965,12 +9099,14 @@ def _parse_deepseek_prefilter_text(text: str | None) -> dict:
         "long_breakdown": breakdown["LONG"],
         "short_breakdown": breakdown["SHORT"],
         "rubric_complete": rubric_complete,
-        "used_legacy_format": found_items == 0 and (long_score > 0 or short_score > 0),
+        "used_legacy_format": used_total_score_fallback,
+        "used_total_score_fallback": used_total_score_fallback,
         "best_direction": best,
         "model_should_call_glm": model_call_glm,
         "best_score": max(long_score, short_score),
         "reason": reason,
         "raw_text": raw[:1600],
+        "found_items": found_items,
     }
 
 
@@ -9012,7 +9148,12 @@ def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
     should_call_glm = bool(parse_ok and above_threshold and not neutral_by_gap)
 
     if not parse_ok:
+        raw_preview = str(payload.get("raw_text") or payload.get("reason") or "").replace("\n", " ").strip()
+        if len(raw_preview) > 160:
+            raw_preview = raw_preview[:160] + "..."
         gate_reason = "Không parse được mini-rubric DeepSeek nên chưa gọi AI cuối."
+        if raw_preview:
+            gate_reason += f" Raw đầu: {raw_preview}"
     elif neutral_by_gap:
         gate_reason = (
             f"Mini-rubric gần cân bằng: LONG {long_score}/100, SHORT {short_score}/100; "
@@ -9039,6 +9180,8 @@ def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
         "should_call_glm": should_call_glm,
         "reason": gate_reason,
         "rubric_complete": rubric_complete,
+        "parse_ok": parse_ok,
+        "used_total_score_fallback": bool(payload.get("used_total_score_fallback")),
     }
 
 
@@ -9205,11 +9348,15 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     gate = _evaluate_deepseek_prefilter_gate(prefilter)
     pre_direction = gate.get("direction")
     pre_conf = gate.get("best_score")
-    prefilter_score_kwargs = {
-        "pre_long_score": gate.get("long_score"),
-        "pre_short_score": gate.get("short_score"),
-        "pre_gap": gate.get("gap"),
-    }
+    if gate.get("parse_ok"):
+        prefilter_score_kwargs = {
+            "pre_long_score": gate.get("long_score"),
+            "pre_short_score": gate.get("short_score"),
+            "pre_gap": gate.get("gap"),
+        }
+    else:
+        # Do not persist fake LONG 0 / SHORT 0 when the Flash answer was not parseable.
+        prefilter_score_kwargs = {"pre_long_score": None, "pre_short_score": None, "pre_gap": None}
     deepseek_direction = pre_direction
     deepseek_conf = pre_conf
     deepseek_reason = gate.get("reason")
@@ -9233,11 +9380,9 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         )
 
     user_prompt = ctx["user_prompt"]
-    flash_note = "\n\nLỌC NHANH DEEPSEEK FLASH — THAM KHẢO, KHÔNG PHẢI LỆNH:\n" + (
-        f"- DeepSeek mini-rubric: LONG {gate.get('long_score', 0)}/100, SHORT {gate.get('short_score', 0)}/100, "
-        f"hướng nhỉnh hơn {deepseek_direction} {deepseek_conf}/100.\n"
-        f"- Ghi chú Flash: {str(deepseek_reason or prefilter.get('reason') or '')[:240]}\n"
-        "- DeepSeek Flash chỉ là lớp lọc nhanh để tiết kiệm chi phí; AI cuối không bị ép cùng hướng và phải tự quyết định từ dữ liệu đầy đủ. Python chỉ chấm hậu kiểm sau khi AI cuối chọn hướng."
+    flash_note = "\n\nLỌC NHANH DEEPSEEK FLASH — CHỈ BÁO RẰNG SNAPSHOT ĐÁNG PHÂN TÍCH SÂU:\n" + (
+        "- Lớp lọc nhanh đã đạt điều kiện gọi AI cuối, nhưng điểm LONG/SHORT của Flash không được đưa vào đây để tránh neo hướng.\n"
+        "- Bạn phải tự chọn LONG / SHORT / NO TRADE từ dữ liệu đầy đủ bên trên và tự chấm một Điểm tín hiệu duy nhất. Python chỉ parse điểm đó và guard lỗi cứng Entry/SL/TP/RR."
     )
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt + flash_note)
     scored_output, _score_meta = finalize_model_scoring_output(raw_output)
@@ -9246,8 +9391,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     direction = (pred.get("direction") or "").upper()
     if direction in {"LONG", "SHORT"}:
         pred, output = apply_python_objective_scores(pred, output, timeframe_data, mode, current_price)
-    final_conf = int(pred.get("confidence") or _extract_legacy_confidence(output) or 0)
-    final_setup = int(pred.get("setup_strength") or 0)
+    final_conf = int(pred.get("signal_score") or pred.get("confidence") or _extract_legacy_confidence(output) or 0)
+    final_data_support = int(pred.get("data_support_score") or 0)
 
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:
@@ -9261,15 +9406,22 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     # Flash chỉ là prefilter tiết kiệm chi phí; AI cuối vẫn tự quyết định từ dữ liệu đầy đủ.
     # Python chỉ hậu kiểm hướng AI cuối bằng dữ liệu khách quan sau khi model chọn xong.
 
-    if final_conf < AUTO_SCAN_MIN_FINAL_CONFIDENCE or final_setup < AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH:
+    signal_gate_failed = final_conf < AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
+    data_gate_failed = AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE and final_data_support < AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
+
+    if signal_gate_failed or data_gate_failed:
         mismatch_note = ""
         if pre_direction in {"LONG", "SHORT"} and direction in {"LONG", "SHORT"} and direction != pre_direction:
-            mismatch_note = f" DeepSeek Flash lọc nhanh nghiêng {pre_direction}, nhưng AI cuối chọn {direction}; Python hậu kiểm hướng {direction} theo dữ liệu khách quan."
+            mismatch_note = f" DeepSeek Flash lọc nhanh nghiêng {pre_direction}, nhưng AI cuối chọn {direction}; đây chỉ là thông tin debug, không ép hướng AI cuối."
+        data_note = f" Kiểm tra dữ liệu Python tham khảo: {final_data_support}/100; không chặn mặc định."
+        if AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE:
+            data_note = f" Kiểm tra dữ liệu Python: {final_data_support}/100; đang bật gate AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE."
         return log_and_return(
             "glm",
             "rejected",
-            f"Tín hiệu cuối đạt Điểm chắc chắn {final_conf}/100 và Chất lượng kế hoạch Entry/SL/TP {final_setup}/100; "
-            f"ngưỡng gửi là {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100 và {AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH}/100."
+            f"Tín hiệu cuối đạt Điểm tín hiệu {final_conf}/100; "
+            f"ngưỡng gửi là {AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE}/100."
+            f"{data_note}"
             f"{mismatch_note}",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
