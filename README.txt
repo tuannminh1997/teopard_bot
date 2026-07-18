@@ -128,3 +128,31 @@ Admin:
 - `/checknow`
 - `/clearhistory CONFIRM`
 - `/cleardrafts ALL CONFIRM`
+
+## Scoring V39 — Python objective scores
+
+Bản này đổi cách chấm điểm cuối:
+
+- Model vẫn chọn LONG/SHORT/NO TRADE và lập Entry/SL/TP.
+- Model vẫn trả rubric nội bộ để kiểm tra format/fallback.
+- Python chấm lại Độ mạnh setup và Điểm chắc chắn bằng dữ liệu cứng.
+
+Độ mạnh setup chỉ đo chất lượng kế hoạch:
+
+- Entry đúng vùng kỹ thuật.
+- SL nằm ngoài điểm vô hiệu.
+- TP bám target thực tế.
+- RR và room đủ đáng.
+- Điều kiện kích hoạt rõ.
+- Rủi ro nhiễu/thực thi.
+
+Điểm chắc chắn chỉ đo hướng model chọn có được dữ liệu ủng hộ hay không:
+
+- Đồng thuận hướng đa khung.
+- Cấu trúc thị trường.
+- Price action và EMA interaction.
+- Diễn biến momentum.
+- Volume và taker flow.
+- Mức mâu thuẫn/kịch bản đối lập.
+
+Output public đổi từ “Độ chắc chắn: x%” sang “Điểm chắc chắn: x/100” để tránh hiểu nhầm đây là xác suất thắng đã được backtest.

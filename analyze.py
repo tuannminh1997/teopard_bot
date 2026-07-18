@@ -3853,22 +3853,25 @@ MIN_SETUP_STRENGTH = _env_float("TEOPARD_MIN_SETUP_STRENGTH", 62.0)
 MIN_REVERSAL_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_REVERSAL_CONFIDENCE", 50.0)
 MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = _env_float("TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE", 52.0)
 
-# Model chấm từng tiêu chí; Python clamp từng mục và cộng tổng.
+# V39 scoring: model chọn hướng/kế hoạch, Python chấm lại bằng dữ liệu khách quan.
+# Setup Strength chỉ đo chất lượng kế hoạch Entry-SL-TP, tránh đếm trùng xu hướng/momentum.
 SETUP_SCORE_WEIGHTS = {
-    "xu_huong_da_khung": 10.0,
     "entry_dung_vung": 25.0,
-    "sl_dung_cau_truc": 20.0,
-    "tp_rr_hop_ly": 25.0,
-    "dong_luong_xac_nhan": 10.0,
-    "volume_nen_xac_nhan": 10.0,
+    "sl_dung_diem_vo_hieu": 20.0,
+    "tp_bam_target_thuc_te": 15.0,
+    "rr_room_hop_ly": 20.0,
+    "dieu_kien_kich_hoat_ro": 10.0,
+    "rui_ro_nhieu_thuc_thi": 10.0,
 }
 
+# Confidence đo mức dữ liệu ủng hộ hướng model đã chọn, không đo lại Entry/SL/TP.
 CONFIDENCE_SCORE_WEIGHTS = {
-    "loi_the_quyet_dinh": 20.0,
-    "huong_lon_ro_rang": 25.0,
-    "hanh_dong_gia_dong_thuan": 25.0,
-    "chi_bao_dong_thuan": 20.0,
-    "boi_canh_thi_truong_ung_ho": 10.0,
+    "dong_thuan_huong_da_khung": 20.0,
+    "cau_truc_thi_truong": 20.0,
+    "price_action_ema_interaction": 20.0,
+    "dien_bien_momentum": 15.0,
+    "volume_taker_flow": 10.0,
+    "mau_thuan_kich_ban_doi_lap": 15.0,
 }
 
 
@@ -5586,8 +5589,8 @@ def build_user_prompt(
         "- Quyết định cuối cùng chỉ là LONG, SHORT hoặc NO TRADE.",
         "- Nếu LONG/SHORT phải có đủ Entry, SL, TP1, TP2 là số cụ thể.",
         "- Nếu LONG/SHORT, trước block rubric bắt buộc có block [[TEOPARD_PLAN_SOURCES]] gồm ENTRY, SL, TP1, TP2 và dùng đúng ID A1..A6/B1..B6 trong BẢN ĐỒ LEVEL; ENTRY được phép CURRENT khi giá đang nằm trong Entry và xác nhận đã đủ. Python sẽ ẩn block này.",
-        "- Cuối phản hồi bắt buộc có block [[TEOPARD_RUBRIC]] đúng key và đủ 11 dòng điểm; Python sẽ ẩn block, clamp từng mục và cộng tổng.",
-        "- Không tự in tổng Độ mạnh setup/Độ chắc chắn; Python sẽ tính và chèn hai tổng sau dòng QUYẾT ĐỊNH.",
+        "- Cuối phản hồi bắt buộc có block [[TEOPARD_RUBRIC]] đúng key mới và đủ 12 dòng điểm; Python sẽ ẩn block rồi chấm lại bằng dữ liệu cứng.",
+        "- Không tự in tổng Độ mạnh setup/Điểm chắc chắn; Python sẽ chấm lại khách quan và chèn hai tổng sau dòng QUYẾT ĐỊNH.",
         "- Bot không cung cấp dữ liệu thanh lý/heatmap; không được suy đoán chúng từ OHLCV. Dùng cấu trúc, Fibonacci, EMA, ATR, volume, nến đã đóng và block nến live trung lập đã được Python tách riêng.",
         "- Nến live giúp nhận biết sớm tương tác EMA/chuyển động đang hình thành, nhưng không được mô tả như một nến đã đóng hoặc một xác nhận đã hoàn tất.",
         "- Nếu chưa đủ setup hợp lý thì chọn NO TRADE.",
@@ -6243,6 +6246,441 @@ def _rubric_total(
     return min(max(total, 0.0), 100.0)
 
 
+
+
+def _score_clip(value: float | None, maximum: float) -> float:
+    """Clamp objective scoring items to integer points."""
+    if value is None:
+        return 0.0
+    try:
+        val = float(value)
+    except Exception:
+        return 0.0
+    if not np.isfinite(val):
+        return 0.0
+    return _rubric_item_score(val, maximum)
+
+
+def _support_to_points(support: float | None, maximum: float) -> float:
+    if support is None:
+        return 0.0
+    try:
+        sup = min(max(float(support), 0.0), 1.0)
+    except Exception:
+        return 0.0
+    return _rubric_item_score(sup * float(maximum), maximum)
+
+
+def _direction_multiplier(direction: str) -> int:
+    return 1 if str(direction).upper() == "LONG" else -1
+
+
+def _range_sorted(a: float | None, b: float | None) -> tuple[float | None, float | None]:
+    if a is None or b is None:
+        return None, None
+    try:
+        af, bf = float(a), float(b)
+    except Exception:
+        return None, None
+    return (min(af, bf), max(af, bf))
+
+
+def _score_catalog_entry_match(catalog: dict[str, dict], entry_low: float, entry_high: float, price: float, tol: float) -> tuple[float, str | None]:
+    entry_mid = (entry_low + entry_high) / 2.0
+    candidates = [
+        (key, item) for key, item in catalog.items()
+        if float(item["high"]) + tol >= entry_low and float(item["low"]) - tol <= entry_high
+    ]
+    if candidates:
+        key, _item = min(candidates, key=lambda kv: abs(float(kv[1]["anchor"]) - entry_mid))
+        return 25.0, key
+    # Nếu giá hiện tại nằm trong vùng Entry, xem như entry hợp lệ nhưng thấp hơn level map rõ ràng.
+    if entry_low <= price <= entry_high:
+        return 20.0, "CURRENT"
+    # Entry gần một level nhưng chưa thật sự ôm level.
+    nearest_gap = None
+    for item in catalog.values():
+        gap = max(float(item["low"]) - entry_high, entry_low - float(item["high"]), 0.0)
+        nearest_gap = gap if nearest_gap is None else min(nearest_gap, gap)
+    if nearest_gap is not None and nearest_gap <= tol * 2.0:
+        return 16.0, None
+    return 8.0, None
+
+
+def _score_catalog_point_match(catalog: dict[str, dict], value: float, direction: str, point_role: str, entry_low: float, entry_high: float, tol: float) -> tuple[float, str | None]:
+    # point_role: sl/tp1/tp2. Return 1.0 style score, not points.
+    matches = [
+        (key, item) for key, item in catalog.items()
+        if _catalog_item_matches_price(item, value, tol)
+    ]
+    if not matches:
+        return 0.0, None
+    key, item = min(matches, key=lambda kv: abs(float(kv[1]["anchor"]) - float(value)))
+    anchor = float(item["anchor"])
+    if point_role == "sl":
+        if direction == "LONG" and anchor >= entry_low:
+            return 0.25, key
+        if direction == "SHORT" and anchor <= entry_high:
+            return 0.25, key
+        return 1.0, key
+    if direction == "LONG" and anchor <= entry_high:
+        return 0.25, key
+    if direction == "SHORT" and anchor >= entry_low:
+        return 0.25, key
+    return 1.0, key
+
+
+def _python_setup_score_breakdown(
+    pred: dict,
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+    output: str | None = None,
+) -> dict[str, float]:
+    """Objective Setup Strength: chỉ chấm chất lượng Entry-SL-TP của kế hoạch đã có."""
+    direction = (pred.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT"):
+        return {key: 0.0 for key in SETUP_SCORE_WEIGHTS}
+
+    entry_low, entry_high = _range_sorted(pred.get("entry_low"), pred.get("entry_high"))
+    try:
+        sl = float(pred.get("sl"))
+        tp1 = float(pred.get("tp1"))
+        tp2 = float(pred.get("tp2"))
+    except Exception:
+        return {key: 0.0 for key in SETUP_SCORE_WEIGHTS}
+    if entry_low is None or entry_high is None:
+        return {key: 0.0 for key in SETUP_SCORE_WEIGHTS}
+
+    price = float(current_price) if current_price is not None else (entry_low + entry_high) / 2.0
+    atr_label, atr = _tp_noise_atr(timeframe_data, mode)
+    atr_val = float(atr or 0.0)
+    tol = max(price * (0.0007 if mode == "short" else 0.0018), atr_val * 0.25, 1e-9)
+    catalog = _build_model_level_catalog(timeframe_data, mode, price, max_per_side=6)
+
+    entry_points, entry_source = _score_catalog_entry_match(catalog, entry_low, entry_high, price, tol) if catalog else (18.0 if entry_low <= price <= entry_high else 8.0, None)
+
+    # SL: geometry first, then invalidation/source quality.
+    if direction == "LONG":
+        sl_geometry_ok = sl < entry_low
+        final_risk = entry_high - sl
+    else:
+        sl_geometry_ok = sl > entry_high
+        final_risk = sl - entry_low
+    min_stop = _minimum_stop_distance(timeframe_data, mode, price)
+    sl_match_score, sl_source = _score_catalog_point_match(catalog, float(pred.get("_sl_before_extra_buffer") or sl), direction, "sl", entry_low, entry_high, max(tol, atr_val * 0.50)) if catalog else (0.0, None)
+    if not sl_geometry_ok or final_risk <= 0:
+        sl_points = 0.0
+    elif sl_match_score >= 1.0:
+        sl_points = 20.0 if final_risk >= min_stop else 15.0
+    elif final_risk >= min_stop:
+        sl_points = 12.0
+    else:
+        sl_points = 7.0
+
+    # TP: nguồn target thực tế tách khỏi RR.
+    if direction == "LONG":
+        tp_geometry_ok = tp1 > entry_high and tp2 >= tp1
+    else:
+        tp_geometry_ok = tp1 < entry_low and tp2 <= tp1
+    tp1_match_score, tp1_source = _score_catalog_point_match(catalog, float(pred.get("_tp1_before_extra_buffer") or tp1), direction, "tp1", entry_low, entry_high, max(tol, atr_val * 0.30)) if catalog else (0.0, None)
+    tp2_match_score, tp2_source = _score_catalog_point_match(catalog, float(pred.get("_tp2_before_extra_buffer") or tp2), direction, "tp2", entry_low, entry_high, max(tol, atr_val * 0.30)) if catalog else (0.0, None)
+    if not tp_geometry_ok:
+        tp_target_points = 0.0
+    else:
+        tp_target_points = 5.0 + 5.0 * tp1_match_score + 5.0 * tp2_match_score
+        tp_target_points = min(tp_target_points, 15.0)
+
+    # RR/room: dùng worst-case edge và threshold theo mode.
+    rr = _plan_worst_case_risk_reward(pred, use_rr_guard_sl=True, use_rr_guard_tp=True)
+    risk = float(rr.get("risk") or 0.0)
+    reward1 = float(rr.get("reward1") or 0.0)
+    reward2 = float(rr.get("reward2") or 0.0)
+    rr1 = float(rr.get("rr1") or 0.0)
+    rr2 = float(rr.get("rr2") or 0.0)
+    guards = _trade_plan_guard_thresholds(mode)
+    min_tp1_r = float(guards["tp1_r"])
+    min_tp2_r = float(guards["tp2_r"])
+    tp2_sep = float(guards["tp2_sep"])
+    if risk <= 0:
+        rr_points = 0.0
+    else:
+        rr_points = 0.0
+        rr_points += min(rr1 / max(min_tp1_r, 1e-9), 1.0) * 8.0
+        rr_points += min(rr2 / max(min_tp2_r, 1e-9), 1.0) * 8.0
+        rr_points += 2.0 if reward2 > reward1 * tp2_sep else max(0.0, reward2 / max(reward1 * tp2_sep, 1e-9)) * 2.0
+        if atr_val > 0:
+            rr_points += 1.0 if reward1 >= atr_val * float(guards["tp1_atr"]) else 0.0
+            rr_points += 1.0 if reward2 >= atr_val * float(guards["tp2_atr"]) else 0.0
+        else:
+            rr_points += 2.0
+        rr_points = min(rr_points, 20.0)
+
+    # Kích hoạt rõ: chấm wording public, không ép hướng.
+    out = (output or "").lower()
+    entry_contains = entry_low <= price <= entry_high
+    has_clear_wait = ("chờ" in out or "lệnh chờ" in out) and ("xác nhận" in out or "nến" in out or "entry" in out)
+    has_immediate = "vào ngay" in out or "đang nằm trong vùng entry" in out or "có thể vào ngay" in out
+    if entry_contains and has_immediate:
+        activation_points = 10.0
+    elif has_clear_wait:
+        activation_points = 8.0
+    elif entry_contains:
+        activation_points = 7.0
+    elif "chờ" in out or "lệnh chờ" in out:
+        activation_points = 6.0
+    else:
+        activation_points = 4.0
+
+    # Rủi ro thực thi/nhiễu: entry quá rộng, SL quá sát, entry quá xa đều giảm điểm.
+    entry_width = entry_high - entry_low
+    dist_to_entry = _distance_price_to_entry(pred, price)
+    noise_points = 0.0
+    if atr_val > 0:
+        noise_points += 4.0 if entry_width <= atr_val * (0.35 if mode == "short" else 0.55) else 2.5 if entry_width <= atr_val * (0.70 if mode == "short" else 1.00) else 1.0
+        noise_points += 3.0 if final_risk >= min_stop else 1.0
+        noise_points += 3.0 if (dist_to_entry is not None and dist_to_entry <= atr_val * (1.3 if mode == "short" else 1.1)) else 1.0
+    else:
+        noise_points = 6.0 if final_risk > 0 else 0.0
+
+    breakdown = {
+        "entry_dung_vung": entry_points,
+        "sl_dung_diem_vo_hieu": sl_points,
+        "tp_bam_target_thuc_te": tp_target_points,
+        "rr_room_hop_ly": rr_points,
+        "dieu_kien_kich_hoat_ro": activation_points,
+        "rui_ro_nhieu_thuc_thi": min(noise_points, 10.0),
+    }
+    pred["_python_score_sources"] = {
+        "entry": entry_source,
+        "sl": sl_source,
+        "tp1": tp1_source,
+        "tp2": tp2_source,
+        "atr_label": atr_label,
+    }
+    return {k: _score_clip(v, SETUP_SCORE_WEIGHTS[k]) for k, v in breakdown.items()}
+
+
+def _frame_direction_support(df: pd.DataFrame | None, direction: str) -> float | None:
+    data = _closed_candles(df)
+    if data is None or len(data) < 8:
+        return None
+    row = data.iloc[-1]
+    sign = _direction_multiplier(direction)
+    close = _safe_float(row.get("close"))
+    ema7 = _safe_float(row.get("ema_7"))
+    ema25 = _safe_float(row.get("ema_25"))
+    ema50 = _safe_float(row.get("ema_50"))
+    checks: list[float] = []
+    if close and ema7:
+        checks.append(1.0 if sign * (close - ema7) > 0 else 0.0)
+    if close and ema25:
+        checks.append(1.0 if sign * (close - ema25) > 0 else 0.0)
+    if ema7 and ema25 and ema50:
+        if direction == "LONG":
+            checks.append(1.0 if ema7 > ema25 > ema50 else 0.65 if ema7 > ema25 else 0.25 if ema7 > ema50 else 0.0)
+        else:
+            checks.append(1.0 if ema7 < ema25 < ema50 else 0.65 if ema7 < ema25 else 0.25 if ema7 < ema50 else 0.0)
+    for bars in (1, 3, 6):
+        ret = _closed_return_pct(df, bars)
+        if ret is not None:
+            checks.append(1.0 if sign * ret > 0 else 0.0)
+    rsi_d3 = _closed_metric_delta(df, "rsi_14", 3)
+    if rsi_d3 is not None:
+        checks.append(1.0 if sign * rsi_d3 > 0 else 0.0)
+    macd_d3 = _closed_metric_delta(df, "macd_hist", 3)
+    if macd_d3 is not None:
+        checks.append(1.0 if sign * macd_d3 > 0 else 0.0)
+    return float(np.mean(checks)) if checks else None
+
+
+def _weighted_support(timeframe_data: dict[str, pd.DataFrame | None], weights: dict[str, float], direction: str, func) -> float | None:
+    total = 0.0
+    used = 0.0
+    for label, weight in weights.items():
+        val = func(timeframe_data.get(label), direction)
+        if val is None:
+            continue
+        total += float(val) * float(weight)
+        used += float(weight)
+    return total / used if used > 0 else None
+
+
+def _direction_role_weights(mode: str) -> dict[str, float]:
+    if mode == "short":
+        return {"15M": 0.25, "1H": 0.45, "4H": 0.30}
+    return {"4H": 0.25, "1D": 0.45, "1W": 0.30}
+
+
+def _structure_direction_support(df: pd.DataFrame | None, direction: str) -> float | None:
+    data = _closed_candles(df)
+    if data is None or len(data) < 20:
+        return None
+    highs = _last_pivot_values(data, "high", 3)
+    lows = _last_pivot_values(data, "low", 3)
+    score_parts: list[float] = []
+    if len(highs) >= 2:
+        h_shape = _sequence_shape(highs, True)
+        if direction == "LONG":
+            score_parts.append(1.0 if "cao dần" in h_shape else 0.25 if "đan xen" in h_shape else 0.0)
+        else:
+            score_parts.append(1.0 if "thấp dần" in h_shape else 0.25 if "đan xen" in h_shape else 0.0)
+    if len(lows) >= 2:
+        l_shape = _sequence_shape(lows, False)
+        if direction == "LONG":
+            score_parts.append(1.0 if "cao dần" in l_shape else 0.25 if "đan xen" in l_shape else 0.0)
+        else:
+            score_parts.append(1.0 if "thấp dần" in l_shape else 0.25 if "đan xen" in l_shape else 0.0)
+    try:
+        info = _structure_info(data, _safe_float(data.iloc[-1].get("close")))
+        trend = str(info.get("trend") or "").upper()
+        if trend:
+            if (direction == "LONG" and trend == "TĂNG") or (direction == "SHORT" and trend == "GIẢM"):
+                score_parts.append(1.0)
+            elif trend == "ĐI NGANG":
+                score_parts.append(0.45)
+            else:
+                score_parts.append(0.0)
+    except Exception:
+        pass
+    return float(np.mean(score_parts)) if score_parts else None
+
+
+def _ema_price_action_support(df: pd.DataFrame | None, direction: str, current_price: float | None) -> float | None:
+    if df is None or df.empty or current_price is None:
+        return None
+    row = df.iloc[-1]
+    sign = _direction_multiplier(direction)
+    price = float(current_price)
+    open_ = _safe_float(row.get("open"))
+    high = _safe_float(row.get("high"))
+    low = _safe_float(row.get("low"))
+    atr = _safe_float(_analysis_row(df).get("atr_14")) if _analysis_row(df) is not None else None
+    atr_num = float(atr or 0.0)
+    checks: list[float] = []
+    if open_ is not None:
+        checks.append(1.0 if sign * (price - open_) > 0 else 0.0)
+    for col in ("ema_7", "ema_25", "ema_50"):
+        ema = _safe_float(row.get(col))
+        if ema is None or ema <= 0:
+            continue
+        tol = max(ema * 0.00025, atr_num * 0.04, 1e-9)
+        above_support = sign * (price - ema)
+        base = 1.0 if above_support > tol else 0.5 if abs(price - ema) <= tol else 0.0
+        touched = high is not None and low is not None and low - tol <= ema <= high + tol
+        if touched:
+            if direction == "SHORT" and high is not None and high >= ema - tol and price < ema - tol:
+                base = max(base, 1.0)  # rejection from EMA as resistance
+            if direction == "LONG" and low is not None and low <= ema + tol and price > ema + tol:
+                base = max(base, 1.0)  # rejection from EMA as support
+        checks.append(base)
+    progress = _live_candle_progress(row, "")
+    if progress is not None and progress < 0.12:
+        # Nến mới mở: giữ dữ liệu live nhưng giảm trọng lượng tín hiệu.
+        checks = [0.5 + (v - 0.5) * 0.55 for v in checks]
+    return float(np.mean(checks)) if checks else None
+
+
+def _momentum_direction_support(df: pd.DataFrame | None, direction: str) -> float | None:
+    data = _closed_candles(df)
+    if data is None or len(data) < 8:
+        return None
+    sign = _direction_multiplier(direction)
+    checks: list[float] = []
+    for val in (_closed_return_pct(df, 3), _closed_return_pct(df, 6), _closed_metric_delta(df, "rsi_14", 3), _closed_metric_delta(df, "rsi_14", 6), _closed_metric_delta(df, "macd_hist", 3)):
+        if val is not None:
+            checks.append(1.0 if sign * float(val) > 0 else 0.0)
+    ema_slope = _closed_ema_slope_pct(df, "ema_7", 3)
+    if ema_slope is not None:
+        checks.append(1.0 if sign * float(ema_slope) > 0 else 0.0)
+    return float(np.mean(checks)) if checks else None
+
+
+def _taker_volume_direction_support(df: pd.DataFrame | None, direction: str) -> float | None:
+    data = _closed_candles(df)
+    if data is None or data.empty:
+        return None
+    row = data.iloc[-1]
+    checks: list[float] = []
+    taker_now = _taker_buy_ratio(row)
+    taker3 = _taker_ratio_average(df, 3)
+    taker6 = _taker_ratio_average(df, 6)
+    for val in (taker_now, taker3, taker6):
+        if val is None:
+            continue
+        if direction == "LONG":
+            checks.append(1.0 if val >= 52 else 0.5 if 48 <= val < 52 else 0.0)
+        else:
+            checks.append(1.0 if val <= 48 else 0.5 if 48 < val <= 52 else 0.0)
+    vol = _safe_float(row.get("vol_ratio"))
+    if vol is not None:
+        # Volume quá thấp làm cả hai hướng bớt đáng tin; volume bình thường/cao cho phép tín hiệu taker có giá trị hơn.
+        checks.append(1.0 if vol >= 0.85 else 0.45)
+    return float(np.mean(checks)) if checks else None
+
+
+def _python_confidence_score_breakdown(
+    pred: dict,
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+) -> dict[str, float]:
+    direction = (pred.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT"):
+        return {key: 0.0 for key in CONFIDENCE_SCORE_WEIGHTS}
+    role_weights = _direction_role_weights(mode)
+    live_weights = {"1H": 0.55, "4H": 0.45} if mode == "short" else {"4H": 0.55, "1D": 0.45}
+    frame_support = _weighted_support(timeframe_data, role_weights, direction, _frame_direction_support)
+    structure_support = _weighted_support(timeframe_data, role_weights, direction, _structure_direction_support)
+    ema_support = _weighted_support(timeframe_data, live_weights, direction, lambda df, d: _ema_price_action_support(df, d, current_price))
+    momentum_support = _weighted_support(timeframe_data, role_weights, direction, _momentum_direction_support)
+    taker_support = _weighted_support(timeframe_data, role_weights, direction, _taker_volume_direction_support)
+    supports = [v for v in (frame_support, structure_support, ema_support, momentum_support, taker_support) if v is not None]
+    aggregate = float(np.mean(supports)) if supports else 0.0
+    if aggregate >= 0.72:
+        contradiction = 15.0
+    elif aggregate >= 0.60:
+        contradiction = 12.0
+    elif aggregate >= 0.50:
+        contradiction = 8.0
+    elif aggregate >= 0.40:
+        contradiction = 5.0
+    else:
+        contradiction = 2.0
+    breakdown = {
+        "dong_thuan_huong_da_khung": _support_to_points(frame_support, 20.0),
+        "cau_truc_thi_truong": _support_to_points(structure_support, 20.0),
+        "price_action_ema_interaction": _support_to_points(ema_support, 20.0),
+        "dien_bien_momentum": _support_to_points(momentum_support, 15.0),
+        "volume_taker_flow": _support_to_points(taker_support, 10.0),
+        "mau_thuan_kich_ban_doi_lap": _score_clip(contradiction, 15.0),
+    }
+    return breakdown
+
+
+def apply_python_objective_scores(
+    pred: dict,
+    output: str,
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+) -> tuple[dict, str]:
+    """Override model rubric with Python objective scores for final user text and guards."""
+    direction = (pred.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT"):
+        return pred, output
+    scored = dict(pred)
+    setup_breakdown = _python_setup_score_breakdown(scored, timeframe_data, mode, current_price, output)
+    confidence_breakdown = _python_confidence_score_breakdown(scored, timeframe_data, mode, current_price)
+    setup_strength = _rubric_total(setup_breakdown, SETUP_SCORE_WEIGHTS)
+    confidence = _rubric_total(confidence_breakdown, CONFIDENCE_SCORE_WEIGHTS)
+    scored["setup_strength"] = setup_strength
+    scored["confidence"] = confidence
+    scored["setup_score_breakdown"] = setup_breakdown
+    scored["confidence_score_breakdown"] = confidence_breakdown
+    scored["_score_engine"] = "python_objective_v39"
+    return scored, _insert_public_scores(output, setup_strength, confidence)
+
 def _extract_rubric_breakdowns(output: str | None) -> tuple[dict, dict]:
     """Đọc block máy [[TEOPARD_RUBRIC]] do model trả ở cuối output."""
     text = output or ""
@@ -6288,7 +6726,7 @@ def _extract_legacy_confidence(output: str | None) -> float | None:
     """Chỉ dùng để tương thích output text cũ khi model lỡ thiếu rubric."""
     text = output or ""
     patterns = [
-        r"Độ\s+chắc\s+chắn\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"(?:Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn)\s*:\s*([0-9]+(?:\.[0-9]+)?)(?:\s*(?:%|/\s*100))?",
         r"QUYẾT\s+ĐỊNH[:\s]+(?:LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
         r"(?:📈|📉)?\s*(?:LONG|SHORT|NO[_\s-]?TRADE)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
     ]
@@ -6322,11 +6760,11 @@ def _insert_public_scores(
         flags=re.IGNORECASE | re.MULTILINE,
     )
     text = re.sub(r"^\s*Độ\s+mạnh\s+setup\s*:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
-    text = re.sub(r"^\s*Độ\s+chắc\s+chắn\s*:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"^\s*(?:Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn)\s*:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
 
     setup_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
-    confidence_text = f"{confidence:.0f}%" if confidence is not None else "N/A"
-    score_lines = [f"Độ mạnh setup: {setup_text}", f"Độ chắc chắn: {confidence_text}"]
+    confidence_text = f"{confidence:.0f}/100" if confidence is not None else "N/A"
+    score_lines = [f"Độ mạnh setup: {setup_text}", f"Điểm chắc chắn: {confidence_text}"]
 
     lines = text.splitlines()
     for index, line in enumerate(lines):
@@ -6417,7 +6855,7 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
         f"🎯 {symbol} — {mode_label}",
         f"🏆 QUYẾT ĐỊNH: {decision.replace('_', ' ')}",
         f"Độ mạnh setup: {setup_strength:.0f}/100" if setup_strength is not None else "Độ mạnh setup: N/A",
-        f"Độ chắc chắn: {confidence:.0f}%" if confidence is not None else "Độ chắc chắn: N/A",
+        f"Điểm chắc chắn: {confidence:.0f}/100" if confidence is not None else "Điểm chắc chắn: N/A",
         current_price_line,
     ]
 
@@ -6538,7 +6976,7 @@ def parse_prediction_from_output(output: str) -> dict:
     confidence = None
     # Ưu tiên tổng rubric do Python đã render; fallback format phần trăm cũ.
     conf_patterns = [
-        r"Độ\s+chắc\s+chắn\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+        r"(?:Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn)\s*:\s*([0-9]+(?:\.[0-9]+)?)(?:\s*(?:%|/\s*100))?",
         r"QUYẾT\s+ĐỊNH[:\s]+(?:LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
         r"(?:📈|📉)?\s*(?:LONG|SHORT|NO[_\s-]?TRADE)\s*[—\-]\s*([0-9]+(?:\.[0-9]+)?)\s*%",
     ]
@@ -6752,17 +7190,17 @@ def _validate_model_scores(pred: dict, mode: str) -> list[str]:
     confidence_min = MIN_ACTION_CONFIDENCE_SCALP if mode == "short" else MIN_ACTION_CONFIDENCE_SWING
 
     if setup_strength is None:
-        errors.append("Model thiếu bảng chấm Độ mạnh setup đầy đủ nên Python không thể cộng tổng.")
+        errors.append("Python chưa tính được Độ mạnh setup đầy đủ cho kế hoạch này.")
     elif setup_strength < MIN_SETUP_STRENGTH:
         errors.append(
             f"Độ mạnh setup chỉ {setup_strength:.1f}/100, dưới ngưỡng tối thiểu {MIN_SETUP_STRENGTH:.1f}/100."
         )
 
     if confidence is None:
-        errors.append("Model thiếu bảng chấm Độ chắc chắn đầy đủ nên Python không thể cộng tổng.")
+        errors.append("Python chưa tính được Điểm chắc chắn đầy đủ cho kế hoạch này.")
     elif confidence < confidence_min:
         errors.append(
-            f"Độ chắc chắn chỉ {confidence:.1f}%, dưới ngưỡng tối thiểu {confidence_min:.1f}% cho mode này."
+            f"Điểm chắc chắn chỉ {confidence:.1f}/100, dưới ngưỡng tối thiểu {confidence_min:.1f}/100 cho mode này."
         )
     return errors
 
@@ -7078,7 +7516,7 @@ def _guarded_no_trade_output(
     setup_strength = _num_or_none(pred_data.get("setup_strength"))
     confidence = _num_or_none(pred_data.get("confidence"))
     setup_text = f"{setup_strength:.0f}/100" if setup_strength is not None else "N/A"
-    confidence_text = f"{confidence:.0f}%" if confidence is not None else "N/A"
+    confidence_text = f"{confidence:.0f}/100" if confidence is not None else "N/A"
 
     rejected_direction = str(pred_data.get("direction") or "").upper()
     direction_line = ""
@@ -7100,7 +7538,7 @@ def _guarded_no_trade_output(
         f"{direction_line}"
         f"{structure_line}"
         f"Độ mạnh setup: {setup_text}\n"
-        f"Độ chắc chắn: {confidence_text}\n"
+        f"Điểm chắc chắn: {confidence_text}\n"
         f"Giá hiện tại: {fmt(current_price)} USDT\n"
         f"⚠️ Rủi ro: {reason}{price_text} Bot không lưu tín hiệu này; nếu cố vào lệnh, nguy cơ bị nhiễu hoặc quét SL ngắn hạn còn cao."
     )
@@ -7366,6 +7804,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         pred, output = _apply_extra_sl_buffer_to_plan(pred, output)
         pred, output = _apply_extra_tp_buffers_to_plan(pred, output)
         output = _normalize_pending_entry_activation(output, pred, current_price)
+        pred, output = apply_python_objective_scores(pred, output, timeframe_data, mode, current_price)
 
     if direction == "NO_TRADE":
         # V19: chỉ lệnh user xác nhận đã trade mới được lưu vào predictions/history.
@@ -7541,6 +7980,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         pred, output = _apply_extra_sl_buffer_to_plan(pred, output)
         pred, output = _apply_extra_tp_buffers_to_plan(pred, output)
         output = _normalize_pending_entry_activation(output, pred, current_price)
+        pred, output = apply_python_objective_scores(pred, output, timeframe_data, mode, current_price)
 
     if direction == "NO_TRADE":
         # V19: NO TRADE không lưu vào predictions/history; chỉ lệnh user xác nhận mới được theo dõi.
@@ -8612,6 +9052,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
     pred = _attach_plan_sources(parse_prediction_from_output(output), raw_output)
     direction = (pred.get("direction") or "").upper()
+    if direction in {"LONG", "SHORT"}:
+        pred, output = apply_python_objective_scores(pred, output, timeframe_data, mode, current_price)
     final_conf = int(pred.get("confidence") or _extract_legacy_confidence(output) or 0)
     final_setup = int(pred.get("setup_strength") or 0)
 
@@ -8627,8 +9069,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         return log_and_return(
             "glm",
             "rejected",
-            f"Tín hiệu cuối đạt Độ chắc chắn {final_conf}% và Độ mạnh setup {final_setup}/100; "
-            f"ngưỡng gửi là {AUTO_SCAN_MIN_FINAL_CONFIDENCE}% và {AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH}/100.",
+            f"Tín hiệu cuối đạt Điểm chắc chắn {final_conf}/100 và Độ mạnh setup {final_setup}/100; "
+            f"ngưỡng gửi là {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100 và {AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH}/100.",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
             final_direction=direction,
