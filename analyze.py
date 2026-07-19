@@ -3869,7 +3869,7 @@ MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = _env_float("TEOPARD_MIN_REVERSAL_BAD
 SIGNAL_SCORE_WEIGHTS = {
     "huong_boi_canh_da_khung": 30.0,
     "entry_timing": 20.0,
-    "sl_tp_rr": 25.0,
+    "chat_luong_ke_hoach": 25.0,
     "mau_thuan_rui_ro_nhieu": 15.0,
     "thuc_thi_thuc_te": 10.0,
 }
@@ -4011,10 +4011,9 @@ def _normalize_trade_plan_structural_tps(
     current_price: float | None,
     output: str | None = None,
 ) -> tuple[dict, str | None]:
-    """Nếu TP1/TP2 không đạt RR tối thiểu sau khi SL đã chuẩn hóa, thử target cấu trúc kế tiếp.
+    """Hàm tương thích cũ, không được gọi trong luồng model-authoritative hiện tại.
 
-    Không ép khoảng cách TP2 theo một tỷ lệ cố định so với TP1. TP2 phải do
-    cấu trúc thị trường quyết định; validator chỉ kiểm tra hình học và RR tối thiểu.
+    Luồng hiện tại giữ nguyên TP1/TP2 do model trả về và chỉ gate theo Điểm tín hiệu.
     """
     direction = (pred.get("direction") or "").upper()
     if direction not in ("LONG", "SHORT"):
@@ -4713,6 +4712,7 @@ def _format_model_plan_contract(
         "5. Tự kiểm tra trước khi trả lời: vì sao Entry có hai biên này, điều gì vô hiệu luận điểm, cấu trúc nào tạo TP1/TP2, và các mức có thực dụng so với ATR/phần trăm biến động hay không.",
         "6. Nếu dữ liệu không đủ để tự bảo vệ các mức giá bằng lập luận rõ ràng, chọn NO TRADE thay vì xuất số có độ chính xác giả.",
         "- Python sẽ giữ nguyên các số model trả về. Gate gửi tín hiệu chỉ dựa trên Điểm tín hiệu; Python không sửa Entry/SL/TP và không ép chúng khớp danh sách mức giá dựng sẵn.",
+        "- Kế hoạch và mức giá lịch sử chỉ là bối cảnh trạng thái. Không tái sử dụng Entry/SL/TP cũ nếu snapshot hiện tại không còn xác nhận; mỗi mức mới phải được bảo vệ bằng dữ liệu hiện tại.",
     ])
 
 def build_feature_engineering_block(
@@ -4735,8 +4735,6 @@ def build_feature_engineering_block(
     atr_main = _current_atr(main_df)
     atr_structure = _current_atr(structure_df)
     structure = _structure_info(structure_df, price)
-    risk = _risk_floor(timeframe_data, mode, price)
-
     fib = structure.get("fib", {})
 
     plan_contract = _format_model_plan_contract(timeframe_data, mode, price)
@@ -4747,13 +4745,13 @@ def build_feature_engineering_block(
         f"- Vai trò timeframe: {_mode_role_text(mode)}",
         build_market_regime_block(timeframe_data, mode),
         plan_contract,
-        f"- ATR14 {trigger_label}: {fmt(atr_trigger)} | ATR14 {main_label}: {fmt(atr_main)} | ATR14 {structure_label}: {fmt(atr_structure)} | Rủi ro tham chiếu: {fmt(risk)} USDT",
+        f"- ATR14 {trigger_label}: {fmt(atr_trigger)} | ATR14 {main_label}: {fmt(atr_main)} | ATR14 {structure_label}: {fmt(atr_structure)}",
         f"- Trigger {trigger_label} đã đóng: {_consecutive_candles(trigger_df)} | {_wick_body_info(trigger_df)}",
         f"- Setup {main_label} đã đóng: {_consecutive_candles(main_df)} | {_wick_body_info(main_df)}",
-        f"- Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}. Python chỉ cung cấp dữ liệu và các phép tính khách quan; model tự tổng hợp để chọn kế hoạch.",
+        f"- Phân loại cấu trúc {structure_label} do Python ước tính: {structure.get('trend', 'N/A')}. Đây chỉ là tham khảo; model phải tự đối chiếu với OHLCV, nến và các khung khác, không coi đây là kết luận bắt buộc.",
         "- Entry/SL/TP do model tự quyết định từ toàn bộ OHLCV, nến đã đóng, nến live trung lập, EMA, RSI, MACD, ATR, Fibonacci, swing và cấu trúc đã cung cấp. Không có danh sách level bắt buộc và không phải chọn số từ danh sách mức giá dựng sẵn.",
         "- Bot không cung cấp liquidation heatmap, vị thế đòn bẩy hay vùng thanh lý thật. Không được suy đoán hoặc tự tạo các dữ liệu đó từ OHLCV.",
-        "- Python chỉ kiểm tra hình học và RR sau khi model đã chọn Entry/SL/TP theo cấu trúc. Không tạo TP từ phép nhân RR và không bóp SL để vượt guard.",
+        "- Python chỉ parse và giữ nguyên Entry/SL/TP do model chọn. Python không kiểm tra hoặc ép RR, ATR, khoảng cách hay cấu trúc của các mức giá; điều kiện gửi duy nhất là Điểm tín hiệu.",
     ]
     return "\n".join(lines)
 
@@ -4784,7 +4782,6 @@ def build_feature_snapshot(
     atr_main = _current_atr(main_df)
     atr_structure = _current_atr(structure_df)
     structure = _structure_info(structure_df, price)
-    risk = _risk_floor(timeframe_data, mode, price)
     fib = structure.get("fib", {})
 
     def compact_tf(label: str, df: pd.DataFrame | None) -> str:
@@ -4813,7 +4810,7 @@ def build_feature_snapshot(
         compact_tf(big_label, big_df),
         f"Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}-{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}-{fmt(structure.get('major_high'))}",
         f"Fib {structure_label}: 0.382 {fmt(fib.get('0.382'))}, 0.5 {fmt(fib.get('0.5'))}, 0.618 {fmt(fib.get('0.618'))}",
-        f"ATR/risk: ATR {main_label} {fmt(atr_main)}, ATR {structure_label} {fmt(atr_structure)}, rủi ro tham chiếu {fmt(risk)}",
+        f"ATR: {main_label} {fmt(atr_main)}, {structure_label} {fmt(atr_structure)}",
         f"Nến {main_label}: {_consecutive_candles(main_df)}; {_wick_body_info(main_df)}",
     ]
     return " | ".join(parts)
@@ -5393,10 +5390,8 @@ def build_model_input_payload(
             "regime_text": build_market_regime_block(timeframe_data, mode),
         },
         "python_calculated_features": {
-            "risk_reference": _json_float(_risk_floor(timeframe_data, mode, price), 4) if price else None,
-            "minimum_stop_distance": _json_float(_minimum_stop_distance(timeframe_data, mode, price), 4) if price else None,
-            "structural_sl_buffer": _json_float(_structural_sl_buffer(timeframe_data, mode, price), 4) if price else None,
-            "structure": _structure_to_json(structure),
+            "structure_estimate": _structure_to_json(structure),
+            "structure_estimate_note": "Python estimate only. Re-check against OHLCV and closed candles; do not treat as mandatory direction or mandatory price levels.",
         },
         "timeframes": {
             label: _json_timeframe_summary(label, df, mode, candle_limit=_timeframe_contract(mode, label).get("closed_candle_limit"))
@@ -6692,8 +6687,10 @@ def _extract_signal_rubric_breakdown(output: str | None) -> dict:
         "direction_context": "huong_boi_canh_da_khung",
         "entry_timing": "entry_timing",
         "entry_va_timing": "entry_timing",
-        "sl_tp_rr": "sl_tp_rr",
-        "sltp_rr": "sl_tp_rr",
+        "chat_luong_ke_hoach": "chat_luong_ke_hoach",
+        "plan_quality": "chat_luong_ke_hoach",
+        "sl_tp_rr": "chat_luong_ke_hoach",
+        "sltp_rr": "chat_luong_ke_hoach",
         "mau_thuan_rui_ro_nhieu": "mau_thuan_rui_ro_nhieu",
         "mau_thuan_va_rui_ro_nhieu": "mau_thuan_rui_ro_nhieu",
         "contradiction_noise": "mau_thuan_rui_ro_nhieu",

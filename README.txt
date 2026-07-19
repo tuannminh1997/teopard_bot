@@ -190,3 +190,10 @@ Cập nhật V44 - một rubric cuối duy nhất:
 - Python không tự chấm confidence/setup nữa; chỉ parse Điểm tín hiệu, lọc ngưỡng và guard lỗi cứng Entry/SL/TP/RR.
 - Output user chỉ còn: QUYẾT ĐỊNH, Điểm tín hiệu, Entry/SL/TP, Kích hoạt và Rủi ro. Không hiện Kịch bản chính, Chất lượng kế hoạch hay Điểm tin cậy AI.
 - Auto Scan gửi user khi Điểm tín hiệu >= AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE và kế hoạch không lỗi cứng.
+
+
+MODEL ENTRY/SL/TP (CURRENT)
+- Python cung cấp OHLCV và các phép tính như EMA, RSI, MACD, ATR, Fibonacci, swing và các nhãn cấu trúc tham khảo.
+- Model tự quyết định Entry, SL, TP1, TP2 từ toàn bộ dữ liệu; không có Level Map, ID nguồn, risk floor hay RR guard ép giá.
+- Python giữ nguyên các mức model trả về. Gate gửi tín hiệu duy nhất là Điểm tín hiệu.
+- RR chỉ là tiêu chí đánh giá tính thực thi sau khi chọn mức, không được dùng để nắn Entry/SL/TP.
