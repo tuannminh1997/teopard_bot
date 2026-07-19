@@ -3809,7 +3809,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
 
 def _python_adjusts_model_sl() -> bool:
-    """Mặc định tắt: model là nguồn quyết định SL; Python không tự dời số, chỉ validate nguồn/cấu trúc và áp buffer user.
+    """Mặc định tắt: model là nguồn quyết định SL; Python không tự dời số; chỉ giữ tùy chọn tương thích khi người vận hành chủ động bật.
 
     Bật TEOPARD_PYTHON_ADJUST_SL=1 nếu muốn quay lại kiểu Python ép SL theo
     swing/invalidation.
@@ -3817,7 +3817,7 @@ def _python_adjusts_model_sl() -> bool:
     return _env_bool("TEOPARD_PYTHON_ADJUST_SL", False)
 
 def _python_adjusts_model_tp() -> bool:
-    """Mặc định tắt: model là nguồn quyết định TP; Python không tự dời số, chỉ validate nguồn/RR/ATR và áp buffer user.
+    """Mặc định tắt: model là nguồn quyết định TP; Python không tự dời số; chỉ giữ tùy chọn tương thích khi người vận hành chủ động bật.
 
     Bật TEOPARD_PYTHON_ADJUST_TP=1 nếu muốn Python tự nhảy TP sang target kế tiếp
     khi model đặt TP quá sát.
@@ -4692,145 +4692,8 @@ def build_synchronized_decision_snapshot(
 
 
 
-def _build_model_level_catalog(
-    timeframe_data: dict[str, pd.DataFrame | None],
-    mode: str,
-    price: float,
-    zones: dict | None = None,
-    structure: dict | None = None,
-    max_per_side: int = 6,
-) -> dict[str, dict]:
-    """Gom, xếp hạng và gắn ID cho các level model được phép dùng.
-
-    Mỗi phía chỉ giữ tối đa 6 cụm từ cấu trúc, Fibonacci và EMA. Tham số ``zones``
-    chỉ được giữ để tương thích lời gọi cũ; pseudo-liquidation không còn được đưa
-    vào bản đồ level, prompt hay Python guard.
-    """
-    _ = zones
-    main_label, structure_label, big_label = _mode_labels(mode)
-    structure = structure or _structure_info(timeframe_data.get(structure_label), price)
-    atr_ref = _current_atr(timeframe_data.get(_mode_trigger_label(mode)))
-    try:
-        atr_ref = float(atr_ref) if atr_ref is not None else 0.0
-    except Exception:
-        atr_ref = 0.0
-    merge_tol = max(price * (0.0006 if mode == "short" else 0.0015), atr_ref * 0.20, 1e-9)
-
-    raw: list[dict] = []
-
-    def add_point(level: float | None, name: str, score: float) -> None:
-        try:
-            val = float(level)
-        except Exception:
-            return
-        if not np.isfinite(val) or val <= 0 or abs(val - price) <= 1e-12:
-            return
-        raw.append({"low": val, "high": val, "anchor": val, "labels": [name], "score": float(score)})
-
-    def add_structure(label: str, base_score: float) -> None:
-        info = structure if label == structure_label else _structure_info(timeframe_data.get(label), price)
-        add_point(info.get("recent_high"), f"đỉnh gần {label}", base_score + 0.55)
-        add_point(info.get("recent_low"), f"đáy gần {label}", base_score + 0.55)
-        add_point(info.get("major_high"), f"biên cao {label}", base_score + 0.25)
-        add_point(info.get("major_low"), f"biên thấp {label}", base_score + 0.25)
-        for name, value in (info.get("fib") or {}).items():
-            add_point(value, f"Fib {label} {name}", base_score)
-        df = timeframe_data.get(label)
-        data = _closed_candles(df) if df is not None else None
-        if data is not None and not data.empty:
-            row = data.iloc[-1]
-            add_point(row.get("ema_7"), f"EMA7 {label}", base_score + 0.10)
-            add_point(row.get("ema_25"), f"EMA25 {label}", base_score + 0.15)
-            add_point(row.get("ema_50"), f"EMA50 {label}", base_score + 0.20)
-
-    add_structure(main_label, 2.10)
-    if structure_label != main_label:
-        add_structure(structure_label, 2.35)
-    if big_label not in (main_label, structure_label):
-        add_structure(big_label, 1.70)
-
-    def side_of(c: dict) -> str | None:
-        if c["low"] > price:
-            return "above"
-        if c["high"] < price:
-            return "below"
-        return None
-
-    def merge_side(items: list[dict]) -> list[dict]:
-        items = sorted(items, key=lambda c: float(c["anchor"]))
-        merged: list[dict] = []
-        for cand in items:
-            hit = None
-            for kept in merged:
-                gap = max(float(cand["low"]) - float(kept["high"]), float(kept["low"]) - float(cand["high"]), 0.0)
-                if gap <= merge_tol:
-                    hit = kept
-                    break
-            if hit is None:
-                merged.append(dict(cand))
-                continue
-            hit["low"] = min(float(hit["low"]), float(cand["low"]))
-            hit["high"] = max(float(hit["high"]), float(cand["high"]))
-            if float(cand.get("score", 0.0)) > float(hit.get("score", 0.0)):
-                hit["anchor"] = float(cand["anchor"])
-            hit["score"] = max(float(hit.get("score", 0.0)), float(cand.get("score", 0.0)))
-            for label in cand.get("labels", []):
-                if label not in hit["labels"]:
-                    hit["labels"].append(label)
-
-        # Luôn giữ 4 cụm gần nhất và bổ sung tối đa 2 cụm mạnh nhất còn lại.
-        by_dist = sorted(merged, key=lambda c: abs(float(c["anchor"]) - price))
-        selected = by_dist[:min(4, max_per_side)]
-        remaining = [c for c in by_dist if c not in selected]
-        remaining = sorted(remaining, key=lambda c: (-float(c.get("score", 0.0)), abs(float(c["anchor"]) - price)))
-        selected += remaining[:max(0, max_per_side - len(selected))]
-        return sorted(selected, key=lambda c: abs(float(c["anchor"]) - price))
-
-    result: dict[str, dict] = {}
-    for side, prefix in (("above", "A"), ("below", "B")):
-        selected = merge_side([c for c in raw if side_of(c) == side])
-        for idx, cand in enumerate(selected, 1):
-            item = dict(cand)
-            item["id"] = f"{prefix}{idx}"
-            item["side"] = side
-            result[item["id"]] = item
-    return result
 
 
-def _format_model_level_map(
-    timeframe_data: dict[str, pd.DataFrame | None],
-    mode: str,
-    price: float,
-    zones: dict | None = None,
-    structure: dict | None = None,
-) -> str:
-    """Bản đồ level đã gộp, có ID để model khai báo nguồn Entry/SL/TP."""
-    catalog = _build_model_level_catalog(timeframe_data, mode, price, None, structure, max_per_side=6)
-
-    def compact(prefix: str, title: str) -> str:
-        items = [catalog[k] for k in sorted(catalog) if k.startswith(prefix)]
-        if not items:
-            return f"{title}: N/A"
-        parts = []
-        for item in items:
-            low, high = float(item["low"]), float(item["high"])
-            level_text = fmt(low) if abs(high - low) <= 1e-9 else f"{fmt(low)}–{fmt(high)}"
-            dist = abs(float(item["anchor"]) - price)
-            pct = dist / max(price, 1e-12) * 100.0
-            labels = " + ".join(item.get("labels", [])[:5])
-            kind = "vùng" if abs(high - low) > 1e-9 else "mốc neo"
-            parts.append(
-                f"{item['id']}={level_text} [{kind}] ({labels}, cách {fmt(dist)} / {pct:.2f}%)"
-            )
-        return title + ": " + "; ".join(parts)
-
-    return "\n".join([
-        "BẢN ĐỒ LEVEL ĐÃ GỘP — dùng ID trong block nguồn, không show user:",
-        compact("A", "- Phía trên giá"),
-        compact("B", "- Phía dưới giá"),
-        "- Mốc neo là giá tham chiếu cấu trúc, KHÔNG phải hai biên Entry. Model phải tự đọc nến/EMA/cụm level để tạo vùng giao dịch có bề rộng thực tế quanh mốc neo; không được lấy mốc rồi cộng/trừ vài chữ số thập phân tùy ý.",
-        "- CURRENT chỉ được dùng làm nguồn Entry khi giá hiện tại nằm trong vùng Entry và xác nhận đã đủ.",
-    ])
 
 
 def _format_model_plan_contract(
@@ -4838,23 +4701,18 @@ def _format_model_plan_contract(
     mode: str,
     price: float,
 ) -> str:
-    """Bốn nguyên tắc ngắn để model lập kế hoạch theo cấu trúc.
-
-    RR chỉ là bộ kiểm tra sau cùng. Block này không đưa mốc RR, khoảng cách TP,
-    độ rộng Entry hay công thức ATR để tránh neo model vào các con số tối thiểu.
-    """
+    """Nguyên tắc để model tự lập kế hoạch từ dữ liệu, không bị Python neo giá."""
     _ = timeframe_data, price
     return "\n".join([
         "NGUYÊN TẮC LẬP ENTRY/SL/TP — dùng nội bộ, không show user:",
         f"- Vai trò timeframe: {_mode_role_text(mode)}",
-        "1. Trước tiên phải viết nội bộ luận điểm giao dịch: hướng, vùng vô hiệu và hai mục tiêu cấu trúc. Chỉ sau đó mới chọn con số; không bắt đầu từ việc tìm một bộ số có RR đẹp.",
-        "2. Entry là một vùng đấu giá thực tế, không phải một điểm giả dạng thành range. Hai biên phải xuất phát từ biên nến, cụm EMA/Fibonacci hoặc nhiều level hội tụ trong dữ liệu. Cấm tạo vùng chỉ rộng vài tick/vài chữ số thập phân nếu dữ liệu không cho thấy một vùng hẹp như vậy.",
-        "3. ID nguồn ENTRY là mốc neo của vùng, không bắt buộc là một trong hai biên. Hãy dùng raw candles và độ biến động đang có để quyết định hai biên bằng phân tích của chính model; không dùng công thức cố định và không chờ Python sửa.",
-        "4. SL phải nằm ngoài điểm vô hiệu thật của luận điểm. TP1/TP2 phải là các mục tiêu cấu trúc kế tiếp, theo đúng thứ tự khoảng cách; không chọn các số trung gian chỉ để làm đẹp RR.",
-        "5. Tự kiểm tra tính thực dụng trước khi trả lời: Entry có đủ rộng để giá thật sự khớp nhưng không quá rộng; SL không nằm trong nhiễu thông thường; TP1/TP2 không phải các số nội suy vô căn cứ; kế hoạch vẫn hợp lý khi nhìn bằng đơn vị phần trăm và ATR của chính dữ liệu.",
-        "6. Nếu không thể giải thích nguồn của từng biên Entry và từng mức SL/TP từ dữ liệu đã cho, chọn NO TRADE thay vì xuất số có độ chính xác giả.",
-        "- Trình tự bắt buộc: luận điểm → chọn ID nguồn → tạo vùng Entry từ hành vi giá thật → chọn invalidation/targets → kiểm tra RR → giữ kế hoạch hoặc NO TRADE.",
-        "- Nếu LONG/SHORT, bắt buộc khai báo ID nguồn trong block [[TEOPARD_PLAN_SOURCES]]. Python chỉ parse/validate; mọi con số công khai phải là kết quả phân tích nguyên bản của model.",
+        "1. Python chỉ cung cấp dữ liệu raw và các phép tính khách quan. Model phải tự hình thành luận điểm giao dịch rồi tự chọn Entry, SL, TP1 và TP2; không có level ID bắt buộc.",
+        "2. Entry phải là vùng giao dịch có lý do từ hành động giá và độ biến động thực tế. Không tạo range giả chỉ rộng vài tick hoặc vài chữ số thập phân nếu chart không có vùng hẹp tương ứng.",
+        "3. SL phải nằm ngoài điểm vô hiệu thật của luận điểm do model tự xác định từ cấu trúc/nến/volatility. Không đặt SL chỉ để đạt RR đẹp.",
+        "4. TP1 và TP2 phải là các mục tiêu mà model suy ra từ cấu trúc thị trường, swing, vùng phản ứng, Fibonacci, EMA hoặc price action trong dữ liệu; không bắt buộc trùng bất kỳ mốc Python nào.",
+        "5. Tự kiểm tra trước khi trả lời: vì sao Entry có hai biên này, điều gì vô hiệu luận điểm, cấu trúc nào tạo TP1/TP2, và các mức có thực dụng so với ATR/phần trăm biến động hay không.",
+        "6. Nếu dữ liệu không đủ để tự bảo vệ các mức giá bằng lập luận rõ ràng, chọn NO TRADE thay vì xuất số có độ chính xác giả.",
+        "- Python sẽ giữ nguyên các số model trả về. Gate gửi tín hiệu chỉ dựa trên Điểm tín hiệu; Python không sửa Entry/SL/TP và không ép chúng khớp danh sách mức giá dựng sẵn.",
     ])
 
 def build_feature_engineering_block(
@@ -4881,7 +4739,6 @@ def build_feature_engineering_block(
 
     fib = structure.get("fib", {})
 
-    level_map = _format_model_level_map(timeframe_data, mode, price, None, structure)
     plan_contract = _format_model_plan_contract(timeframe_data, mode, price)
 
     lines = [
@@ -4889,13 +4746,12 @@ def build_feature_engineering_block(
         f"- Mode: {'SCALP' if mode == 'short' else 'SWING'} | Trigger: {trigger_label} | Khung setup/chính: {main_label} | Khung cấu trúc/xác nhận: {structure_label} | Khung lớn: {big_label}",
         f"- Vai trò timeframe: {_mode_role_text(mode)}",
         build_market_regime_block(timeframe_data, mode),
-        level_map,
         plan_contract,
         f"- ATR14 {trigger_label}: {fmt(atr_trigger)} | ATR14 {main_label}: {fmt(atr_main)} | ATR14 {structure_label}: {fmt(atr_structure)} | Rủi ro tham chiếu: {fmt(risk)} USDT",
         f"- Trigger {trigger_label} đã đóng: {_consecutive_candles(trigger_df)} | {_wick_body_info(trigger_df)}",
         f"- Setup {main_label} đã đóng: {_consecutive_candles(main_df)} | {_wick_body_info(main_df)}",
-        f"- Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}. Các level số đã được gộp duy nhất trong BẢN ĐỒ LEVEL ở trên.",
-        "- Entry/SL/TP chỉ được bám vào cấu trúc giá có thể kiểm chứng: đỉnh/đáy, Fibonacci, EMA, ATR và hành động giá từ nến đã đóng.",
+        f"- Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}. Python chỉ cung cấp dữ liệu và các phép tính khách quan; model tự tổng hợp để chọn kế hoạch.",
+        "- Entry/SL/TP do model tự quyết định từ toàn bộ OHLCV, nến đã đóng, nến live trung lập, EMA, RSI, MACD, ATR, Fibonacci, swing và cấu trúc đã cung cấp. Không có danh sách level bắt buộc và không phải chọn số từ danh sách mức giá dựng sẵn.",
         "- Bot không cung cấp liquidation heatmap, vị thế đòn bẩy hay vùng thanh lý thật. Không được suy đoán hoặc tự tạo các dữ liệu đó từ OHLCV.",
         "- Python chỉ kiểm tra hình học và RR sau khi model đã chọn Entry/SL/TP theo cấu trúc. Không tạo TP từ phép nhân RR và không bóp SL để vượt guard.",
     ]
@@ -5615,7 +5471,7 @@ def build_user_prompt(
         "- Trả lời bằng text tiếng Việt theo format cũ của bot, KHÔNG trả JSON.",
         "- Quyết định cuối cùng chỉ là LONG, SHORT hoặc NO TRADE.",
         "- Nếu LONG/SHORT phải có đủ Entry, SL, TP1, TP2 là số cụ thể.",
-        "- Nếu LONG/SHORT, trước block rubric bắt buộc có block [[TEOPARD_PLAN_SOURCES]] gồm ENTRY, SL, TP1, TP2 và dùng đúng ID A1..A6/B1..B6 trong BẢN ĐỒ LEVEL; ENTRY được phép CURRENT khi giá đang nằm trong Entry và xác nhận đã đủ. Python sẽ ẩn block này.",
+        "- Nếu LONG/SHORT, model tự chọn Entry/SL/TP từ toàn bộ dữ liệu đã cung cấp; không cần khai báo ID hay nguồn mức giá do Python dựng.",
         "- Cuối phản hồi bắt buộc có block [[TEOPARD_RUBRIC]] đúng key V44 và đủ 5 dòng SIGNAL; Python sẽ ẩn block, cộng thành Điểm tín hiệu /100 và dùng điểm đó để filter.",
         "- Không tự in Điểm tín hiệu trong phần public; Python sẽ chèn đúng một dòng Điểm tín hiệu dưới dòng QUYẾT ĐỊNH.",
         "- Bot không cung cấp dữ liệu thanh lý/heatmap; không được suy đoán chúng từ OHLCV. Dùng cấu trúc, Fibonacci, EMA, ATR, volume, nến đã đóng và block nến live trung lập đã được Python tách riêng.",
@@ -6152,10 +6008,6 @@ Schema:
   "sl": 59884.11,
   "tp1": 62064.0,
   "tp2": 62750.0,
-  "entry_source": "B1 hoặc CURRENT",
-  "sl_source": "B2",
-  "tp1_source": "A1",
-  "tp2_source": "A3",
   "risk_text": "~1,465.89 USDT",
   "activation": "Có thể vào ngay... hoặc Lệnh chờ, chưa vào ngay...",
   "risk_note": "Rủi ro chính và điều kiện hủy lệnh ngắn gọn."
@@ -6210,37 +6062,10 @@ def _num_or_none(value) -> float | None:
 
 
 
-def _extract_plan_sources(output: str | None) -> dict[str, str]:
-    """Đọc block nguồn level nội bộ do model trả; block này không bao giờ show user."""
-    text = output or ""
-    match = re.search(
-        r"\[\[TEOPARD_PLAN_SOURCES\]\]([\s\S]*?)\[\[/TEOPARD_PLAN_SOURCES\]\]",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if not match:
-        return {}
-    result: dict[str, str] = {}
-    for raw_line in match.group(1).splitlines():
-        m = re.fullmatch(r"\s*(ENTRY|SL|TP1|TP2)\s*=\s*([A-B][1-6]|CURRENT|NA)\s*", raw_line, flags=re.IGNORECASE)
-        if m:
-            result[m.group(1).lower()] = m.group(2).upper()
-    return result
 
 
-def _remove_plan_sources_block(output: str | None) -> str:
-    return re.sub(
-        r"\n?\s*\[\[TEOPARD_PLAN_SOURCES\]\][\s\S]*?\[\[/TEOPARD_PLAN_SOURCES\]\]\s*",
-        "\n",
-        output or "",
-        flags=re.IGNORECASE,
-    ).strip()
 
 
-def _attach_plan_sources(pred: dict, raw_output: str | None) -> dict:
-    enriched = dict(pred)
-    enriched["_plan_sources"] = _extract_plan_sources(raw_output)
-    return enriched
 
 
 def _rubric_item_score(raw: float, maximum: float) -> float:
@@ -6312,49 +6137,8 @@ def _range_sorted(a: float | None, b: float | None) -> tuple[float | None, float
     return (min(af, bf), max(af, bf))
 
 
-def _score_catalog_entry_match(catalog: dict[str, dict], entry_low: float, entry_high: float, price: float, tol: float) -> tuple[float, str | None]:
-    entry_mid = (entry_low + entry_high) / 2.0
-    candidates = [
-        (key, item) for key, item in catalog.items()
-        if float(item["high"]) + tol >= entry_low and float(item["low"]) - tol <= entry_high
-    ]
-    if candidates:
-        key, _item = min(candidates, key=lambda kv: abs(float(kv[1]["anchor"]) - entry_mid))
-        return 25.0, key
-    # Nếu giá hiện tại nằm trong vùng Entry, xem như entry hợp lệ nhưng thấp hơn level map rõ ràng.
-    if entry_low <= price <= entry_high:
-        return 20.0, "CURRENT"
-    # Entry gần một level nhưng chưa thật sự ôm level.
-    nearest_gap = None
-    for item in catalog.values():
-        gap = max(float(item["low"]) - entry_high, entry_low - float(item["high"]), 0.0)
-        nearest_gap = gap if nearest_gap is None else min(nearest_gap, gap)
-    if nearest_gap is not None and nearest_gap <= tol * 2.0:
-        return 16.0, None
-    return 8.0, None
 
 
-def _score_catalog_point_match(catalog: dict[str, dict], value: float, direction: str, point_role: str, entry_low: float, entry_high: float, tol: float) -> tuple[float, str | None]:
-    # point_role: sl/tp1/tp2. Return 1.0 style score, not points.
-    matches = [
-        (key, item) for key, item in catalog.items()
-        if _catalog_item_matches_price(item, value, tol)
-    ]
-    if not matches:
-        return 0.0, None
-    key, item = min(matches, key=lambda kv: abs(float(kv[1]["anchor"]) - float(value)))
-    anchor = float(item["anchor"])
-    if point_role == "sl":
-        if direction == "LONG" and anchor >= entry_low:
-            return 0.25, key
-        if direction == "SHORT" and anchor <= entry_high:
-            return 0.25, key
-        return 1.0, key
-    if direction == "LONG" and anchor <= entry_high:
-        return 0.25, key
-    if direction == "SHORT" and anchor >= entry_low:
-        return 0.25, key
-    return 1.0, key
 
 
 def _python_setup_score_breakdown(
@@ -6383,9 +6167,14 @@ def _python_setup_score_breakdown(
     atr_label, atr = _tp_noise_atr(timeframe_data, mode)
     atr_val = float(atr or 0.0)
     tol = max(price * (0.0007 if mode == "short" else 0.0018), atr_val * 0.25, 1e-9)
-    catalog = _build_model_level_catalog(timeframe_data, mode, price, max_per_side=6)
-
-    entry_points, entry_source = _score_catalog_entry_match(catalog, entry_low, entry_high, price, tol) if catalog else (18.0 if entry_low <= price <= entry_high else 8.0, None)
+    # Model được toàn quyền chọn vùng từ dữ liệu raw; không chấm theo danh sách mức giá dựng sẵn.
+    entry_source = None
+    if entry_low <= price <= entry_high:
+        entry_points = 25.0
+    elif atr_val > 0 and _distance_price_to_entry(pred, price) <= atr_val * (1.3 if mode == "short" else 1.1):
+        entry_points = 20.0
+    else:
+        entry_points = 14.0
 
     # SL: geometry first, then invalidation/source quality.
     if direction == "LONG":
@@ -6395,28 +6184,25 @@ def _python_setup_score_breakdown(
         sl_geometry_ok = sl > entry_high
         final_risk = sl - entry_low
     min_stop = _minimum_stop_distance(timeframe_data, mode, price)
-    sl_match_score, sl_source = _score_catalog_point_match(catalog, float(pred.get("_sl_before_extra_buffer") or sl), direction, "sl", entry_low, entry_high, max(tol, atr_val * 0.50)) if catalog else (0.0, None)
+    sl_source = None
     if not sl_geometry_ok or final_risk <= 0:
         sl_points = 0.0
-    elif sl_match_score >= 1.0:
-        sl_points = 20.0 if final_risk >= min_stop else 15.0
     elif final_risk >= min_stop:
-        sl_points = 12.0
+        sl_points = 20.0
     else:
-        sl_points = 7.0
+        sl_points = 12.0
 
     # TP: nguồn target thực tế tách khỏi RR.
     if direction == "LONG":
         tp_geometry_ok = tp1 > entry_high and tp2 >= tp1
     else:
         tp_geometry_ok = tp1 < entry_low and tp2 <= tp1
-    tp1_match_score, tp1_source = _score_catalog_point_match(catalog, float(pred.get("_tp1_before_extra_buffer") or tp1), direction, "tp1", entry_low, entry_high, max(tol, atr_val * 0.30)) if catalog else (0.0, None)
-    tp2_match_score, tp2_source = _score_catalog_point_match(catalog, float(pred.get("_tp2_before_extra_buffer") or tp2), direction, "tp2", entry_low, entry_high, max(tol, atr_val * 0.30)) if catalog else (0.0, None)
+    tp1_source = None
+    tp2_source = None
     if not tp_geometry_ok:
         tp_target_points = 0.0
     else:
-        tp_target_points = 5.0 + 5.0 * tp1_match_score + 5.0 * tp2_match_score
-        tp_target_points = min(tp_target_points, 15.0)
+        tp_target_points = 15.0
 
     # RR/room: dùng worst-case edge và threshold theo mode.
     rr = _plan_worst_case_risk_reward(pred, use_rr_guard_sl=True, use_rr_guard_tp=True)
@@ -7006,7 +6792,7 @@ def finalize_model_scoring_output(output: str | None) -> tuple[str, dict]:
     if signal_score is None and not has_rubric_block:
         signal_score = _extract_legacy_confidence(raw_text)
 
-    clean = _remove_plan_sources_block(_remove_rubric_block(raw_text))
+    clean = _remove_rubric_block(raw_text)
     clean = _insert_public_signal_score(clean, signal_score)
     return clean, {
         "signal_score": signal_score,
@@ -7045,11 +6831,6 @@ def parse_prediction_from_json_payload(payload: dict | None) -> dict:
         "sl": _num_or_none(payload.get("sl")),
         "tp1": _num_or_none(payload.get("tp1")),
         "tp2": _num_or_none(payload.get("tp2")),
-        "_plan_sources": {
-            key: str(payload.get(f"{key}_source") or "").upper()
-            for key in ("entry", "sl", "tp1", "tp2")
-            if payload.get(f"{key}_source")
-        },
     }
 
 
@@ -7469,117 +7250,10 @@ def _validate_scalp_reversal_quality(
 
     return errors
 
-def _catalog_item_matches_price(item: dict, value: float, tolerance: float) -> bool:
-    return float(item["low"]) - tolerance <= float(value) <= float(item["high"]) + tolerance
 
 
-def _resolve_structural_source(
-    catalog: dict[str, dict],
-    requested: str | None,
-    value: float,
-    tolerance: float,
-) -> tuple[str | None, dict | None]:
-    req = str(requested or "").upper()
-    if req in catalog and _catalog_item_matches_price(catalog[req], value, tolerance):
-        return req, catalog[req]
-    matches = [
-        (key, item) for key, item in catalog.items()
-        if _catalog_item_matches_price(item, value, tolerance)
-    ]
-    if not matches:
-        return None, None
-    key, item = min(matches, key=lambda kv: abs(float(kv[1]["anchor"]) - float(value)))
-    return key, item
 
 
-def _validate_structural_plan_sources(
-    pred: dict,
-    timeframe_data: dict[str, pd.DataFrame | None],
-    mode: str,
-    current_price: float | None,
-) -> list[str]:
-    """Buộc SL/TP bám level đã gộp; nguồn model khai báo được kiểm chứng bằng giá."""
-    if current_price is None:
-        return []
-    direction = (pred.get("direction") or "").upper()
-    if direction not in ("LONG", "SHORT"):
-        return []
-    try:
-        entry_low, entry_high = sorted((float(pred["entry_low"]), float(pred["entry_high"])))
-        sl, tp1, tp2 = float(pred["sl"]), float(pred["tp1"]), float(pred["tp2"])
-        price = float(current_price)
-    except Exception:
-        return []
-
-    catalog = _build_model_level_catalog(timeframe_data, mode, price, max_per_side=6)
-    if not catalog:
-        return []
-    atr_label, atr = _tp_noise_atr(timeframe_data, mode)
-    tol = max(price * (0.0007 if mode == "short" else 0.0018), (atr or 0.0) * 0.25, 1e-9)
-    sources = pred.get("_plan_sources") if isinstance(pred.get("_plan_sources"), dict) else {}
-    errors: list[str] = []
-    resolved: dict[str, str] = {}
-
-    entry_req = str(sources.get("entry") or "").upper()
-    if entry_req == "CURRENT" and entry_low <= price <= entry_high:
-        resolved["entry"] = "CURRENT"
-    else:
-        # Entry là range nên match nếu một level nằm trong/giáp range.
-        entry_mid = (entry_low + entry_high) / 2.0
-        entry_match = None
-        if entry_req in catalog:
-            item = catalog[entry_req]
-            if float(item["high"]) + tol >= entry_low and float(item["low"]) - tol <= entry_high:
-                entry_match = (entry_req, item)
-        if entry_match is None:
-            candidates = [
-                (key, item) for key, item in catalog.items()
-                if float(item["high"]) + tol >= entry_low and float(item["low"]) - tol <= entry_high
-            ]
-            if candidates:
-                entry_match = min(candidates, key=lambda kv: abs(float(kv[1]["anchor"]) - entry_mid))
-        if entry_match:
-            resolved["entry"] = entry_match[0]
-        elif not (entry_low <= price <= entry_high):
-            errors.append("Entry không bám level kỹ thuật nào trong bản đồ đã gộp.")
-        else:
-            # Immediate entry vẫn được chấp nhận khi model quên CURRENT; Python tự resolve.
-            resolved["entry"] = "CURRENT"
-
-    source_values = {
-        "sl": float(pred.get("_sl_before_extra_buffer") or sl),
-        "tp1": float(pred.get("_tp1_before_extra_buffer") or tp1),
-        "tp2": float(pred.get("_tp2_before_extra_buffer") or tp2),
-    }
-    for key, value in source_values.items():
-        key_tol = tol
-        if atr is not None:
-            key_tol = max(key_tol, atr * (0.50 if key == "sl" else 0.30))
-        src_id, item = _resolve_structural_source(catalog, sources.get(key), value, key_tol)
-        if src_id is None or item is None:
-            errors.append(f"{key.upper()} không bám level cấu trúc nào trong bản đồ đã gộp (khung tham chiếu ATR {atr_label}).")
-            continue
-        resolved[key] = src_id
-        if key == "sl":
-            tiny = max(price * 0.00003, 1e-9)
-            if direction == "LONG":
-                if float(item["anchor"]) >= entry_low:
-                    errors.append("Nguồn SL LONG không nằm phía dưới vùng Entry.")
-                if value > float(item["low"]) + tiny:
-                    errors.append("SL LONG chưa nằm ra ngoài đáy/vùng vô hiệu đã chọn.")
-            else:
-                if float(item["anchor"]) <= entry_high:
-                    errors.append("Nguồn SL SHORT không nằm phía trên vùng Entry.")
-                if value < float(item["high"]) - tiny:
-                    errors.append("SL SHORT chưa nằm ra ngoài đỉnh/vùng vô hiệu đã chọn.")
-        elif key.startswith("tp"):
-            if direction == "LONG" and float(item["anchor"]) <= entry_high:
-                errors.append(f"Nguồn {key.upper()} LONG không nằm phía trên vùng Entry.")
-            if direction == "SHORT" and float(item["anchor"]) >= entry_low:
-                errors.append(f"Nguồn {key.upper()} SHORT không nằm phía dưới vùng Entry.")
-
-    pred["_resolved_plan_sources"] = resolved
-    return errors
 
 
 def _validate_actionable_trade_plan(
@@ -7723,7 +7397,7 @@ def sanitize_user_output(output: str) -> str:
         "EMA_DAN_XEN": "EMA đan xen",
         "modifier": "ghi chú",
     }
-    text = _remove_plan_sources_block(output or "")
+    text = output or ""
     # Dọn lỗi gõ/nhãn tiếng Anh thường bị model chèn vào output user.
     text = re.sub(r"\bNO[_\s-]?TRADE\b", "NO TRADE", text, flags=re.IGNORECASE)
     text = re.sub(r"\bREJECTED[_\s-]?PLAN\b", "kế hoạch bị từ chối", text, flags=re.IGNORECASE)
@@ -7899,7 +7573,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     raw_output = request_claude_analysis(system_prompt, user_prompt)
     scored_output, _score_meta = finalize_model_scoring_output(raw_output)
     output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
-    pred = _attach_plan_sources(parse_prediction_from_output(output), raw_output)
+    pred = parse_prediction_from_output(output)
 
     # Model-authoritative flow:
     # - Model tự chọn và chịu trách nhiệm toàn bộ Entry/SL/TP.
@@ -8075,7 +7749,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     )
     scored_output, _score_meta = finalize_model_scoring_output(raw_output)
     output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
-    pred = _attach_plan_sources(parse_prediction_from_output(output), raw_output)
+    pred = parse_prediction_from_output(output)
 
     # Model-authoritative flow:
     # - Model tự chọn và chịu trách nhiệm toàn bộ Entry/SL/TP.
@@ -9280,7 +8954,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt + flash_note)
     scored_output, _score_meta = finalize_model_scoring_output(raw_output)
     output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
-    pred = _attach_plan_sources(parse_prediction_from_output(output), raw_output)
+    pred = parse_prediction_from_output(output)
     direction = (pred.get("direction") or "").upper()
     if direction in {"LONG", "SHORT"}:
         pred, output = apply_python_objective_scores(pred, output, timeframe_data, mode, current_price)

@@ -28,13 +28,13 @@ Auto Scan:
 
 Bản này không truyền vùng thanh lý/thanh khoản ước lượng từ OHLCV cho Flash hoặc Pro.
 
-- BẢN ĐỒ LEVEL chỉ gồm cấu trúc, đỉnh/đáy, Fibonacci và EMA7/EMA25/EMA50.
+- Python gửi OHLCV, nến đã đóng, nến live trung lập và các phép tính kỹ thuật khách quan như EMA, RSI, MACD, ATR, Fibonacci, swing và cấu trúc.
+- Model tự suy luận Entry, SL, TP1 và TP2; không có Level Map, catalog hoặc ID giá bắt buộc.
 - ATR, volume, RSI, MACD và nến đã đóng vẫn được gửi bình thường.
 - Râu nến/cú quét đỉnh-đáy đã xảy ra được coi là hành động giá, không phải dữ liệu thanh lý thật.
-- Auto-adjust TP, nếu bật, chỉ lấy target cấu trúc/Fibonacci; không dùng liquidity box ước lượng.
+- Mặc định Python không tự chỉnh Entry/SL/TP; các mức do model chọn được giữ nguyên.
 - Feature snapshot mới không chứa vùng dưới/trên ước lượng.
 - Snapshot cũ trong DB được lọc khi đưa lại vào prompt; không cần xóa `bot.db`.
-- Các hàm tính vùng cũ còn nằm trong `analyze.py` để tương thích mã nguồn, nhưng không còn được gọi trong prompt, level map, guard, manual hay Auto Scan.
 
 ## Timeframe
 
