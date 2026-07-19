@@ -197,3 +197,9 @@ MODEL ENTRY/SL/TP (CURRENT)
 - Model tự quyết định Entry, SL, TP1, TP2 từ toàn bộ dữ liệu; không có Level Map, ID nguồn, risk floor hay RR guard ép giá.
 - Python giữ nguyên các mức model trả về. Gate gửi tín hiệu duy nhất là Điểm tín hiệu.
 - RR chỉ là tiêu chí đánh giá tính thực thi sau khi chọn mức, không được dùng để nắn Entry/SL/TP.
+
+AI INPUT POLICY
+---------------
+- Model prefilter và model phân tích chính KHÔNG nhận lịch sử dự đoán/trade cũ.
+- /history, /stats và dữ liệu kết quả vẫn được lưu để user xem, nhưng không được đưa trở lại prompt.
+- Chỉ kế hoạch đang mở hiện tại được gửi như trạng thái vận hành; nó không phải bằng chứng hướng và không được dùng để tái sử dụng Entry/SL/TP cũ.

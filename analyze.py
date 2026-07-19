@@ -1084,7 +1084,7 @@ def format_open_signal_context(open_signals: list[dict], current_price: float | 
     if not open_signals:
         return "KẾ HOẠCH ĐANG MỞ: Không có kế hoạch đang chờ/đã khớp cho user này ở cùng coin và mode."
 
-    lines = ["KẾ HOẠCH ĐANG MỞ CÙNG USER/COIN/MODE:"]
+    lines = ["KẾ HOẠCH ĐANG MỞ CÙNG USER/COIN/MODE (CHỈ LÀ TRẠNG THÁI VẬN HÀNH, KHÔNG PHẢI BẰNG CHỨNG HƯỚNG):"]
     for p in open_signals:
         entry = f"{fmt(p.get('entry_low'))}-{fmt(p.get('entry_high'))}" if p.get("entry_low") is not None and p.get("entry_high") is not None else "N/A"
         status = p.get("result") or p.get("entry_status") or "N/A"
@@ -1102,8 +1102,8 @@ def format_open_signal_context(open_signals: list[dict], current_price: float | 
     lines.extend([
         "Cách dùng kế hoạch đang mở:",
         "- Nếu kế hoạch cũ là LONG chờ hồi, vùng Entry LONG KHÔNG phải TP cho lệnh SHORT ngược lại. Nếu kế hoạch cũ là SHORT chờ hồi, vùng Entry SHORT KHÔNG phải TP cho lệnh LONG ngược lại.",
-        "- Khi phân tích lại, phải xem kế hoạch cũ là còn hiệu lực, bị hủy, hay cần thay bằng kế hoạch mới. Nếu thay kế hoạch, ghi ngắn trong Kích hoạt rằng kế hoạch mới thay thế kế hoạch cũ.",
-        "- Nếu giá không hồi về Entry cũ mà đã chạy theo hướng dự báo, không được đuổi giá chỉ vì giá đang chạy. Chỉ cho vào ngay khi giá hiện tại nằm trong vùng Entry mới hợp lý và đã có xác nhận rõ; nếu không, ưu tiên NO TRADE hoặc chờ kiểm tra lại.",
+        "- Hướng và mức giá cũ không được dùng làm bằng chứng. Chỉ giữ, hủy hoặc thay kế hoạch sau khi dữ liệu hiện tại tự xác nhận độc lập.",
+        "- Entry mới gần giá hiện tại vẫn hợp lệ nếu nằm trong luận điểm cấu trúc hiện tại và có điểm vô hiệu rõ. Chỉ coi là đuổi giá khi giá đã rời vùng luận điểm và không còn đặt được SL hợp lý.",
     ])
     return "\n".join(lines)
 
@@ -4903,7 +4903,7 @@ def build_market_snapshot(
     fear_greed_info: str,
     current_price_str: str,
 ) -> str:
-    lines = [current_price_str, fear_greed_info]
+    lines = [current_price_str]
     for label, df in timeframe_data.items():
         if df is None or df.empty:
             lines.append(f"{label}: no data")
@@ -4971,86 +4971,43 @@ def _sanitize_feature_snapshot_for_model(value: str | None) -> str:
     return " | ".join(clean) or "No feature snapshot."
 
 def format_prediction_history(history: list[dict]) -> str:
+    """Learning context without old price anchors or directional win-rate bias."""
     if not history:
-        return "No previous analysis for this symbol/mode."
+        return "No previous traded outcome for this symbol/mode."
 
-    lines = [f"USER-SPECIFIC RECENT TRADED-ONLY LEARNING SUMMARY ({len(history)} user-confirmed trades for this symbol/mode only):"]
-    finished = [p for p in history if p["result"] in ("WIN", "LOSS")]
-    if finished:
-        wins = sum(1 for p in finished if p["result"] == "WIN")
-        win_rate = wins / len(finished) * 100
-        lines.append(f"- Closed results: {wins}/{len(finished)} WIN, win rate {win_rate:.0f}%.")
-
-        long_finished = [p for p in finished if p["direction"] == "LONG"]
-        short_finished = [p for p in finished if p["direction"] == "SHORT"]
-        if long_finished:
-            long_wins = sum(1 for p in long_finished if p["result"] == "WIN")
-            lines.append(f"- LONG: {long_wins}/{len(long_finished)} WIN.")
-        if short_finished:
-            short_wins = sum(1 for p in short_finished if p["result"] == "WIN")
-            lines.append(f"- SHORT: {short_wins}/{len(short_finished)} WIN.")
-
-    losses = [p for p in finished if p["result"] == "LOSS"]
-    if losses:
-        loss_dirs = [p["direction"] for p in losses]
-        if loss_dirs.count("LONG") > loss_dirs.count("SHORT"):
-            lines.append("- Repeated issue: recent LONG calls have more losses. Require stronger bullish confirmation.")
-        elif loss_dirs.count("SHORT") > loss_dirs.count("LONG"):
-            lines.append("- Repeated issue: recent SHORT calls have more losses. Require stronger bearish confirmation.")
-
-    for i, p in enumerate(history, 1):
-        entry = f"{fmt(p['entry_low'])}-{fmt(p['entry_high'])}" if p["entry_low"] and p["entry_high"] else "N/A"
-        checked = f"checked price {fmt(p['result_price'])}" if p["result_price"] else "not checked"
-        reason = p.get("result_reason") or "Outcome not checked yet."
-        decision_reason = p.get("reasoning_summary") or "No decision reasoning summary."
-        snapshot = p.get("market_snapshot") or "No market snapshot."
-        feature_snapshot = _sanitize_feature_snapshot_for_model(p.get("feature_snapshot"))
+    selected = list(history or [])[:PREDICTION_HISTORY_COUNT]
+    lines = [
+        f"USER-SPECIFIC RECENT OUTCOME LESSONS ({len(selected)} confirmed trades):",
+        "- This history is diagnostic only. Do not prefer LONG/SHORT and do not reuse any old Entry/SL/TP from it.",
+    ]
+    for i, item in enumerate(selected, 1):
+        outcome = item.get("result") or "PENDING"
+        reason = str(item.get("result_reason") or "Outcome detail unavailable.").strip().replace("\n", " ")
+        if len(reason) > 220:
+            reason = reason[:217] + "..."
+        decision_reason = str(item.get("reasoning_summary") or "").strip().replace("\n", " ")
+        if len(decision_reason) > 260:
+            decision_reason = decision_reason[:257] + "..."
         lines.append(
-            f"- #{i} {p['created_at'][:16]} {p['direction']} {p['result']} ({checked}); "
-            f"Entry {entry}, SL {fmt(p['sl'])}, TP1 {fmt(p['tp1'])}, TP2 {fmt(p['tp2'])}. "
-            f"Decision why: {decision_reason} Outcome: {reason} "
-            f"Market then: {snapshot} Feature then: {feature_snapshot}"
+            f"- #{i} Outcome={outcome}. Original thesis summary: {decision_reason or 'N/A'}. Outcome note: {reason}"
         )
-
-    lines.append("Use this traded-only user-specific summary as learning context. These are signals the user explicitly chose to trade/follow; do not learn from unconfirmed analyses and do not assume global user behavior.")
+    lines.append("Use only to avoid repeated analytical mistakes; current OHLCV must determine direction and all new levels.")
     return "\n".join(lines)
 
 
 def format_deepseek_history_compact(history: list[dict], limit: int = 3) -> str:
-    """History cực gọn chỉ dành cho DeepSeek prefilter.
-
-    Không đưa market_snapshot/feature_snapshot/full_response vào prefilter để giữ
-    input token thấp. GLM phân tích chính vẫn nhận full history giống manual.
-    """
+    """Outcome-only history for prefilter; excludes old directions and price levels."""
     selected = list(history or [])[:max(0, int(limit))]
     if not selected:
         return "Không có lịch sử đã trade cho coin/mode này."
-
-    finished = [p for p in selected if p.get("result") in ("WIN", "LOSS")]
-    lines = [f"{len(selected)} lệnh đã trade gần nhất của đúng user/coin/mode:"]
-    if finished:
-        wins = sum(1 for p in finished if p.get("result") == "WIN")
-        lines.append(f"- Kết quả đã đóng: {wins}/{len(finished)} WIN.")
-
+    lines = [
+        f"{len(selected)} kết quả gần nhất (chỉ để tránh lặp lỗi, không dùng để nghiêng LONG/SHORT):"
+    ]
     for index, pred in enumerate(selected, 1):
-        entry_low = pred.get("entry_low")
-        entry_high = pred.get("entry_high")
-        entry = (
-            f"{fmt(entry_low)}-{fmt(entry_high)}"
-            if entry_low is not None and entry_high is not None
-            else "N/A"
-        )
         outcome_reason = str(pred.get("result_reason") or "").strip().replace("\n", " ")
-        if len(outcome_reason) > 120:
-            outcome_reason = outcome_reason[:117] + "..."
-        reason_suffix = f"; lý do kết quả: {outcome_reason}" if outcome_reason else ""
-        lines.append(
-            f"- #{index} {pred.get('direction') or 'N/A'} → {pred.get('result') or 'N/A'}; "
-            f"Entry {entry}; SL {fmt(pred.get('sl'))}; TP1 {fmt(pred.get('tp1'))}; "
-            f"TP2 {fmt(pred.get('tp2'))}{reason_suffix}."
-        )
-
-    lines.append("Chỉ dùng để tránh lặp sai lầm rõ ràng; không thay thế phân tích dữ liệu hiện tại.")
+        if len(outcome_reason) > 150:
+            outcome_reason = outcome_reason[:147] + "..."
+        lines.append(f"- #{index} Kết quả={pred.get('result') or 'N/A'}; ghi chú={outcome_reason or 'N/A'}.")
     return "\n".join(lines)
 
 
@@ -5299,35 +5256,19 @@ def _structure_to_json(structure: dict | None) -> dict:
 
 
 def _history_to_json(history: list[dict]) -> dict:
-    finished = [p for p in history if p.get("result") in ("WIN", "LOSS")]
-    wins = sum(1 for p in finished if p.get("result") == "WIN")
+    """Outcome lessons only; intentionally excludes old direction and price levels."""
+    selected = list(history or [])[:PREDICTION_HISTORY_COUNT]
     return {
-        "count": len(history),
-        "closed_count": len(finished),
-        "wins": wins,
-        "losses": sum(1 for p in finished if p.get("result") == "LOSS"),
-        "win_rate_pct": round(wins / len(finished) * 100, 2) if finished else None,
+        "count": len(selected),
         "items": [
             {
-                "created_at": p.get("created_at"),
-                "direction": p.get("direction"),
-                "entry_low": _json_float(p.get("entry_low")),
-                "entry_high": _json_float(p.get("entry_high")),
-                "sl": _json_float(p.get("sl")),
-                "tp1": _json_float(p.get("tp1")),
-                "tp2": _json_float(p.get("tp2")),
                 "result": p.get("result"),
-                "result_price": _json_float(p.get("result_price")),
                 "result_reason": _truncate_text(p.get("result_reason"), 260),
-                "reasoning_summary": _truncate_text(p.get("reasoning_summary"), 420),
-                # Keep history compact; full market/feature snapshots are very token-heavy
-                # and can make JSON input larger than the old text prompt.
-                "market_snapshot_summary": _truncate_text(p.get("market_snapshot"), 300),
-                "feature_snapshot_summary": _truncate_text(_sanitize_feature_snapshot_for_model(p.get("feature_snapshot")), 300),
+                "reasoning_summary": _truncate_text(p.get("reasoning_summary"), 360),
             }
-            for p in history[:PREDICTION_HISTORY_COUNT]
+            for p in selected
         ],
-        "rule": "Use only this user-specific traded-only history for the same symbol/mode. Do not use global history.",
+        "rule": "Diagnostic outcome context only. Do not infer directional preference and do not reuse old Entry/SL/TP. Current OHLCV determines the new direction and levels.",
     }
 
 
@@ -5337,7 +5278,6 @@ def build_model_input_payload(
     timeframe_data: dict[str, pd.DataFrame | None],
     fear_greed_info: str,
     current_price_str: str,
-    history: list[dict],
     feature_block: str | None = None,
     open_signal_context: str | None = None,
 ) -> dict:
@@ -5378,7 +5318,6 @@ def build_model_input_payload(
         "market": {
             "current_price_text": current_price_str,
             "current_price": _json_float(price),
-            "fear_greed_text": fear_greed_info,
             "timeframe_roles": {
                 "trigger": trigger_label,
                 "main_setup": main_label,
@@ -5391,7 +5330,7 @@ def build_model_input_payload(
         },
         "python_calculated_features": {
             "structure_estimate": _structure_to_json(structure),
-            "structure_estimate_note": "Python estimate only. Re-check against OHLCV and closed candles; do not treat as mandatory direction or mandatory price levels.",
+            "structure_estimate_note": "Python estimate only. Raw highs/lows and closed candles have priority. Do not treat labels such as trend/regime as mandatory direction or mandatory price levels.",
         },
         "timeframes": {
             label: _json_timeframe_summary(label, df, mode, candle_limit=_timeframe_contract(mode, label).get("closed_candle_limit"))
@@ -5401,20 +5340,19 @@ def build_model_input_payload(
             "closed_candles_only_rule": "Use closed candles for confirmation. Live candle is reference only.",
             "compact_note": "Detailed closed candles are in timeframes.*.recent_closed_candles_compact. Live candle compact row is reference only.",
         },
-        "user_specific_learning": _history_to_json(history),
         "open_signal_context": {
             "text": _truncate_text(open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có kế hoạch đang chờ/đã khớp cho user này ở cùng coin và mode.", 1200),
             "rule": "If an old LONG is waiting for pullback, its Entry is not a SHORT TP. If an old SHORT is waiting for pullback, its Entry is not a LONG TP.",
         },
         "model_instructions": [
-            "Use only data inside this JSON payload and the system prompt. Do not invent news, order book, funding, open interest, liquidation heatmap, or leveraged-position data.",
+            "Use only data inside this JSON payload and the system prompt. Do not invent news, sentiment indexes, order book, funding, open interest, liquidation heatmap, or leveraged-position data. Fear & Greed is intentionally excluded from the trading decision.",
             "Respect timeframe_data_contract strictly: SCALP core frames are 15M/1H/4H with 1D macro; SWING core frames are 4H/1D/1W with 1H secondary timing.",
             "Use live-candle EMA interaction and transition metrics as early descriptive evidence only; never relabel them as closed-candle confirmation.",
             "Compare LONG, SHORT, and NO_TRADE internally before deciding. Do not print the comparison.",
             "If choosing LONG/SHORT, provide concrete Entry/SL/TP numbers in the required output JSON. If choosing NO_TRADE, omit trade levels or set them null.",
             "The bot supplies no liquidation zones or heatmap. Do not infer them from OHLCV. Do not show raw feature blocks or internal labels to the user.",
             "If current price is inside a valid Entry and confirmation is enough, mark activation as immediate. Otherwise make it a waiting plan with clear confirmation conditions.",
-            "Do not chase price when an old plan exists and price has already moved far away from its Entry. Keep, cancel, or replace it with a clear reason.",
+            "An old plan is operational context only, not directional evidence. Do not reuse its direction or levels unless current data independently confirms them. Entry near current price is allowed when it remains inside the current structural thesis; chasing means price has left that thesis zone and a valid invalidation can no longer be defined.",
         ],
     }
 
@@ -5425,7 +5363,6 @@ def build_user_prompt(
     timeframe_data: dict[str, pd.DataFrame | None],
     fear_greed_info: str,
     current_price_str: str,
-    history: list[dict],
     feature_block: str | None = None,
     open_signal_context: str | None = None,
     decision_snapshot: str | None = None,
@@ -5444,20 +5381,17 @@ def build_user_prompt(
     parts = [
         f"PHÂN TÍCH {symbol} — {mode_label}",
         current_price_str,
-        fear_greed_info,
         "",
         "VAI TRÒ TIMEFRAME:",
         _mode_role_text(mode),
         "",
-        "LƯU Ý QUYỀN QUYẾT ĐỊNH: Python không gửi preferred_direction, LONG support hay SHORT support cho model cuối. Model phải tự chọn LONG/SHORT/NO TRADE từ dữ liệu kỹ thuật, snapshot đồng bộ và kế hoạch đang mở bên dưới.",
+        "LƯU Ý QUYỀN QUYẾT ĐỊNH: Python không gửi preferred_direction, LONG support hay SHORT support cho model cuối. Model phải tự chọn LONG/SHORT/NO TRADE từ dữ liệu hiện tại. Kế hoạch đang mở chỉ là trạng thái vận hành, không phải bằng chứng hướng và không được neo mức giá mới.",
         "",
         feature_block or "Dữ liệu kỹ thuật do Python tính sẵn: không có.",
         "",
         decision_snapshot or "SYNCHRONIZED_DECISION_SNAPSHOT: không có.",
         "",
         open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có.",
-        "",
-        format_prediction_history(history),
         "",
         "DỮ LIỆU CÁC KHUNG NẾN ĐÃ ĐÓNG:",
         "\n".join(timeframe_reports),
@@ -5471,7 +5405,7 @@ def build_user_prompt(
         "- Không tự in Điểm tín hiệu trong phần public; Python sẽ chèn đúng một dòng Điểm tín hiệu dưới dòng QUYẾT ĐỊNH.",
         "- Bot không cung cấp dữ liệu thanh lý/heatmap; không được suy đoán chúng từ OHLCV. Dùng cấu trúc, Fibonacci, EMA, ATR, volume, nến đã đóng và block nến live trung lập đã được Python tách riêng.",
         "- Nến live giúp nhận biết sớm tương tác EMA/chuyển động đang hình thành, nhưng không được mô tả như một nến đã đóng hoặc một xác nhận đã hoàn tất.",
-        "- Nếu Điểm tín hiệu dưới ngưỡng hoặc chưa đủ setup hợp lý thì chọn NO TRADE.",
+        "- Nếu Điểm tín hiệu dưới ngưỡng hoặc chưa đủ setup hợp lý thì chọn NO TRADE. Không tự áp lại ngưỡng chênh LONG/SHORT 20 điểm ở model cuối; gate đó chỉ thuộc prefilter.",
     ]
     return "\n".join(str(x) for x in parts if x is not None)
 
@@ -5987,7 +5921,7 @@ TRẢ VỀ JSON NỘI BỘ BẮT BUỘC:
 - Không markdown, không ```json, không giải thích ngoài JSON.
 - User sẽ KHÔNG thấy JSON này; Python sẽ render lại format cũ cho Telegram.
 - decision chỉ được là "LONG", "SHORT" hoặc "NO_TRADE".
-- Nếu decision là LONG/SHORT: entry_low, entry_high, sl, tp1, tp2 bắt buộc là số.
+- Nếu decision là LONG/SHORT: entry_low, entry_high, sl, tp1, tp2 bắt buộc là số; TP2 phải có mục tiêu cấu trúc thực sự. Nếu không bảo vệ được TP2 bằng dữ liệu hiện tại, chọn NO_TRADE thay vì bịa TP2.
 - Nếu decision là NO_TRADE: entry_low, entry_high, sl, tp1, tp2 để null.
 - current_price nên copy đúng từ JSON input; nếu thiếu, Python sẽ tự chèn giá hiện tại lấy từ Binance.
 
@@ -7551,7 +7485,6 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         fear_greed_info,
         current_price_str,
     )
-    history                          = get_recent_predictions(binance_symbol, mode, user_id=user_id)
     open_signals                     = get_open_signal_predictions(binance_symbol, mode, user_id=user_id)
     open_signal_context              = format_open_signal_context(open_signals, current_price)
     user_prompt                      = build_user_prompt(
@@ -7560,7 +7493,6 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         timeframe_data=timeframe_data,
         fear_greed_info=fear_greed_info,
         current_price_str=current_price_str,
-        history=history,
         feature_block=feature_block,
         open_signal_context=open_signal_context,
         decision_snapshot=decision_snapshot,
@@ -7660,11 +7592,10 @@ async def prepare_analysis_context(
     if not any(df is not None and not df.empty for df in timeframe_data.values()):
         raise RuntimeError(f"Could not fetch Binance data for {binance_symbol}.")
 
-    system_prompt, fear_greed_info, price_tuple, history, open_signals = await asyncio.gather(
+    system_prompt, fear_greed_info, price_tuple, open_signals = await asyncio.gather(
         asyncio.to_thread(load_system_prompt),
         asyncio.to_thread(get_fear_greed_index),
         asyncio.to_thread(get_current_price_str, binance_symbol),
-        asyncio.to_thread(get_recent_predictions, binance_symbol, mode, user_id),
         asyncio.to_thread(get_open_signal_predictions, binance_symbol, mode, user_id),
     )
     current_price_str, current_price = price_tuple
@@ -7683,7 +7614,6 @@ async def prepare_analysis_context(
         timeframe_data=timeframe_data,
         fear_greed_info=fear_greed_info,
         current_price_str=current_price_str,
-        history=history,
         feature_block=feature_block,
         open_signal_context=open_signal_context,
         decision_snapshot=decision_snapshot,
@@ -7695,7 +7625,6 @@ async def prepare_analysis_context(
         "fear_greed_info": fear_greed_info,
         "current_price_str": current_price_str,
         "current_price": current_price,
-        "history": history,
         "open_signals": open_signals,
         "open_signal_context": open_signal_context,
         "feature_block": feature_block,
@@ -8462,7 +8391,6 @@ def build_deepseek_prefilter_text(
     feature_snapshot: str | None,
     feature_block: str | None,
     decision_snapshot: str | None,
-    history: list[dict],
     open_signal_context: str | None,
     direction_scorecard: str | None = None,
 ) -> str:
@@ -8472,7 +8400,6 @@ def build_deepseek_prefilter_text(
     Nó không tạo Entry/SL/TP và không thay thế full rubric của AI cuối.
     """
     mode_label = "SCALP" if mode == "short" else "SWING"
-    history_text = format_deepseek_history_compact(history, limit=3)
     compact_feature = (feature_snapshot or feature_block or "Không có feature snapshot.")
     return "\n".join([
         f"AUTO SCAN PREFILTER — {symbol} {mode_label}",
@@ -8496,13 +8423,10 @@ def build_deepseek_prefilter_text(
         "SNAPSHOT QUYẾT ĐỊNH ĐỒNG BỘ VỚI AI CUỐI:",
         decision_snapshot or "SYNCHRONIZED_DECISION_SNAPSHOT: không có.",
         "",
-        "SNAPSHOT KỸ THUẬT/HISTORY RÚT GỌN:",
+        "SNAPSHOT KỸ THUẬT RÚT GỌN:",
         compact_feature,
         "",
         open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có.",
-        "",
-        "LỊCH SỬ USER RÚT GỌN:",
-        history_text,
         "",
         "FORMAT TRẢ VỀ BẮT BUỘC — CHỈ 13 DÒNG, KHÔNG JSON, KHÔNG MARKDOWN, KHÔNG THÊM GẠCH ĐẦU DÒNG:",
         "LONG_TREND: <0-25>",
@@ -8887,7 +8811,6 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     system_prompt = ctx["system_prompt"]
     current_price_str = ctx["current_price_str"]
     current_price = ctx["current_price"]
-    history = ctx["history"]
     open_signal_context = ctx["open_signal_context"]
     feature_block = ctx["feature_block"]
     feature_snapshot = ctx["feature_snapshot"]
@@ -8903,7 +8826,6 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         feature_snapshot=feature_snapshot,
         feature_block=feature_block,
         decision_snapshot=decision_snapshot,
-        history=history,
         open_signal_context=open_signal_context,
         direction_scorecard=None,
     )
