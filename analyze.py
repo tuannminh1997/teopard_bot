@@ -194,20 +194,20 @@ CLAUDE_MAX_TOKENS = LLM_MAX_OUTPUT_TOKENS
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
 # V33 timeframe roles:
-# SCALP: 15M chỉ là trigger/timing; 1H là khung setup chính; 4H là trend filter; 1D là macro context.
+# SCALP: 4H quyết định hướng; 1H thiết kế Entry/SL/TP; 15M chỉ timing; 1D macro.
 SHORT_TERM_TIMEFRAMES = {
-    "15M": ("15m", 480),   # ~5 ngày, trigger/timing, sweep/wick; không dùng làm bias chính
-    "1H":  ("1h",  360),   # ~15 ngày, setup/momentum chính cho SCALP
-    "4H":  ("4h",  360),   # ~60 ngày, trend filter + target/liquidity chính
+    "15M": ("15m", 480),   # ~5 ngày, chỉ timing/xác nhận; không tạo hướng hoặc độ rộng Entry/SL/TP
+    "1H":  ("1h",  360),   # ~15 ngày, khung thiết kế setup, Entry, SL, TP
+    "4H":  ("4h",  360),   # ~60 ngày, hướng/cấu trúc chính và target lớn
     "1D":  ("1d",  365),   # ~1 năm, bối cảnh lớn; tránh scalp ngược macro quá rõ
 }
 
-# SWING: 1H chỉ timing phụ; 4H setup; 1D decision/trend chính; 1W macro context.
+# SWING: 1D quyết định hướng; 4H thiết kế Entry/SL/TP; 1H chỉ timing; 1W macro/target mở rộng.
 LONG_TERM_TIMEFRAMES = {
-    "1H": ("1h",  480),   # entry trigger / pullback timing phụ cho SWING
-    "4H": ("4h",  360),   # setup + invalidation gần
-    "1D": ("1d",  365),   # trend/decision chính cho SWING
-    "1W": ("1w",  208),   # macro context/liquidity sâu
+    "1H": ("1h",  480),   # chỉ timing/xác nhận; không tạo hướng hoặc độ rộng Entry/SL/TP
+    "4H": ("4h",  360),   # khung thiết kế setup, Entry, SL, TP1
+    "1D": ("1d",  365),   # hướng/cấu trúc quyết định chính cho SWING
+    "1W": ("1w",  208),   # macro context và TP2 mở rộng khi phù hợp
 }
 
 # V4 lifecycle
@@ -3233,12 +3233,12 @@ def _mode_trigger_label(mode: str) -> str:
 def _mode_role_text(mode: str) -> str:
     if mode == "short":
         return (
-            "SCALP roles: 1H là khung setup/chính; 4H là xu hướng xác nhận; "
-            "1D là bối cảnh lớn; 15M chỉ dùng để timing entry, đọc sweep/râu nến và không được đảo bias một mình."
+            "SCALP roles: 4H quyết định xu hướng/cấu trúc chính; 1H là khung thiết kế setup, vùng Entry, điểm vô hiệu SL và TP gần; "
+            "1D chỉ là bối cảnh lớn; 15M chỉ dùng để xác nhận timing, sweep/râu nến và không được quyết định hướng, độ rộng Entry, SL hoặc TP."
         )
     return (
-        "SWING roles: 1D là xu hướng/chính; 4H là setup/vùng vào; "
-        "1W là bối cảnh lớn; 1H chỉ timing entry phụ và không được đảo bias swing một mình."
+        "SWING roles: 1D quyết định xu hướng/cấu trúc chính; 4H là khung thiết kế setup, vùng Entry, điểm vô hiệu SL và TP gần; "
+        "1W là bối cảnh lớn và mục tiêu mở rộng; 1H chỉ dùng để tinh chỉnh timing, không được quyết định hướng, độ rộng Entry, SL hoặc TP."
     )
 
 
@@ -4242,7 +4242,6 @@ def _timeframe_regime_details(label: str, df: pd.DataFrame | None) -> dict:
     close = float(last["close"])
     ema_state = _ema_state_from_last(df)
     rsi = _safe_float(last.get("rsi_14"), 50.0) or 50.0
-    atr_pct = _safe_float(last.get("atr_pct"), 0.0) or 0.0
     vol_ratio = _safe_float(last.get("vol_ratio"), 1.0) or 1.0
     ema_spread_pct = abs(float(last["ema_7"]) - float(last["ema_50"])) / max(close, 1e-12) * 100
 
@@ -4254,13 +4253,7 @@ def _timeframe_regime_details(label: str, df: pd.DataFrame | None) -> dict:
         trend_tag = "RANGE_CHOPPY"
     else:
         trend_tag = "MIXED_TRANSITION"
-
-    if atr_pct >= 1.20:
-        vol_tag = "HIGH_VOLATILITY"
-    elif atr_pct <= 0.25:
-        vol_tag = "LOW_VOLATILITY"
-    else:
-        vol_tag = "NORMAL_VOLATILITY"
+    vol_tag = "N/A"
 
     if vol_ratio >= 1.50:
         volume_tag = "HIGH_VOLUME"
@@ -4276,8 +4269,8 @@ def _timeframe_regime_details(label: str, df: pd.DataFrame | None) -> dict:
         "volume_tag": volume_tag,
         "ema_state": ema_state,
         "text": (
-            f"{label}: {_label_vi(trend_tag)}, {_label_vi(vol_tag)}, {_label_vi(volume_tag)}; "
-            f"EMA={_label_vi(ema_state)}, RSI14={_fmt_metric(rsi,1)}, ATR%={fmt(atr_pct,2)}, Vol={fmt(vol_ratio,2)}x"
+            f"{label}: {_label_vi(trend_tag)}, {_label_vi(volume_tag)}; "
+            f"EMA={_label_vi(ema_state)}, RSI14={_fmt_metric(rsi,1)}, Vol={fmt(vol_ratio,2)}x"
         ),
     }
 
@@ -4297,7 +4290,6 @@ def build_market_regime_block(timeframe_data: dict[str, pd.DataFrame | None], mo
     up_count = sum(s["trend_tag"] == "TRENDING_UP" for s in states)
     range_count = sum(s["trend_tag"] == "RANGE_CHOPPY" for s in states)
     low_volume_count = sum(s["volume_tag"] == "LOW_VOLUME" for s in states)
-    high_vol_count = sum(s["vol_tag"] == "HIGH_VOLATILITY" for s in states)
 
     if down_count >= 2:
         overall_code = "BEAR_TREND"
@@ -4311,8 +4303,6 @@ def build_market_regime_block(timeframe_data: dict[str, pd.DataFrame | None], mo
     modifiers = []
     if low_volume_count >= 2:
         modifiers.append("LOW_LIQUIDITY_RISK")
-    if high_vol_count >= 2:
-        modifiers.append("HIGH_VOLATILITY_RISK")
     if (main_state["trend_tag"] == "TRENDING_UP" and structure_state["trend_tag"] == "TRENDING_DOWN") or (
         main_state["trend_tag"] == "TRENDING_DOWN" and structure_state["trend_tag"] == "TRENDING_UP"
     ):
@@ -4621,14 +4611,13 @@ def _live_transition_line(
         return f"- {label} live: N/A"
     row = df.iloc[-1]
     progress = _live_candle_progress(row, label)
-    atr = _safe_float(_analysis_row(df).get("atr_14")) if _analysis_row(df) is not None else None
     open_ = _safe_float(row.get("open"))
     high = _safe_float(row.get("high"))
     low = _safe_float(row.get("low"))
     rng = (high - low) if high is not None and low is not None else None
-    range_atr = (rng / atr) if rng is not None and atr and atr > 0 else None
+    range_pct = (rng / open_ * 100.0) if rng is not None and open_ else None
+    body_pct = ((current_price - open_) / open_ * 100.0) if open_ else None
     close_location = ((current_price - low) / rng * 100.0) if rng and low is not None else None
-    body_atr = ((current_price - open_) / atr) if open_ is not None and atr and atr > 0 else None
     volume = _safe_float(row.get("volume"))
     closed_vol_avg = None
     closed = _closed_candles(df)
@@ -4644,13 +4633,12 @@ def _live_transition_line(
     return (
         f"- {label} live | progress {_fmt_metric((progress or 0)*100,1)}%{early_note} | "
         f"O/H/L/P {fmt(open_)}/{fmt(high)}/{fmt(low)}/{fmt(current_price)} | "
-        f"body {_fmt_metric(body_atr,2)}ATR; range {_fmt_metric(range_atr,2)}ATR; vị trí giá {_fmt_metric(close_location,1)}% từ đáy | "
+        f"body {_fmt_metric(body_pct,3)}%; range {_fmt_metric(range_pct,3)}%; vị trí giá {_fmt_metric(close_location,1)}% từ đáy | "
         f"vol theo tiến độ {_fmt_metric(expected_ratio,2)}x; TakerBuy {_fmt_metric(taker,1)}% | "
-        f"{_ema_interaction_text(row, 'ema_7', current_price, atr)}; "
-        f"{_ema_interaction_text(row, 'ema_25', current_price, atr)}; "
-        f"{_ema_interaction_text(row, 'ema_50', current_price, atr)}{confirm}"
+        f"{_ema_interaction_text(row, 'ema_7', current_price, None)}; "
+        f"{_ema_interaction_text(row, 'ema_25', current_price, None)}; "
+        f"{_ema_interaction_text(row, 'ema_50', current_price, None)}{confirm}"
     )
-
 
 def build_synchronized_decision_snapshot(
     timeframe_data: dict[str, pd.DataFrame | None],
@@ -4670,11 +4658,11 @@ def build_synchronized_decision_snapshot(
     if mode == "short":
         closed_labels = ["15M", "1H", "4H", "1D"]
         live_specs = [("15M", None), ("1H", "15M"), ("4H", "1H")]
-        core_note = "SCALP core 15M/1H/4H; 1D chỉ macro."
+        core_note = "SCALP: 4H quyết định hướng; 1H thiết kế Entry/SL/TP; 15M chỉ timing; 1D chỉ macro."
     else:
         closed_labels = ["1H", "4H", "1D", "1W"]
         live_specs = [("1H", None), ("4H", "1H"), ("1D", "4H")]
-        core_note = "SWING core 4H/1D/1W; 1H chỉ timing phụ."
+        core_note = "SWING: 1D quyết định hướng; 4H thiết kế Entry/SL/TP; 1H chỉ timing; 1W hỗ trợ macro/TP mở rộng."
     lines = [
         f"SYNCHRONIZED_DECISION_SNAPSHOT id={snapshot_time} price={fmt(price)}",
         f"- {core_note}",
@@ -4702,17 +4690,29 @@ def _format_model_plan_contract(
 ) -> str:
     """Nguyên tắc để model tự lập kế hoạch từ dữ liệu, không bị Python neo giá."""
     _ = timeframe_data, price
+    if mode == "short":
+        frame_rules = [
+            "- SCALP: 4H quyết định hướng/cấu trúc; 1H tạo Entry, invalidation SL, TP1 và phần lớn TP2; 15M chỉ xác nhận timing.",
+            "- Không dùng swing, râu nến, volume hay biến động 15M làm cơ sở chính để co Entry, đặt SL sát hoặc tạo TP ngắn.",
+            "- Nến 1H và 4H đang chạy được dùng như thông tin cập nhật theo tiến độ, nhưng phải phân biệt rõ với nến đã đóng.",
+        ]
+    else:
+        frame_rules = [
+            "- SWING: 1D quyết định hướng/cấu trúc; 4H tạo Entry, invalidation SL, TP1; 1W hỗ trợ mục tiêu mở rộng TP2; 1H chỉ xác nhận timing.",
+            "- Không dùng swing, râu nến, volume hay biến động 1H làm cơ sở chính để co Entry, đặt SL sát hoặc tạo TP ngắn.",
+            "- Nến 4H và 1D đang chạy được dùng như thông tin cập nhật theo tiến độ, nhưng phải phân biệt rõ với nến đã đóng.",
+        ]
     return "\n".join([
         "NGUYÊN TẮC LẬP ENTRY/SL/TP — dùng nội bộ, không show user:",
         f"- Vai trò timeframe: {_mode_role_text(mode)}",
-        "1. Python chỉ cung cấp dữ liệu raw và các phép tính khách quan. Model phải tự hình thành luận điểm giao dịch rồi tự chọn Entry, SL, TP1 và TP2; không có level ID bắt buộc.",
-        "2. Entry phải là vùng giao dịch có lý do từ hành động giá và độ biến động thực tế. Không tạo range giả chỉ rộng vài tick hoặc vài chữ số thập phân nếu chart không có vùng hẹp tương ứng.",
-        "3. SL phải nằm ngoài điểm vô hiệu thật của luận điểm do model tự xác định từ cấu trúc/nến/volatility. Không đặt SL chỉ để đạt RR đẹp.",
-        "4. TP1 và TP2 phải là các mục tiêu mà model suy ra từ cấu trúc thị trường, swing, vùng phản ứng, Fibonacci, EMA hoặc price action trong dữ liệu; không bắt buộc trùng bất kỳ mốc Python nào.",
-        "5. Tự kiểm tra trước khi trả lời: vì sao Entry có hai biên này, điều gì vô hiệu luận điểm, cấu trúc nào tạo TP1/TP2, và các mức có thực dụng so với ATR/phần trăm biến động hay không.",
-        "6. Nếu dữ liệu không đủ để tự bảo vệ các mức giá bằng lập luận rõ ràng, chọn NO TRADE thay vì xuất số có độ chính xác giả.",
-        "- Python sẽ giữ nguyên các số model trả về. Gate gửi tín hiệu chỉ dựa trên Điểm tín hiệu; Python không sửa Entry/SL/TP và không ép chúng khớp danh sách mức giá dựng sẵn.",
-        "- Kế hoạch và mức giá lịch sử chỉ là bối cảnh trạng thái. Không tái sử dụng Entry/SL/TP cũ nếu snapshot hiện tại không còn xác nhận; mỗi mức mới phải được bảo vệ bằng dữ liệu hiện tại.",
+        *frame_rules,
+        "1. Python chỉ cung cấp OHLCV, nến đóng/live và các phép tính khách quan. Model tự hình thành luận điểm rồi tự chọn Entry, SL, TP1, TP2; không có level ID bắt buộc.",
+        "2. Entry phải là vùng giao dịch có lý do từ hành động giá, biên nến, swing, EMA, Fibonacci hoặc vùng phản ứng của khung setup; không tạo range giả chỉ rộng vài tick.",
+        "3. SL phải nằm ngoài điểm vô hiệu thật của luận điểm trên khung setup/cấu trúc; không dùng ATR, phần trăm cố định hoặc khung timing để tự động đặt khoảng SL.",
+        "4. TP1/TP2 phải đến từ mục tiêu cấu trúc có thật trên khung setup/cấu trúc/lớn; không dùng ATR hay RR để kéo target.",
+        "5. Tự kiểm tra: vì sao Entry có hai biên này, điều gì vô hiệu luận điểm, khung nào tạo TP1/TP2, và raw candles nào bảo vệ các mức.",
+        "6. Nếu dữ liệu không đủ bảo vệ các mức bằng lập luận rõ ràng, chọn NO TRADE thay vì xuất số có độ chính xác giả.",
+        "- Python giữ nguyên số model trả về. Gate gửi tín hiệu chỉ dựa trên Điểm tín hiệu; Python không sửa Entry/SL/TP và không ép RR/ATR.",
     ])
 
 def build_feature_engineering_block(
@@ -4724,37 +4724,29 @@ def build_feature_engineering_block(
     trigger_label = _mode_trigger_label(mode)
     price = current_price or _last_close_from_data(timeframe_data)
     if price is None:
-        return "Dữ liệu kỹ thuật: Không đủ dữ liệu để tính cấu trúc, Fibonacci và ATR. Không được tự bịa các phần này."
+        return "Dữ liệu kỹ thuật: Không đủ dữ liệu để tính cấu trúc và Fibonacci. Không được tự bịa các phần này."
 
     main_df = timeframe_data.get(main_label)
     trigger_df = timeframe_data.get(trigger_label)
     structure_df = timeframe_data.get(structure_label)
     if structure_df is None or structure_df.empty:
         structure_df = main_df
-    atr_trigger = _current_atr(trigger_df)
-    atr_main = _current_atr(main_df)
-    atr_structure = _current_atr(structure_df)
     structure = _structure_info(structure_df, price)
-    fib = structure.get("fib", {})
-
     plan_contract = _format_model_plan_contract(timeframe_data, mode, price)
 
     lines = [
         "Dữ liệu kỹ thuật do Python tính sẵn:",
-        f"- Mode: {'SCALP' if mode == 'short' else 'SWING'} | Trigger: {trigger_label} | Khung setup/chính: {main_label} | Khung cấu trúc/xác nhận: {structure_label} | Khung lớn: {big_label}",
+        f"- Mode: {'SCALP' if mode == 'short' else 'SWING'} | Timing: {trigger_label} | Khung thiết kế kế hoạch: {main_label} | Khung xu hướng/cấu trúc: {structure_label} | Khung lớn: {big_label}",
         f"- Vai trò timeframe: {_mode_role_text(mode)}",
         build_market_regime_block(timeframe_data, mode),
         plan_contract,
-        f"- ATR14 {trigger_label}: {fmt(atr_trigger)} | ATR14 {main_label}: {fmt(atr_main)} | ATR14 {structure_label}: {fmt(atr_structure)}",
-        f"- Trigger {trigger_label} đã đóng: {_consecutive_candles(trigger_df)} | {_wick_body_info(trigger_df)}",
+        f"- Timing {trigger_label} đã đóng: {_consecutive_candles(trigger_df)} | {_wick_body_info(trigger_df)}",
         f"- Setup {main_label} đã đóng: {_consecutive_candles(main_df)} | {_wick_body_info(main_df)}",
-        f"- Phân loại cấu trúc {structure_label} do Python ước tính: {structure.get('trend', 'N/A')}. Đây chỉ là tham khảo; model phải tự đối chiếu với OHLCV, nến và các khung khác, không coi đây là kết luận bắt buộc.",
-        "- Entry/SL/TP do model tự quyết định từ toàn bộ OHLCV, nến đã đóng, nến live trung lập, EMA, RSI, MACD, ATR, Fibonacci, swing và cấu trúc đã cung cấp. Không có danh sách level bắt buộc và không phải chọn số từ danh sách mức giá dựng sẵn.",
-        "- Bot không cung cấp liquidation heatmap, vị thế đòn bẩy hay vùng thanh lý thật. Không được suy đoán hoặc tự tạo các dữ liệu đó từ OHLCV.",
-        "- Python chỉ parse và giữ nguyên Entry/SL/TP do model chọn. Python không kiểm tra hoặc ép RR, ATR, khoảng cách hay cấu trúc của các mức giá; điều kiện gửi duy nhất là Điểm tín hiệu.",
+        f"- Phân loại cấu trúc {structure_label} do Python ước tính: {structure.get('trend', 'N/A')}. Chỉ là tham khảo; ưu tiên OHLCV, nến đóng và nến live theo tiến độ.",
+        "- Entry/SL/TP do model tự quyết định từ OHLCV, nến đóng/live, EMA, RSI, MACD, Fibonacci, swing và cấu trúc. ATR không được gửi cho model và không được dùng để neo khoảng SL/TP.",
+        "- Python chỉ parse và giữ nguyên Entry/SL/TP. Không kiểm tra hoặc ép RR, ATR hay khoảng cách; điều kiện gửi duy nhất là Điểm tín hiệu.",
     ]
     return "\n".join(lines)
-
 
 def build_feature_snapshot(
     timeframe_data: dict[str, pd.DataFrame | None],
@@ -4778,9 +4770,6 @@ def build_feature_snapshot(
     if structure_df is None or structure_df.empty:
         structure_df = main_df
     big_df = timeframe_data.get(big_label)
-
-    atr_main = _current_atr(main_df)
-    atr_structure = _current_atr(structure_df)
     structure = _structure_info(structure_df, price)
     fib = structure.get("fib", {})
 
@@ -4799,7 +4788,7 @@ def build_feature_snapshot(
         return (
             f"{label}: close {fmt(last['close'])}, {ema}, "
             f"RSI14 {fmt(last['rsi_14'], 1)}, {macd_momentum_text(last['macd_hist'])}, "
-            f"ATR14 {fmt(last.get('atr_14'))}, vol {fmt(last['vol_ratio'], 2)}x"
+            f"vol {fmt(last['vol_ratio'], 2)}x"
         )
 
     parts = [
@@ -4810,7 +4799,6 @@ def build_feature_snapshot(
         compact_tf(big_label, big_df),
         f"Cấu trúc {structure_label}: {structure.get('trend', 'N/A')}; đỉnh/đáy gần {fmt(structure.get('recent_low'))}-{fmt(structure.get('recent_high'))}; biên lớn {fmt(structure.get('major_low'))}-{fmt(structure.get('major_high'))}",
         f"Fib {structure_label}: 0.382 {fmt(fib.get('0.382'))}, 0.5 {fmt(fib.get('0.5'))}, 0.618 {fmt(fib.get('0.618'))}",
-        f"ATR: {main_label} {fmt(atr_main)}, {structure_label} {fmt(atr_structure)}",
         f"Nến {main_label}: {_consecutive_candles(main_df)}; {_wick_body_info(main_df)}",
     ]
     return " | ".join(parts)
@@ -4887,7 +4875,6 @@ def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
         f"  EMA7={fmt(ema7)} EMA25={fmt(ema25)} EMA50={fmt(ema50)} → {ema_align}",
         f"  RSI(6)={fmt(last['rsi_6'],1)} RSI(14)={fmt(last['rsi_14'],1)}",
         f"  MACD={fmt(last['macd_line'],4)} Signal={fmt(last['macd_signal'],4)}; {macd_momentum_text(last['macd_hist'])} → {macd_dir}{macd_cross}",
-        f"  ATR14={fmt(last.get('atr_14'))} ({fmt(last.get('atr_pct'),2)}%)",
         f"  Volume={fmt(last['vol_ratio'],2)}x → {vol_lbl}",
         f"  Nến đã đóng: {_consecutive_candles(df)} | {_wick_body_info(df)}",
         f"  High/Low 50 nến: {fmt(key_high)} / {fmt(key_low)}",
@@ -4923,7 +4910,7 @@ def build_market_snapshot(
             f"{label}: close={fmt(last['close'])}, EMA={ema_align} "
             f"(7={fmt(last['ema_7'])},25={fmt(last['ema_25'])},50={fmt(last['ema_50'])}), "
             f"RSI14={fmt(last['rsi_14'], 1)}, {macd_momentum_text(last['macd_hist'])}, "
-            f"ATR14={fmt(last.get('atr_14'))}, vol={fmt(last['vol_ratio'], 2)}x"
+            f"vol={fmt(last['vol_ratio'], 2)}x"
         )
 
     return " | ".join(lines)
@@ -5212,8 +5199,6 @@ def _json_timeframe_summary(label: str, df: pd.DataFrame | None, mode: str, cand
             "macd_signal": _json_float(last.get("macd_signal"), 8),
             "macd_hist": _json_float(last.get("macd_hist"), 8),
             "macd_cross": macd_cross,
-            "atr_14": _json_float(last.get("atr_14")),
-            "atr_pct": _json_float(last.get("atr_pct"), 4),
             "volume_ratio": _json_float(last.get("vol_ratio"), 4),
         },
         "price_structure_50_closed_candles": {
@@ -5403,8 +5388,8 @@ def build_user_prompt(
         "- Nếu LONG/SHORT, model tự chọn Entry/SL/TP từ toàn bộ dữ liệu đã cung cấp; không cần khai báo ID hay nguồn mức giá do Python dựng.",
         "- Cuối phản hồi bắt buộc có block [[TEOPARD_RUBRIC]] đúng key V44 và đủ 5 dòng SIGNAL; Python sẽ ẩn block, cộng thành Điểm tín hiệu /100 và dùng điểm đó để filter.",
         "- Không tự in Điểm tín hiệu trong phần public; Python sẽ chèn đúng một dòng Điểm tín hiệu dưới dòng QUYẾT ĐỊNH.",
-        "- Bot không cung cấp dữ liệu thanh lý/heatmap; không được suy đoán chúng từ OHLCV. Dùng cấu trúc, Fibonacci, EMA, ATR, volume, nến đã đóng và block nến live trung lập đã được Python tách riêng.",
-        "- Nến live giúp nhận biết sớm tương tác EMA/chuyển động đang hình thành, nhưng không được mô tả như một nến đã đóng hoặc một xác nhận đã hoàn tất.",
+        "- Bot không cung cấp dữ liệu thanh lý/heatmap; không được suy đoán chúng từ OHLCV. Dùng cấu trúc, Fibonacci, EMA, RSI, MACD, volume, nến đã đóng và block nến live trung lập.",
+        "- Nến live của khung thiết kế và khung xu hướng phải được dùng để cập nhật trạng thái hiện tại theo phần trăm tiến độ, nhưng không được mô tả như nến đã đóng. Khung timing chỉ xác nhận thời điểm, không được co Entry/SL/TP.",
         "- Nếu Điểm tín hiệu dưới ngưỡng hoặc chưa đủ setup hợp lý thì chọn NO TRADE. Không tự áp lại ngưỡng chênh LONG/SHORT 20 điểm ở model cuối; gate đó chỉ thuộc prefilter.",
     ]
     return "\n".join(str(x) for x in parts if x is not None)
@@ -5895,7 +5880,7 @@ def summarize_reasoning(full_response: str) -> str:
                 "content": (
                     "Tóm tắt trong 1-2 câu (tối đa 60 từ) lý do kỹ thuật chính "
                     "dẫn đến quyết định LONG/SHORT/NO TRADE trong phân tích sau. "
-                    "Chỉ nêu các chỉ báo cụ thể (EMA, RSI, MACD, volume, ATR, vùng giá) và mức giá. "
+                    "Chỉ nêu các chỉ báo cụ thể (EMA, RSI, MACD, volume, vùng giá) và mức giá. "
                     "Không dùng chữ Hist, MACD_hist, Histogram; hãy viết động lượng MACD âm/dương hoặc MACD còn âm/dương. "
                     "Không giải thích, không lời mở đầu.\n\n"
                     + full_response[:2000]
