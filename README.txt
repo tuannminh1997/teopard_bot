@@ -202,4 +202,4 @@ AI INPUT POLICY
 ---------------
 - Model prefilter và model phân tích chính KHÔNG nhận lịch sử dự đoán/trade cũ.
 - /history, /stats và dữ liệu kết quả vẫn được lưu để user xem, nhưng không được đưa trở lại prompt.
-- Chỉ kế hoạch đang mở hiện tại được gửi như trạng thái vận hành; nó không phải bằng chứng hướng và không được dùng để tái sử dụng Entry/SL/TP cũ.
+- Manual và Auto Scan không gửi lịch sử cũ hoặc kế hoạch đang mở cho model; mỗi lần phân tích độc lập từ dữ liệu thị trường hiện tại.

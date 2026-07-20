@@ -5325,10 +5325,6 @@ def build_model_input_payload(
             "closed_candles_only_rule": "Use closed candles for confirmation. Live candle is reference only.",
             "compact_note": "Detailed closed candles are in timeframes.*.recent_closed_candles_compact. Live candle compact row is reference only.",
         },
-        "open_signal_context": {
-            "text": _truncate_text(open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có kế hoạch đang chờ/đã khớp cho user này ở cùng coin và mode.", 1200),
-            "rule": "If an old LONG is waiting for pullback, its Entry is not a SHORT TP. If an old SHORT is waiting for pullback, its Entry is not a LONG TP.",
-        },
         "model_instructions": [
             "Use only data inside this JSON payload and the system prompt. Do not invent news, sentiment indexes, order book, funding, open interest, liquidation heatmap, or leveraged-position data. Fear & Greed is intentionally excluded from the trading decision.",
             "Respect timeframe_data_contract strictly: SCALP core frames are 15M/1H/4H with 1D macro; SWING core frames are 4H/1D/1W with 1H secondary timing.",
@@ -5337,7 +5333,7 @@ def build_model_input_payload(
             "If choosing LONG/SHORT, provide concrete Entry/SL/TP numbers in the required output JSON. If choosing NO_TRADE, omit trade levels or set them null.",
             "The bot supplies no liquidation zones or heatmap. Do not infer them from OHLCV. Do not show raw feature blocks or internal labels to the user.",
             "If current price is inside a valid Entry and confirmation is enough, mark activation as immediate. Otherwise make it a waiting plan with clear confirmation conditions.",
-            "An old plan is operational context only, not directional evidence. Do not reuse its direction or levels unless current data independently confirms them. Entry near current price is allowed when it remains inside the current structural thesis; chasing means price has left that thesis zone and a valid invalidation can no longer be defined.",
+            "Entry near current price is allowed when it remains inside the current structural thesis; chasing means price has left that thesis zone and a valid invalidation can no longer be defined.",
         ],
     }
 
@@ -5370,13 +5366,11 @@ def build_user_prompt(
         "VAI TRÒ TIMEFRAME:",
         _mode_role_text(mode),
         "",
-        "LƯU Ý QUYỀN QUYẾT ĐỊNH: Python không gửi preferred_direction, LONG support hay SHORT support cho model cuối. Model phải tự chọn LONG/SHORT/NO TRADE từ dữ liệu hiện tại. Kế hoạch đang mở chỉ là trạng thái vận hành, không phải bằng chứng hướng và không được neo mức giá mới.",
+        "LƯU Ý QUYỀN QUYẾT ĐỊNH: Python không gửi preferred_direction, LONG support, SHORT support, lịch sử cũ hoặc kế hoạch đang mở cho model cuối. Model phải tự chọn LONG/SHORT/NO TRADE chỉ từ dữ liệu thị trường hiện tại.",
         "",
         feature_block or "Dữ liệu kỹ thuật do Python tính sẵn: không có.",
         "",
         decision_snapshot or "SYNCHRONIZED_DECISION_SNAPSHOT: không có.",
-        "",
-        open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có.",
         "",
         "DỮ LIỆU CÁC KHUNG NẾN ĐÃ ĐÓNG:",
         "\n".join(timeframe_reports),
@@ -7470,8 +7464,9 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         fear_greed_info,
         current_price_str,
     )
-    open_signals                     = get_open_signal_predictions(binance_symbol, mode, user_id=user_id)
-    open_signal_context              = format_open_signal_context(open_signals, current_price)
+    # Không gửi lịch sử hoặc kế hoạch đang mở vào model.
+    open_signals                     = []
+    open_signal_context              = None
     user_prompt                      = build_user_prompt(
         symbol=binance_symbol,
         mode=mode,
@@ -7577,12 +7572,13 @@ async def prepare_analysis_context(
     if not any(df is not None and not df.empty for df in timeframe_data.values()):
         raise RuntimeError(f"Could not fetch Binance data for {binance_symbol}.")
 
-    system_prompt, fear_greed_info, price_tuple, open_signals = await asyncio.gather(
+    system_prompt, fear_greed_info, price_tuple = await asyncio.gather(
         asyncio.to_thread(load_system_prompt),
         asyncio.to_thread(get_fear_greed_index),
         asyncio.to_thread(get_current_price_str, binance_symbol),
-        asyncio.to_thread(get_open_signal_predictions, binance_symbol, mode, user_id),
     )
+    # Model phải phân tích độc lập: không lấy history và không lấy kế hoạch đang mở.
+    open_signals = []
     current_price_str, current_price = price_tuple
     feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
     feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
@@ -7592,7 +7588,7 @@ async def prepare_analysis_context(
     direction_scorecard_payload = None
     direction_scorecard = None
     market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
-    open_signal_context = format_open_signal_context(open_signals, current_price)
+    open_signal_context = None
     user_prompt = build_user_prompt(
         symbol=binance_symbol,
         mode=mode,
@@ -8410,8 +8406,6 @@ def build_deepseek_prefilter_text(
         "",
         "SNAPSHOT KỸ THUẬT RÚT GỌN:",
         compact_feature,
-        "",
-        open_signal_context or "KẾ HOẠCH ĐANG MỞ: Không có.",
         "",
         "FORMAT TRẢ VỀ BẮT BUỘC — CHỈ 13 DÒNG, KHÔNG JSON, KHÔNG MARKDOWN, KHÔNG THÊM GẠCH ĐẦU DÒNG:",
         "LONG_TREND: <0-25>",
