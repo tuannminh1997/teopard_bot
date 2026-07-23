@@ -7838,24 +7838,50 @@ def _extract_setup_status(output: str | None) -> str:
 
 
 def _parse_reviewer_output(text: str | None) -> dict:
-    raw = text or ""
-    scores = {}
-    keys = {
-        "THESIS": 20, "SETUP": 20, "ENTRY": 20,
-        "SL": 15, "TARGET": 15, "TRIGGER": 10,
-    }
-    for key, cap in keys.items():
-        m = re.search(rf"^{key}\s*=\s*([0-9]+(?:\.[0-9]+)?)", raw, flags=re.I | re.M)
-        if m:
-            scores[key] = min(cap, max(0.0, float(m.group(1))))
-    total = sum(scores.values()) if len(scores) == len(keys) else None
-    verdict_m = re.search(r"^VERDICT\s*=\s*(APPROVE|REJECT)", raw, flags=re.I | re.M)
-    verdict = verdict_m.group(1).upper() if verdict_m else ("APPROVE" if total is not None and total >= FINAL_REVIEW_MIN_SIGNAL_SCORE else "REJECT")
-    if total is None or total < FINAL_REVIEW_MIN_SIGNAL_SCORE:
-        verdict = "REJECT"
-    reason_m = re.search(r"^REASON\s*=\s*(.+)$", raw, flags=re.I | re.M)
-    return {"score": total, "verdict": verdict, "breakdown": scores, "reason": reason_m.group(1).strip() if reason_m else ""}
+    """Parse kết quả reviewer 3 trường; Flash tự suy luận và tự cộng điểm.
 
+    Chấp nhận cả dấu ``=`` hoặc ``:``, markdown/bullet nhẹ và SCORE dạng
+    ``67`` hoặc ``67/100``. Python tuyệt đối không tự chấm hay cộng rubric.
+    """
+    raw = text or ""
+    parse_text = raw.replace("**", "").replace("__", "")
+
+    score_m = re.search(
+        r"(?im)^\s*[-*#]*\s*\**SCORE\**\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/\s*100)?",
+        parse_text,
+    )
+    score = None
+    if score_m:
+        try:
+            score = min(100.0, max(0.0, float(score_m.group(1))))
+        except Exception:
+            score = None
+
+    verdict_m = re.search(
+        r"(?im)^\s*[-*#]*\s*\**VERDICT\**\s*[:=]\s*(APPROVE|REJECT)\b",
+        parse_text,
+    )
+    verdict = verdict_m.group(1).upper() if verdict_m else None
+
+    reason_m = re.search(
+        r"(?im)^\s*[-*#]*\s*\**REASON\**\s*[:=]\s*(.+)$",
+        parse_text,
+    )
+    reason = reason_m.group(1).strip() if reason_m else ""
+
+    # Chỉ fallback verdict khi model đã trả được SCORE. Đây là suy ra trạng thái
+    # từ chính điểm model chấm, không phải Python tự đánh giá thị trường.
+    if verdict is None and score is not None:
+        verdict = "APPROVE" if score >= FINAL_REVIEW_MIN_SIGNAL_SCORE else "REJECT"
+    if verdict is None:
+        verdict = "REJECT"
+
+    return {
+        "score": score,
+        "verdict": verdict,
+        "breakdown": {},
+        "reason": reason,
+    }
 
 def review_trade_plan_with_flash(market_packet: str, planner_output: str, mode: str) -> dict:
     """Flash chỉ review; không được sửa direction/Entry/SL/TP."""
@@ -7873,13 +7899,10 @@ def review_trade_plan_with_flash(market_packet: str, planner_output: str, mode: 
         "PLANNER OUTPUT:",
         planner_output,
         "",
-        "Trả đúng 8 dòng, không markdown:",
-        "THESIS=0..20",
-        "SETUP=0..20",
-        "ENTRY=0..20",
-        "SL=0..15",
-        "TARGET=0..15",
-        "TRIGGER=0..10",
+        "Tự đánh giá nội bộ theo 6 tiêu chí: luận điểm đa khung, cấu trúc setup, bằng chứng Entry, điểm vô hiệu/SL, bằng chứng mục tiêu, trigger/timing.",
+        "Tự cộng thành một SCORE 0..100. Python không chấm và không cộng thay bạn.",
+        "Chỉ trả đúng 3 dòng sau, không markdown và không thêm nội dung khác:",
+        "SCORE=0..100",
         "VERDICT=APPROVE|REJECT",
         "REASON=một câu nêu lỗi lớn nhất hoặc lý do approve",
     ])
@@ -7934,7 +7957,7 @@ def _manual_review_rejection_output(
     score_text = f"{float(score):g}/100" if score is not None else "Không đọc được"
     verdict = review.get("verdict") or "REJECT"
     reason = review.get("reason") or (
-        "Flash reviewer không trả đúng rubric bắt buộc." if score is None
+        "Flash reviewer không trả đúng 3 trường SCORE/VERDICT/REASON bắt buộc." if score is None
         else "Kế hoạch chưa được dữ liệu hỗ trợ đủ."
     )
     breakdown = _review_breakdown_text(review)
