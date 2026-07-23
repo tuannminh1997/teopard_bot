@@ -7501,7 +7501,8 @@ def _mode_frame_roles(mode: str) -> tuple[str, str, str, str]:
         return "15M", "1H", "4H", "1D"
     return "1H", "4H", "1D", "1W"
 
-def _v50_time_value(row) -> str:
+def _v50_timestamp_value(row) -> pd.Timestamp | None:
+    """Lấy timestamp UTC của đúng candle để dùng nội bộ, không dùng chuỗi hiển thị để tính toán."""
     for key in ("open_time", "timestamp", "time", "datetime"):
         try:
             value = row.get(key)
@@ -7511,14 +7512,22 @@ def _v50_time_value(row) -> str:
             try:
                 if isinstance(value, (int, float, np.integer, np.floating)):
                     unit = "ms" if float(value) > 10_000_000_000 else "s"
-                    return pd.to_datetime(value, unit=unit, utc=True).strftime("%Y-%m-%d %H:%M")
-                return pd.to_datetime(value, utc=True).strftime("%Y-%m-%d %H:%M")
+                    return pd.to_datetime(value, unit=unit, utc=True)
+                return pd.to_datetime(value, utc=True)
             except Exception:
-                return str(value)
+                pass
     try:
-        return pd.to_datetime(row.name, utc=True).strftime("%Y-%m-%d %H:%M")
+        return pd.to_datetime(row.name, utc=True)
     except Exception:
+        return None
+
+
+def _v50_time_value(row) -> str:
+    """Hiển thị toàn bộ timestamp market packet theo giờ Việt Nam (UTC+7)."""
+    ts = _v50_timestamp_value(row)
+    if ts is None or pd.isna(ts):
         return str(getattr(row, "name", "N/A"))
+    return ts.tz_convert("Asia/Ho_Chi_Minh").strftime("%Y-%m-%d %H:%M VN")
 
 
 def _v50_closed_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -7563,9 +7572,11 @@ def _v50_pivots(df: pd.DataFrame | None, lookback: int = 80, wing: int = 2) -> l
     pivots: list[dict] = []
     for i in range(wing, len(sample) - wing):
         if np.isfinite(highs[i]) and highs[i] >= np.nanmax(highs[i-wing:i+wing+1]):
-            pivots.append({"type": "HIGH", "price": float(highs[i]), "time": _v50_time_value(rows[i][1]), "index": i})
+            ts = _v50_timestamp_value(rows[i][1])
+            pivots.append({"type": "HIGH", "price": float(highs[i]), "time": _v50_time_value(rows[i][1]), "time_utc": ts.isoformat() if ts is not None else None, "index": i})
         if np.isfinite(lows[i]) and lows[i] <= np.nanmin(lows[i-wing:i+wing+1]):
-            pivots.append({"type": "LOW", "price": float(lows[i]), "time": _v50_time_value(rows[i][1]), "index": i})
+            ts = _v50_timestamp_value(rows[i][1])
+            pivots.append({"type": "LOW", "price": float(lows[i]), "time": _v50_time_value(rows[i][1]), "time_utc": ts.isoformat() if ts is not None else None, "index": i})
     return pivots[-12:]
 
 
@@ -7577,7 +7588,7 @@ def _v50_zone_stats(df: pd.DataFrame | None, pivot: dict) -> dict:
     tolerance = max(abs(price) * 0.0012, 1e-9)  # 0.12%, không dùng ATR.
     post = closed.copy()
     try:
-        pivot_time = pd.to_datetime(pivot["time"], utc=True)
+        pivot_time = pd.to_datetime(pivot.get("time_utc"), utc=True)
         time_values = pd.to_datetime(post.get("open_time", post.index), utc=True, errors="coerce")
         post = post.loc[time_values >= pivot_time]
     except Exception:
@@ -7663,6 +7674,7 @@ def build_feature_engineering_block(
     labels = [trigger, setup, trend, big]
     lines = [
         "OBJECTIVE_MARKET_PACKET V50",
+        "Múi giờ của mọi timestamp trong packet: giờ Việt Nam (UTC+7), hậu tố VN.",
         f"Giá hiện tại: {fmt(current_price)}",
         "Python không kết luận hướng và không dựng Entry/SL/TP.",
         "Không có ATR, Fibonacci, market-regime label hay trend label trong packet này.",
@@ -7714,7 +7726,7 @@ def build_synchronized_decision_snapshot(
     current_price: float | None,
 ) -> str:
     trigger, setup, trend, big = _mode_frame_roles(mode)
-    lines = ["SYNCHRONIZED_DECISION_SNAPSHOT V50"]
+    lines = ["SYNCHRONIZED_DECISION_SNAPSHOT V50", "Mọi timestamp bên dưới dùng giờ Việt Nam (UTC+7), hậu tố VN."]
     lines.append(f"Roles: timing={trigger}; setup/plan={setup}; trend/structure={trend}; macro={big}.")
     lines.append(_v50_live_line(setup, timeframe_data.get(setup)))
     lines.append(_v50_live_line(trend, timeframe_data.get(trend)))
