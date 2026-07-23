@@ -169,3 +169,10 @@ ANALYSIS_DATA_VARIANT="C"
 - Bot không ghi đè planner result bằng reviewer result.
 - Entry/SL/TP gửi user luôn lấy từ planner.
 - Điểm tín hiệu gửi user lấy từ Flash reviewer.
+
+V50.1 — Reviewer logging fix
+- Manual và Auto Scan dùng chung review_and_gate_plan().
+- Reviewer REJECT vẫn giữ và hiển thị score thật; không đổi thành 0.
+- Reviewer parse lỗi hiển thị PARSE ERROR — REJECT.
+- Auto Scan log tách rõ Prefilter Flash, Planner Pro và Flash reviewer.
+- auto_scan_logs bổ sung reviewer_verdict và tự migrate database cũ.

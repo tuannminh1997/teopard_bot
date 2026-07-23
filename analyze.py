@@ -7878,10 +7878,82 @@ def review_trade_plan_with_flash(market_packet: str, planner_output: str, mode: 
 
 
 def _apply_reviewer_score(output: str, review: dict) -> str:
+    """Ghép đúng điểm reviewer vào plan, kể cả khi reviewer REJECT.
+
+    Verdict và threshold quyết định pass/fail; tuyệt đối không đổi score thật thành 0.
+    """
     clean = _remove_rubric_block(output or "")
-    # Reviewer REJECT là gate thật; giữ score gốc trong snapshot nhưng public/gate dùng 0.
-    gate_score = review.get("score") if review.get("verdict") == "APPROVE" else 0
-    return _insert_public_signal_score(clean, gate_score)
+    return _insert_public_signal_score(clean, review.get("score"))
+
+
+def _review_passed(review: dict, minimum_score: float) -> bool:
+    score = review.get("score")
+    return (
+        review.get("verdict") == "APPROVE"
+        and score is not None
+        and float(score) >= float(minimum_score)
+    )
+
+
+def _review_breakdown_text(review: dict) -> str:
+    breakdown = review.get("breakdown") or {}
+    labels = [
+        ("THESIS", "Luận điểm đa khung"),
+        ("SETUP", "Cấu trúc setup"),
+        ("ENTRY", "Bằng chứng Entry"),
+        ("SL", "Điểm vô hiệu/SL"),
+        ("TARGET", "Bằng chứng mục tiêu"),
+        ("TRIGGER", "Trigger/timing"),
+    ]
+    parts = []
+    for key, label in labels:
+        if key in breakdown:
+            cap = {"THESIS":20,"SETUP":20,"ENTRY":20,"SL":15,"TARGET":15,"TRIGGER":10}[key]
+            parts.append(f"- {label}: {float(breakdown[key]):g}/{cap}")
+    return "\n".join(parts)
+
+
+def _manual_review_rejection_output(
+    symbol: str, mode: str, current_price: float, planner_pred: dict, review: dict, minimum_score: float
+) -> str:
+    mode_label = "SCALP" if mode == "short" else "SWING"
+    direction = _clean_decision(planner_pred.get("direction"))
+    score = review.get("score")
+    score_text = f"{float(score):g}/100" if score is not None else "Không đọc được"
+    verdict = review.get("verdict") or "REJECT"
+    reason = review.get("reason") or (
+        "Flash reviewer không trả đúng rubric bắt buộc." if score is None
+        else "Kế hoạch chưa được dữ liệu hỗ trợ đủ."
+    )
+    breakdown = _review_breakdown_text(review)
+    breakdown_block = f"\n\nChi tiết chấm điểm:\n{breakdown}" if breakdown else ""
+    direction_line = f"Hướng planner đề xuất: {direction} {'📈' if direction == 'LONG' else '📉' if direction == 'SHORT' else ''}\n"
+    return sanitize_user_output(
+        f"🎯 {symbol} — {mode_label}\n"
+        f"🏆 QUYẾT ĐỊNH: NO TRADE\n"
+        f"{direction_line}"
+        f"Giá hiện tại: {fmt(current_price)} USDT\n\n"
+        f"🔍 FLASH REVIEWER\n"
+        f"Điểm đánh giá: {score_text}\n"
+        f"Kết luận: {verdict}\n"
+        f"Ngưỡng Manual: {float(minimum_score):g}/100\n"
+        f"Nhận xét reviewer: {reason}"
+        f"{breakdown_block}\n\n"
+        "Kế hoạch planner không được bot lưu."
+    )
+
+
+def review_and_gate_plan(
+    market_packet: str, planner_output: str, mode: str, minimum_score: float
+) -> dict:
+    """Pipeline reviewer dùng chung cho Manual và Auto Scan.
+
+    Planner result luôn được giữ nguyên. Reviewer chỉ bổ sung score/verdict/reason.
+    """
+    review = review_trade_plan_with_flash(market_packet, planner_output, mode)
+    review["minimum_score"] = float(minimum_score)
+    review["passed"] = _review_passed(review, minimum_score)
+    return review
 
 
 def _review_market_packet(user_prompt: str) -> str:
@@ -8040,7 +8112,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     planner_clean = _remove_rubric_block(raw_output)
     planner_pred = parse_prediction_from_output(planner_clean)
     if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
-        review = review_trade_plan_with_flash(_review_market_packet(user_prompt), planner_clean, mode)
+        review = review_and_gate_plan(_review_market_packet(user_prompt), planner_clean, mode, MIN_SIGNAL_SCORE)
         output = ensure_current_price_line(sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price)
     else:
         review = {"score": None, "verdict": "REJECT", "raw": "", "reason": "Planner chọn NO TRADE."}
@@ -8053,6 +8125,10 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
         current_price=current_price,
     )
+    if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"} and not review.get("passed"):
+        return _manual_review_rejection_output(
+            binance_symbol, mode, current_price, planner_pred, review, MIN_SIGNAL_SCORE
+        )
 
     # Model-authoritative flow:
     # - Model tự chọn và chịu trách nhiệm toàn bộ Entry/SL/TP.
@@ -8227,7 +8303,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     planner_pred = parse_prediction_from_output(planner_clean)
     if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
         review = await asyncio.to_thread(
-            review_trade_plan_with_flash, _review_market_packet(user_prompt), planner_clean, mode
+            review_and_gate_plan, _review_market_packet(user_prompt), planner_clean, mode, MIN_SIGNAL_SCORE
         )
         output = ensure_current_price_line(
             sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
@@ -8246,6 +8322,11 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
         current_price=current_price,
     )
+    if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"} and not review.get("passed"):
+        rejected = _manual_review_rejection_output(
+            binance_symbol, mode, current_price, planner_pred, review, MIN_SIGNAL_SCORE
+        )
+        return {"text": rejected, "candidate_id": None}
 
     # Model-authoritative flow:
     # - Model tự chọn và chịu trách nhiệm toàn bộ Entry/SL/TP.
@@ -8362,6 +8443,7 @@ def init_auto_scan_db() -> None:
                 pre_gap           INTEGER,
                 final_direction   TEXT,
                 final_confidence  INTEGER,
+                reviewer_verdict  TEXT,
                 reason            TEXT,
                 prediction_id     INTEGER
             )
@@ -8388,6 +8470,7 @@ def init_auto_scan_db() -> None:
             ("pre_long_score", "INTEGER"),
             ("pre_short_score", "INTEGER"),
             ("pre_gap", "INTEGER"),
+            ("reviewer_verdict", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE auto_scan_logs ADD COLUMN {col} {definition}")
@@ -8876,6 +8959,7 @@ def _record_auto_scan_log(
     pre_gap: int | None = None,
     final_direction: str | None = None,
     final_confidence: int | None = None,
+    reviewer_verdict: str | None = None,
     prediction_id: int | None = None,
 ) -> None:
     init_auto_scan_db()
@@ -8885,12 +8969,12 @@ def _record_auto_scan_log(
             INSERT INTO auto_scan_logs
                 (user_id, chat_id, symbol, mode, scan_slot, scanned_at, stage, status,
                  pre_direction, pre_confidence, pre_long_score, pre_short_score, pre_gap,
-                 final_direction, final_confidence, reason, prediction_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 final_direction, final_confidence, reviewer_verdict, reason, prediction_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (user_id, chat_id, symbol, mode, scan_slot, iso(utc_now()), stage, status,
              pre_direction, pre_confidence, pre_long_score, pre_short_score, pre_gap,
-             final_direction, final_confidence, reason, prediction_id),
+             final_direction, final_confidence, reviewer_verdict, reason, prediction_id),
         )
         if user_id is not None:
             conn.execute(
@@ -8919,7 +9003,7 @@ def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
             """
             SELECT scanned_at, symbol, mode, stage, status, pre_direction, pre_confidence,
                    pre_long_score, pre_short_score, pre_gap,
-                   final_direction, final_confidence, reason, prediction_id
+                   final_direction, final_confidence, reviewer_verdict, reason, prediction_id
             FROM auto_scan_logs
             WHERE user_id=?
             ORDER BY id DESC
@@ -8930,7 +9014,7 @@ def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
     keys = [
         "scanned_at", "symbol", "mode", "stage", "status",
         "pre_direction", "pre_confidence", "pre_long_score", "pre_short_score", "pre_gap",
-        "final_direction", "final_confidence", "reason", "prediction_id",
+        "final_direction", "final_confidence", "reviewer_verdict", "reason", "prediction_id",
     ]
     return [dict(zip(keys, row)) for row in rows]
 
@@ -9449,7 +9533,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     user_prompt = ctx["user_prompt"]
     flash_note = "\n\nLỌC NHANH DEEPSEEK FLASH — CHỈ BÁO RẰNG SNAPSHOT ĐÁNG PHÂN TÍCH SÂU:\n" + (
         "- Lớp lọc nhanh đã đạt điều kiện gọi AI cuối, nhưng điểm LONG/SHORT của Flash không được đưa vào đây để tránh neo hướng.\n"
-        "- Bạn phải tự chọn LONG / SHORT / NO TRADE từ dữ liệu đầy đủ bên trên và tự chấm một Điểm tín hiệu duy nhất. Python chỉ parse kết quả và dùng Điểm tín hiệu làm gate duy nhất."
+        "- Bạn phải tự chọn LONG / SHORT / NO TRADE và lập plan từ dữ liệu đầy đủ bên trên. Không tự chấm điểm; Flash reviewer độc lập sẽ chấm sau."
     )
     planner_input = user_prompt + flash_note
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, planner_input)
@@ -9457,7 +9541,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     planner_pred = parse_prediction_from_output(planner_clean)
     if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
         review = await asyncio.to_thread(
-            review_trade_plan_with_flash, _review_market_packet(user_prompt), planner_clean, mode
+            review_and_gate_plan, _review_market_packet(user_prompt), planner_clean, mode, AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
         )
         output = ensure_current_price_line(
             sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
@@ -9488,7 +9572,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             "reviewer", "rejected",
             f"Flash reviewer REJECT: {review.get('reason') or 'kế hoạch chưa được dữ liệu hỗ trợ đủ.'}",
             pre_direction=pre_direction, pre_confidence=pre_conf,
-            final_direction=direction, final_confidence=int(review.get("score") or 0),
+            final_direction=direction, final_confidence=(int(review.get("score")) if review.get("score") is not None else None),
+            reviewer_verdict=review.get("verdict"),
             **prefilter_score_kwargs,
         )
 
@@ -9498,42 +9583,44 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             "trigger", "waiting",
             "Setup hợp lệ nhưng chưa có trigger; lưu snapshot nội bộ và chưa gửi user.",
             pre_direction=pre_direction, pre_confidence=pre_conf,
-            final_direction=direction, final_confidence=int(review.get("score") or 0),
+            final_direction=direction, final_confidence=(int(review.get("score")) if review.get("score") is not None else None),
+            reviewer_verdict=review.get("verdict"),
             **prefilter_score_kwargs,
         )
 
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:
             return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
-        return log_and_return("glm", "rejected", "AI cuối chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+        return log_and_return("planner", "rejected", "Planner Pro chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     if direction not in {"LONG", "SHORT"}:
-        return log_and_return("glm", "rejected", "AI cuối không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+        return log_and_return("planner", "rejected", "Planner Pro không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     # Không chặn cứng chỉ vì hướng AI cuối khác DeepSeek Flash.
     # Flash chỉ là prefilter tiết kiệm chi phí; AI cuối vẫn tự quyết định từ dữ liệu đầy đủ.
     # Python chỉ hậu kiểm hướng AI cuối bằng dữ liệu khách quan sau khi model chọn xong.
 
-    # Gate cuối duy nhất: Điểm tín hiệu do AI cuối trả về.
-    # data_support_score của Python chỉ giữ để debug, không bao giờ chặn gửi tín hiệu.
+    # Gate cuối: điểm thật do Flash reviewer trả về.
+    # Python chỉ so với ngưỡng Auto Scan; không tự chấm và không sửa plan.
     signal_gate_failed = final_conf < AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
 
     if signal_gate_failed:
         mismatch_note = ""
         if pre_direction in {"LONG", "SHORT"} and direction in {"LONG", "SHORT"} and direction != pre_direction:
             mismatch_note = f" DeepSeek Flash lọc nhanh nghiêng {pre_direction}, nhưng AI cuối chọn {direction}; đây chỉ là thông tin debug, không ép hướng AI cuối."
-        data_note = f" Kiểm tra dữ liệu Python tham khảo: {final_data_support}/100; chỉ debug, không dùng để chặn."
+        data_note = ""
         return log_and_return(
-            "glm",
+            "reviewer",
             "rejected",
-            f"Tín hiệu cuối đạt Điểm tín hiệu {final_conf}/100; "
-            f"ngưỡng gửi là {AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE}/100."
+            f"Flash reviewer {review.get('verdict') or 'REJECT'} với {final_conf}/100; "
+            f"ngưỡng gửi Auto Scan là {AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE}/100."
             f"{data_note}"
             f"{mismatch_note}",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
             final_direction=direction,
             final_confidence=final_conf,
+            reviewer_verdict=review.get("verdict"),
             **prefilter_score_kwargs,
         )
 
@@ -9549,7 +9636,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     can_track = all(pred.get(k) is not None for k in ("entry_low", "entry_high", "sl", "tp1"))
     if not can_track:
-        return log_and_return("glm", "rejected", "missing trade levels", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+        return log_and_return("planner", "rejected", "Planner Pro thiếu Entry/SL/TP bắt buộc", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     reasoning_summary = build_local_reasoning_summary(output)
     prediction_id = await asyncio.to_thread(
@@ -9592,6 +9679,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         "pre_gap": gate.get("gap"),
         "final_direction": direction,
         "final_confidence": final_conf,
+        "reviewer_verdict": review.get("verdict"),
     }
 
 
@@ -9646,6 +9734,7 @@ async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
                             pre_gap=result.get("pre_gap"),
                             final_direction=result.get("final_direction") or result.get("direction"),
                             final_confidence=result.get("final_confidence") if result.get("final_confidence") is not None else result.get("confidence"),
+                            reviewer_verdict=result.get("reviewer_verdict"),
                             prediction_id=result.get("prediction_id"),
                         )
                         payload["sent"] += 1

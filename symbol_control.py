@@ -648,7 +648,11 @@ def _display_scan_stage(stage, status=None) -> str:
     status_raw = str(status or "-").lower()
     stage_map = {
         "deepseek": "DeepSeek",
-        "glm": "AI cuối",
+        "glm": "Planner Pro",
+        "planner": "Planner Pro",
+        "reviewer": "Flash reviewer",
+        "trigger": "Trigger",
+        "confirmation": "Xác nhận bias",
         "binance": "Binance",
         "cooldown": "Cooldown",
         "quota": "Quota AI cuối",
@@ -661,6 +665,7 @@ def _display_scan_stage(stage, status=None) -> str:
         "error": "lỗi",
         "sent": "đã gửi",
         "ok": "đã gửi",
+        "waiting": "đang chờ",
     }
     return f"{stage_map.get(stage_raw, stage_raw.upper() if stage_raw != '-' else '-')} → {status_map.get(status_raw, status_raw)}"
 
@@ -769,6 +774,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         _normalize_auto_scan_modes, AUTO_SCAN_INTERVAL_SECONDS, AUTO_SCAN_MIN_PREFILTER_CONFIDENCE,
         AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP, AUTO_SCAN_MIN_FINAL_CONFIDENCE,
         AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, DEEPSEEK_MODEL,
+        DEEPSEEK_REVIEW_MODEL, FINAL_REVIEW_MIN_SIGNAL_SCORE,
         get_ai_model_name, get_ai_provider_label, _auto_scan_format_dt,
     )
 
@@ -783,12 +789,21 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
     last_line = "Chưa có log scan."
     if last_log:
         pre = _display_prefilter_score(last_log)
-        final = _display_scan_score(last_log.get('final_direction'), last_log.get('final_confidence'), source="glm")
+        planner_direction = _display_scan_direction(last_log.get('final_direction'))
+        reviewer_score = last_log.get('final_confidence')
+        reviewer_verdict = last_log.get('reviewer_verdict') or (
+            "REJECT" if str(last_log.get('stage') or '').lower() == "reviewer" and str(last_log.get('status') or '').lower() == "rejected" else "-"
+        )
+        reviewer_text = (
+            f"{reviewer_score}/100 — {reviewer_verdict}" if reviewer_score is not None
+            else ("PARSE ERROR — REJECT" if reviewer_verdict == "REJECT" else "Chưa gọi")
+        )
         last_line = (
             f"{_auto_scan_format_dt(last_log.get('scanned_at'))} | "
             f"{last_log.get('symbol')} {'SCALP' if last_log.get('mode') == 'short' else 'SWING'} | "
             f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
-            f"DeepSeek: {pre} | AI cuối: {final} | {_display_scan_reason(last_log.get('reason'))}"
+            f"Prefilter Flash: {pre} | Planner Pro: {planner_direction} | "
+            f"Flash reviewer: {reviewer_text} | {_display_scan_reason(last_log.get('reason'))}"
         )
     if status.get("quota_resume"):
         state_text = "⏸ ĐÃ ĐỦ QUOTA AI CUỐI — sẽ tự bật lại lúc 07:00"
@@ -806,10 +821,12 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         f"Mode: {modes}\n"
         "Giới hạn: 1 symbol/tài khoản\n"
         f"DeepSeek prefilter: {DEEPSEEK_MODEL}\n"
-        f"AI cuối: {get_ai_model_name()} ({get_ai_provider_label()})\n"
+        f"Planner Pro: {get_ai_model_name()} ({get_ai_provider_label()})\n"
+        f"Flash reviewer: {DEEPSEEK_REVIEW_MODEL}\n"
         f"Ngưỡng mini-rubric DeepSeek: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100\n"
         f"Chênh lệch hướng tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm\n"
-        f"Ngưỡng Điểm tín hiệu AI cuối: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100\n"
+        f"Ngưỡng reviewer chung/Manual: {FINAL_REVIEW_MIN_SIGNAL_SCORE}/100\n"
+        f"Ngưỡng gửi Auto Scan: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100\n"
         f"Quota gọi AI cuối hôm nay: {status.get('glm_calls_today', 0)}/{AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} "
         f"(còn {status.get('glm_calls_remaining', AUTO_SCAN_MAX_GLM_CALLS_PER_DAY)} lượt)\n"
         f"Cooldown cùng symbol/mode: {AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES} phút\n"
@@ -834,14 +851,23 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     for item in reversed(logs):
         mode_label = "SCALP" if item.get("mode") == "short" else "SWING"
         pre = _display_prefilter_score(item)
-        final = _display_scan_score(item.get('final_direction'), item.get('final_confidence'), source="glm")
+        planner_direction = _display_scan_direction(item.get('final_direction'))
+        reviewer_score = item.get('final_confidence')
+        reviewer_verdict = item.get('reviewer_verdict') or (
+            "REJECT" if str(item.get('stage') or '').lower() == "reviewer" and str(item.get('status') or '').lower() == "rejected" else "-"
+        )
+        reviewer_text = (
+            f"{reviewer_score}/100 — {reviewer_verdict}" if reviewer_score is not None
+            else ("PARSE ERROR — REJECT" if reviewer_verdict == "REJECT" else "Chưa gọi")
+        )
         pid = f" | prediction #{item.get('prediction_id')}" if item.get("prediction_id") else ""
         lines.append(
             f"\n{_auto_scan_format_dt(item.get('scanned_at'))}\n"
             f"{item.get('symbol')} {mode_label}\n"
             f"Kết quả: {_display_scan_stage(item.get('stage'), item.get('status'))}\n"
-            f"DeepSeek: {pre}\n"
-            f"AI cuối: {final}\n"
+            f"Prefilter Flash: {pre}\n"
+            f"Planner Pro: {planner_direction}\n"
+            f"Flash reviewer: {reviewer_text}\n"
             f"Ghi chú: {_display_scan_reason(item.get('reason'))}{pid}"
         )
     # Vẫn chia tin nhắn an toàn vì một log có thể chứa ghi chú dài, dù chỉ giữ 5 mục.
