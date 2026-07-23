@@ -136,18 +136,18 @@ LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
 # chỉ khi prefilter thấy tín hiệu đủ tốt.
 AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
 AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
-AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "62"))
+AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "72"))
 # Nếu LONG/SHORT quá sát điểm nhau thì prefilter xem là NEUTRAL và không gọi AI cuối.
 # Đây là độ chênh tối thiểu giữa hai tổng điểm mini-rubric, không phải confidence %.
 AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
     0,
-    min(100, int(os.getenv("AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP", "5"))),
+    min(100, int(os.getenv("AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP", "20"))),
 )
 # V44: Auto Scan dùng 1 rubric cuối duy nhất do AI cuối tự chấm: Điểm tín hiệu /100.
 # Tên mới được ưu tiên; tên cũ giữ fallback để deploy không vỡ nếu Railway còn biến cũ.
 AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE = int(os.getenv(
     "AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE",
-    os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", "62"),
+    os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", "72"),
 ))
 # Backward-compatible aliases. Không còn dùng 2 gate confidence + setup nữa.
 AUTO_SCAN_MIN_FINAL_CONFIDENCE = AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
@@ -184,6 +184,12 @@ DEEPSEEK_APP_NAME = os.getenv("DEEPSEEK_APP_NAME", "Teopard Auto Scan")
 DEEPSEEK_TIMEOUT_SECONDS = int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "60"))
 DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "3000"))
 DEEPSEEK_TEMPERATURE = _env_float("DEEPSEEK_TEMPERATURE", 0.05)
+DEEPSEEK_REVIEW_MODEL = os.getenv("DEEPSEEK_REVIEW_MODEL", DEEPSEEK_MODEL)
+DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS", "1800"))
+DEEPSEEK_REVIEW_TEMPERATURE = _env_float("DEEPSEEK_REVIEW_TEMPERATURE", 0.0)
+FINAL_REVIEW_MIN_SIGNAL_SCORE = int(os.getenv("FINAL_REVIEW_MIN_SIGNAL_SCORE", os.getenv("AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE", "72")))
+AUTO_SCAN_DIRECTION_CONFIRMATIONS = max(1, int(os.getenv("AUTO_SCAN_DIRECTION_CONFIRMATIONS", "2")))
+ANALYSIS_DATA_VARIANT = os.getenv("ANALYSIS_DATA_VARIANT", "C").strip().upper() or "C"
 # Call tóm tắt reasoning dùng token riêng và KHÔNG continuation để tránh model đốt token reasoning ẩn.
 LLM_SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_SUMMARY_MAX_OUTPUT_TOKENS", "600"))
 # Mặc định tắt reasoning cho summary. Phân tích chính vẫn dùng provider-specific reasoning effort nếu bạn set.
@@ -312,6 +318,12 @@ def init_prediction_db() -> None:
             ("result_reason", "TEXT"),
             ("market_snapshot", "TEXT"),
             ("feature_snapshot", "TEXT"),
+            ("setup_status", "TEXT"),
+            ("reviewer_score", "REAL"),
+            ("reviewer_verdict", "TEXT"),
+            ("lifecycle_status", "TEXT"),
+            ("mae", "REAL"),
+            ("mfe", "REAL"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {definition}")
@@ -1395,6 +1407,54 @@ def evaluate_prediction_lifecycle(
 
 
 
+
+def _calculate_mae_mfe(pred: dict, candles: pd.DataFrame | None, entry_price: float | None) -> tuple[float | None, float | None]:
+    if candles is None or candles.empty or entry_price is None:
+        return None, None
+    try:
+        highs = pd.to_numeric(candles["high"], errors="coerce")
+        lows = pd.to_numeric(candles["low"], errors="coerce")
+        direction = str(pred.get("direction") or "").upper()
+        if direction == "LONG":
+            mae = max(0.0, float(entry_price) - float(lows.min()))
+            mfe = max(0.0, float(highs.max()) - float(entry_price))
+        elif direction == "SHORT":
+            mae = max(0.0, float(highs.max()) - float(entry_price))
+            mfe = max(0.0, float(entry_price) - float(lows.min()))
+        else:
+            return None, None
+        return mae, mfe
+    except Exception:
+        return None, None
+
+
+def _update_prediction_lifecycle_metrics(prediction_id: int, lifecycle_status: str, mae: float | None = None, mfe: float | None = None) -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE predictions SET lifecycle_status=?, mae=COALESCE(?,mae), mfe=COALESCE(?,mfe) WHERE id=?",
+                (lifecycle_status, mae, mfe, prediction_id),
+            )
+    except Exception:
+        pass
+
+
+def _compat_lifecycle_status(result: str | None, action: str | None = None) -> str:
+    mapping = {
+        "WIN": "TP1_HIT",
+        "LOSS": "SL_HIT",
+        "AMBIGUOUS": "AMBIGUOUS_TP_SL",
+        "NOT_FILLED": "EXPIRED_NOT_FILLED",
+        "EXPIRED": "EXPIRED_AFTER_ENTRY",
+        "PENDING_ENTRY": "WAITING_TRIGGER",
+        "ENTRY_FILLED": "ENTRY_FILLED",
+    }
+    if action == "fill":
+        return "ENTRY_FILLED"
+    return mapping.get(str(result or "").upper(), str(result or action or "SETUP_CREATED").upper())
+
+
+
 async def auto_check_pending_predictions(force: bool = False) -> dict:
     """Check predictions đang mở, chỉ cập nhật DB và trả về số liệu tóm tắt.
 
@@ -1427,6 +1487,7 @@ async def auto_check_pending_predictions(force: bool = False) -> dict:
 
         if action == "fill":
             mark_entry_filled(pred["id"], decision["price"], decision["filled_at"], pred["mode"])
+            _update_prediction_lifecycle_metrics(pred["id"], "ENTRY_FILLED")
             entry_filled_count += 1
             # Không gửi tin khi khớp Entry; chỉ log Railway và lưu DB.
             print(f"[AUTO_CHECK] #{pred['id']} ENTRY_FILLED {pred['symbol']} {decision.get('reason')}", flush=True)
@@ -1448,6 +1509,11 @@ async def auto_check_pending_predictions(force: bool = False) -> dict:
                 trade_closed_at=decision.get("closed_at"), entry_price=entry_price,
                 direction=pred.get("direction"), sl=pred.get("sl"), entry_filled_at=entry_filled_at,
             )
+            metric_candles = candles
+            if entry_filled_at is not None and candles is not None and not candles.empty:
+                metric_candles = candles[candles["close_time"] >= pd.Timestamp(entry_filled_at)]
+            mae, mfe = _calculate_mae_mfe(pred, metric_candles, entry_price)
+            _update_prediction_lifecycle_metrics(pred["id"], _compat_lifecycle_status(result), mae, mfe)
             closed_count += 1
             print(
                 f"[AUTO_CHECK] #{pred['id']} CLOSED {pred['symbol']} {result} "
@@ -7426,6 +7492,497 @@ def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
         call_type="main",
     )
 
+
+# ─── V50 objective market packet + independent Flash reviewer ────────────────
+
+def _mode_frame_roles(mode: str) -> tuple[str, str, str, str]:
+    """Return timing, setup/plan, trend/structure, macro labels."""
+    if mode == "short":
+        return "15M", "1H", "4H", "1D"
+    return "1H", "4H", "1D", "1W"
+
+def _v50_time_value(row) -> str:
+    for key in ("open_time", "timestamp", "time", "datetime"):
+        try:
+            value = row.get(key)
+        except Exception:
+            value = None
+        if value is not None and str(value) not in {"", "nan", "NaT"}:
+            try:
+                if isinstance(value, (int, float, np.integer, np.floating)):
+                    unit = "ms" if float(value) > 10_000_000_000 else "s"
+                    return pd.to_datetime(value, unit=unit, utc=True).strftime("%Y-%m-%d %H:%M")
+                return pd.to_datetime(value, utc=True).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                return str(value)
+    try:
+        return pd.to_datetime(row.name, utc=True).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(getattr(row, "name", "N/A"))
+
+
+def _v50_closed_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return None
+    # Binance row cuối thường là nến đang chạy.
+    return df.iloc[:-1].copy() if len(df) >= 2 else df.copy()
+
+
+def _v50_raw_limit(mode: str, label: str) -> int:
+    limits = {
+        "short": {"15M": 16, "1H": 48, "4H": 36, "1D": 12},
+        "long": {"1H": 16, "4H": 60, "1D": 50, "1W": 24},
+    }
+    return limits.get(mode, {}).get(label, 16)
+
+
+def _v50_raw_candles(label: str, df: pd.DataFrame | None, mode: str) -> str:
+    closed = _v50_closed_df(df)
+    if closed is None or closed.empty:
+        return f"{label}: N/A"
+    rows = closed.tail(_v50_raw_limit(mode, label))
+    out = [f"{label} — {len(rows)} nến đã đóng gần nhất (time,O,H,L,C,V):"]
+    for _, row in rows.iterrows():
+        out.append(
+            f"{_v50_time_value(row)} | "
+            f"{fmt(_safe_float(row.get('open')))} | {fmt(_safe_float(row.get('high')))} | "
+            f"{fmt(_safe_float(row.get('low')))} | {fmt(_safe_float(row.get('close')))} | "
+            f"{fmt(_safe_float(row.get('volume')))}"
+        )
+    return "\n".join(out)
+
+
+def _v50_pivots(df: pd.DataFrame | None, lookback: int = 80, wing: int = 2) -> list[dict]:
+    closed = _v50_closed_df(df)
+    if closed is None or len(closed) < wing * 2 + 3:
+        return []
+    sample = closed.tail(lookback)
+    highs = pd.to_numeric(sample["high"], errors="coerce").to_numpy()
+    lows = pd.to_numeric(sample["low"], errors="coerce").to_numpy()
+    rows = list(sample.iterrows())
+    pivots: list[dict] = []
+    for i in range(wing, len(sample) - wing):
+        if np.isfinite(highs[i]) and highs[i] >= np.nanmax(highs[i-wing:i+wing+1]):
+            pivots.append({"type": "HIGH", "price": float(highs[i]), "time": _v50_time_value(rows[i][1]), "index": i})
+        if np.isfinite(lows[i]) and lows[i] <= np.nanmin(lows[i-wing:i+wing+1]):
+            pivots.append({"type": "LOW", "price": float(lows[i]), "time": _v50_time_value(rows[i][1]), "index": i})
+    return pivots[-12:]
+
+
+def _v50_zone_stats(df: pd.DataFrame | None, pivot: dict) -> dict:
+    closed = _v50_closed_df(df)
+    if closed is None or closed.empty:
+        return {}
+    price = float(pivot["price"])
+    tolerance = max(abs(price) * 0.0012, 1e-9)  # 0.12%, không dùng ATR.
+    post = closed.copy()
+    try:
+        pivot_time = pd.to_datetime(pivot["time"], utc=True)
+        time_values = pd.to_datetime(post.get("open_time", post.index), utc=True, errors="coerce")
+        post = post.loc[time_values >= pivot_time]
+    except Exception:
+        pass
+    touches = rejects = closes_through = 0
+    last_touch = None
+    volumes = []
+    for _, row in post.iterrows():
+        low = _safe_float(row.get("low"))
+        high = _safe_float(row.get("high"))
+        close = _safe_float(row.get("close"))
+        open_ = _safe_float(row.get("open"))
+        if None in (low, high, close, open_):
+            continue
+        touched = low <= price + tolerance and high >= price - tolerance
+        if touched:
+            touches += 1
+            last_touch = _v50_time_value(row)
+            volumes.append(_safe_float(row.get("volume"), 0.0) or 0.0)
+            if pivot["type"] == "LOW" and close > price and close >= open_:
+                rejects += 1
+            elif pivot["type"] == "HIGH" and close < price and close <= open_:
+                rejects += 1
+        if pivot["type"] == "LOW" and close < price - tolerance:
+            closes_through += 1
+        elif pivot["type"] == "HIGH" and close > price + tolerance:
+            closes_through += 1
+    status = "fresh" if touches <= 1 and closes_through == 0 else "tested" if closes_through == 0 else "weakened"
+    return {
+        "touches": touches,
+        "rejections": rejects,
+        "closed_through": closes_through,
+        "last_touch": last_touch or "N/A",
+        "reaction_volume_avg": float(np.mean(volumes)) if volumes else None,
+        "status": status,
+        "zone_low": price - tolerance,
+        "zone_high": price + tolerance,
+    }
+
+
+def _v50_swing_zone_block(label: str, df: pd.DataFrame | None) -> str:
+    pivots = _v50_pivots(df)
+    if not pivots:
+        return f"{label}: không đủ pivot khách quan."
+    lines = [f"{label} swing/vùng phản ứng khách quan (không phải mức bắt buộc):"]
+    for pivot in pivots[-6:]:
+        stats = _v50_zone_stats(df, pivot)
+        lines.append(
+            f"- {pivot['type']} {fmt(pivot['price'])} hình thành {pivot['time']}; "
+            f"vùng {fmt(stats.get('zone_low'))}–{fmt(stats.get('zone_high'))}; "
+            f"touch={stats.get('touches', 0)}, reject={stats.get('rejections', 0)}, "
+            f"close-through={stats.get('closed_through', 0)}, last={stats.get('last_touch', 'N/A')}, "
+            f"status={stats.get('status', 'N/A')}."
+        )
+    return "\n".join(lines)
+
+
+def _v50_live_line(label: str, df: pd.DataFrame | None) -> str:
+    if df is None or df.empty:
+        return f"{label} live: N/A"
+    row = df.iloc[-1]
+    progress = None
+    try:
+        progress = (_live_candle_progress(row, label) * 100.0) if _live_candle_progress(row, label) is not None else None
+    except Exception:
+        progress = None
+    return (
+        f"{label} live ({fmt(progress, 1) if progress is not None else 'N/A'}%): "
+        f"time={_v50_time_value(row)}, O={fmt(_safe_float(row.get('open')))}, "
+        f"H={fmt(_safe_float(row.get('high')))}, L={fmt(_safe_float(row.get('low')))}, "
+        f"C={fmt(_safe_float(row.get('close')))}, V={fmt(_safe_float(row.get('volume')))}. "
+        "Đây là nến đang chạy, không phải xác nhận đóng nến."
+    )
+
+
+def build_feature_engineering_block(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+) -> str:
+    """V50: chỉ gửi dữ kiện khách quan; bỏ Fib/regime/trend label và ATR."""
+    trigger, setup, trend, big = _mode_frame_roles(mode)
+    labels = [trigger, setup, trend, big]
+    lines = [
+        "OBJECTIVE_MARKET_PACKET V50",
+        f"Giá hiện tại: {fmt(current_price)}",
+        "Python không kết luận hướng và không dựng Entry/SL/TP.",
+        "Không có ATR, Fibonacci, market-regime label hay trend label trong packet này.",
+    ]
+    for label in labels:
+        df = timeframe_data.get(label)
+        if df is None or df.empty:
+            continue
+        row = _analysis_row(df)
+        if row is not None:
+            lines.append(
+                f"{label} chỉ báo nến đóng gần nhất: close={fmt(_safe_float(row.get('close')))}, "
+                f"EMA7={fmt(_safe_float(row.get('ema_7')))}, EMA25={fmt(_safe_float(row.get('ema_25')))}, "
+                f"EMA50={fmt(_safe_float(row.get('ema_50')))}, RSI14={fmt(_safe_float(row.get('rsi_14')),1)}, "
+                f"MACD={fmt(_safe_float(row.get('macd')))}, signal={fmt(_safe_float(row.get('macd_signal')))}, "
+                f"volume={fmt(_safe_float(row.get('volume')))}, takerBuy={fmt(_safe_float(row.get('taker_buy_ratio')),2)}."
+            )
+        if ANALYSIS_DATA_VARIANT in {"B", "C"} and label in {setup, trend, big}:
+            lines.append(_v50_swing_zone_block(label, df))
+    return "\n".join(lines)
+
+
+def build_feature_snapshot(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+) -> str:
+    """V50 prefilter packet ngắn: dữ kiện khách quan, không plan và không nhãn hướng Python."""
+    trigger, setup, trend, big = _mode_frame_roles(mode)
+    lines = [f"Mode={'SCALP' if mode == 'short' else 'SWING'}; price={fmt(current_price)}"]
+    for label in (trigger, setup, trend, big):
+        df = timeframe_data.get(label)
+        row = _analysis_row(df) if df is not None and not df.empty else None
+        if row is None:
+            continue
+        lines.append(
+            f"{label}: O={fmt(_safe_float(row.get('open')))},H={fmt(_safe_float(row.get('high')))},"
+            f"L={fmt(_safe_float(row.get('low')))},C={fmt(_safe_float(row.get('close')))},"
+            f"EMA7/25/50={fmt(_safe_float(row.get('ema_7')))}/{fmt(_safe_float(row.get('ema_25')))}/{fmt(_safe_float(row.get('ema_50')))},"
+            f"RSI14={fmt(_safe_float(row.get('rsi_14')),1)},MACD={fmt(_safe_float(row.get('macd')))},"
+            f"signal={fmt(_safe_float(row.get('macd_signal')))},V={fmt(_safe_float(row.get('volume')))}"
+        )
+    return "\n".join(lines)
+
+
+def build_synchronized_decision_snapshot(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+) -> str:
+    trigger, setup, trend, big = _mode_frame_roles(mode)
+    lines = ["SYNCHRONIZED_DECISION_SNAPSHOT V50"]
+    lines.append(f"Roles: timing={trigger}; setup/plan={setup}; trend/structure={trend}; macro={big}.")
+    lines.append(_v50_live_line(setup, timeframe_data.get(setup)))
+    lines.append(_v50_live_line(trend, timeframe_data.get(trend)))
+    lines.append(_v50_live_line(trigger, timeframe_data.get(trigger)))
+    return "\n".join(lines)
+
+
+def build_user_prompt(
+    symbol: str,
+    mode: str,
+    timeframe_data: dict[str, pd.DataFrame | None],
+    fear_greed_info: str,
+    current_price_str: str,
+    feature_block: str | None = None,
+    open_signal_context: str | None = None,
+    decision_snapshot: str | None = None,
+    direction_scorecard: str | None = None,
+) -> str:
+    mode_label = "SCALP" if mode == "short" else "SWING"
+    trigger, setup, trend, big = _mode_frame_roles(mode)
+    raw_sections = [_v50_raw_candles(label, timeframe_data.get(label), mode) for label in (trigger, setup, trend, big)]
+    return "\n".join([
+        f"PHÂN TÍCH {symbol} — {mode_label}",
+        current_price_str,
+        "",
+        f"Vai trò: {trend}=hướng/cấu trúc; {setup}=thiết kế Entry/SL/TP; {trigger}=timing; {big}=macro.",
+        "Không có history, open plan, Fear & Greed, ATR, Fibonacci hay preferred direction.",
+        "",
+        feature_block or "OBJECTIVE_MARKET_PACKET: N/A",
+        "",
+        decision_snapshot or "LIVE SNAPSHOT: N/A",
+        "",
+        "RAW OHLCV:",
+        "\n\n".join(raw_sections),
+        "",
+        "QUY TRÌNH NỘI BỘ BẮT BUỘC:",
+        "PHASE A — THESIS: xác định continuation/pullback/range/reversal, hướng ưu tiên, bằng chứng ủng hộ, bằng chứng phản đối và điều kiện vô hiệu.",
+        "PHASE B — PLAN: chỉ khi thesis rõ mới lập plan. Không chọn số trước rồi viết lý do sau.",
+        "",
+        "OUTPUT PUBLIC:",
+        f"🎯 {symbol} — {mode_label}",
+        "🏆 QUYẾT ĐỊNH: LONG | SHORT | NO TRADE",
+        "Trạng thái: READY_TO_ENTER | SETUP_WAITING_TRIGGER | NO_TRADE",
+        "Giá hiện tại: ... USDT",
+        "Nếu LONG/SHORT:",
+        "Entry: low–high",
+        "SL: ...",
+        "TP1: ...",
+        "TP2: ... hoặc N/A nếu không có target cấu trúc thứ hai đủ rõ",
+        "Kích hoạt: ...",
+        "Bằng chứng Entry: timeframe + timestamp/cụm nến cụ thể",
+        "Bằng chứng SL: invalidation cụ thể; wick hay close; timeframe",
+        "Bằng chứng TP1: target + timestamp/vùng hình thành",
+        "Bằng chứng TP2: target + timestamp/vùng hình thành hoặc N/A",
+        "⚠️ Rủi ro: ...",
+        "",
+        "QUY TẮC:",
+        "- Không tự chấm Điểm tín hiệu. Một Flash reviewer độc lập sẽ chấm sau.",
+        "- Không có evidence timestamp cho Entry/SL/TP1 thì chọn NO TRADE.",
+        "- TP2 tùy chọn; tuyệt đối không bịa TP2.",
+        "- Khung timing chỉ xác nhận, không được co Entry/SL/TP hoặc tự đảo hướng.",
+        "- READY_TO_ENTER chỉ khi trigger đã có và giá đang trong/sát Entry. Nếu còn chờ xác nhận, dùng SETUP_WAITING_TRIGGER.",
+    ])
+
+
+def build_deepseek_prefilter_text(
+    symbol: str,
+    mode: str,
+    current_price_str: str,
+    feature_snapshot: str,
+    feature_block: str | None = None,
+    decision_snapshot: str | None = None,
+    open_signal_context: str | None = None,
+    direction_scorecard: str | None = None,
+) -> str:
+    """V50: prefilter chỉ lọc market clarity/direction, không phân tích plan."""
+    return "\n".join([
+        f"PREFILTER {symbol} {'SCALP' if mode == 'short' else 'SWING'}",
+        current_price_str,
+        "Chỉ đánh giá snapshot có đáng gọi planner hay không. Không tạo Entry/SL/TP.",
+        feature_snapshot or "N/A",
+        decision_snapshot or "N/A",
+        "",
+        "Chấm đúng format:",
+        "LONG trend=0..25",
+        "LONG structure=0..25",
+        "LONG momentum=0..20",
+        "LONG confirmation=0..15",
+        "LONG clarity=0..15",
+        "SHORT trend=0..25",
+        "SHORT structure=0..25",
+        "SHORT momentum=0..20",
+        "SHORT confirmation=0..15",
+        "SHORT clarity=0..15",
+        "BEST=LONG|SHORT|NEUTRAL",
+        "REASON=một câu ngắn",
+    ])
+
+
+def _extract_setup_status(output: str | None) -> str:
+    text = output or ""
+    m = re.search(r"Trạng\s*thái\s*:\s*(READY_TO_ENTER|SETUP_WAITING_TRIGGER|NO_TRADE)", text, flags=re.I)
+    if m:
+        return m.group(1).upper()
+    if re.search(r"(chờ|lệnh chờ|chưa vào ngay|waiting)", text, flags=re.I):
+        return "SETUP_WAITING_TRIGGER"
+    direction = _clean_decision(parse_prediction_from_output(text).get("direction"))
+    return "NO_TRADE" if direction == "NO_TRADE" else "READY_TO_ENTER"
+
+
+def _parse_reviewer_output(text: str | None) -> dict:
+    raw = text or ""
+    scores = {}
+    keys = {
+        "THESIS": 20, "SETUP": 20, "ENTRY": 20,
+        "SL": 15, "TARGET": 15, "TRIGGER": 10,
+    }
+    for key, cap in keys.items():
+        m = re.search(rf"^{key}\s*=\s*([0-9]+(?:\.[0-9]+)?)", raw, flags=re.I | re.M)
+        if m:
+            scores[key] = min(cap, max(0.0, float(m.group(1))))
+    total = sum(scores.values()) if len(scores) == len(keys) else None
+    verdict_m = re.search(r"^VERDICT\s*=\s*(APPROVE|REJECT)", raw, flags=re.I | re.M)
+    verdict = verdict_m.group(1).upper() if verdict_m else ("APPROVE" if total is not None and total >= FINAL_REVIEW_MIN_SIGNAL_SCORE else "REJECT")
+    if total is None or total < FINAL_REVIEW_MIN_SIGNAL_SCORE:
+        verdict = "REJECT"
+    reason_m = re.search(r"^REASON\s*=\s*(.+)$", raw, flags=re.I | re.M)
+    return {"score": total, "verdict": verdict, "breakdown": scores, "reason": reason_m.group(1).strip() if reason_m else ""}
+
+
+def review_trade_plan_with_flash(market_packet: str, planner_output: str, mode: str) -> dict:
+    """Flash chỉ review; không được sửa direction/Entry/SL/TP."""
+    prompt = "\n".join([
+        "Bạn là reviewer độc lập cho kế hoạch trading do analyst khác tạo.",
+        "Không tạo plan mới. Không sửa direction, Entry, SL, TP1, TP2.",
+        "Đọc raw market packet và kiểm tra plan có được dữ liệu hỗ trợ hay không.",
+        "Không tin lời giải thích nếu không khớp timestamp/OHLCV.",
+        "TP2=N/A là hợp lệ và không bị trừ điểm chỉ vì thiếu TP2.",
+        "Nếu plan là SETUP_WAITING_TRIGGER, chấm TRIGGER thấp; không tự đổi thành READY.",
+        "",
+        "MARKET PACKET:",
+        market_packet,
+        "",
+        "PLANNER OUTPUT:",
+        planner_output,
+        "",
+        "Trả đúng 8 dòng, không markdown:",
+        "THESIS=0..20",
+        "SETUP=0..20",
+        "ENTRY=0..20",
+        "SL=0..15",
+        "TARGET=0..15",
+        "TRIGGER=0..10",
+        "VERDICT=APPROVE|REJECT",
+        "REASON=một câu nêu lỗi lớn nhất hoặc lý do approve",
+    ])
+    result = _deepseek_create_once(system=None, messages=[{"role": "user", "content": prompt}], timeout=DEEPSEEK_TIMEOUT_SECONDS, model=DEEPSEEK_REVIEW_MODEL, max_tokens=DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS, temperature=DEEPSEEK_REVIEW_TEMPERATURE)
+    parsed = _parse_reviewer_output(result.get("text") or "")
+    parsed["raw"] = result.get("text") or ""
+    return parsed
+
+
+def _apply_reviewer_score(output: str, review: dict) -> str:
+    clean = _remove_rubric_block(output or "")
+    # Reviewer REJECT là gate thật; giữ score gốc trong snapshot nhưng public/gate dùng 0.
+    gate_score = review.get("score") if review.get("verdict") == "APPROVE" else 0
+    return _insert_public_signal_score(clean, gate_score)
+
+
+def _review_market_packet(user_prompt: str) -> str:
+    # Cùng dữ liệu planner, bỏ riêng phần format output dài không cần thiết.
+    return user_prompt[:120000]
+
+
+def _ensure_v50_tables() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS analysis_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                user_id INTEGER,
+                chat_id INTEGER,
+                symbol TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                source TEXT NOT NULL,
+                model TEXT,
+                data_variant TEXT,
+                prefilter_output TEXT,
+                planner_input TEXT,
+                planner_output TEXT,
+                reviewer_output TEXT,
+                reviewer_score REAL,
+                reviewer_verdict TEXT,
+                setup_status TEXT,
+                current_price REAL,
+                outcome TEXT DEFAULT 'SETUP_CREATED',
+                mae REAL,
+                mfe REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auto_scan_bias_state (
+                user_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                direction TEXT,
+                confirmations INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, symbol, mode)
+            )
+        """)
+        for table in ("predictions", "trade_candidates"):
+            for col, definition in [
+                ("setup_status", "TEXT"),
+                ("reviewer_score", "REAL"),
+                ("reviewer_verdict", "TEXT"),
+                ("mae", "REAL"),
+                ("mfe", "REAL"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
+                except sqlite3.OperationalError:
+                    pass
+
+
+def _save_analysis_snapshot(**kwargs) -> None:
+    try:
+        _ensure_v50_tables()
+        cols = [
+            "created_at","user_id","chat_id","symbol","mode","source","model","data_variant",
+            "prefilter_output","planner_input","planner_output","reviewer_output","reviewer_score",
+            "reviewer_verdict","setup_status","current_price"
+        ]
+        values = [
+            iso(utc_now()), kwargs.get("user_id"), kwargs.get("chat_id"), kwargs.get("symbol"),
+            kwargs.get("mode"), kwargs.get("source"), kwargs.get("model"), ANALYSIS_DATA_VARIANT,
+            kwargs.get("prefilter_output"), kwargs.get("planner_input"), kwargs.get("planner_output"),
+            kwargs.get("reviewer_output"), kwargs.get("reviewer_score"), kwargs.get("reviewer_verdict"),
+            kwargs.get("setup_status"), kwargs.get("current_price")
+        ]
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                f"INSERT INTO analysis_snapshots ({','.join(cols)}) VALUES ({','.join('?' for _ in cols)})",
+                values,
+            )
+    except Exception as exc:
+        print(f"[SNAPSHOT_SAVE_ERROR] {exc}", flush=True)
+
+
+def _confirm_auto_scan_bias(user_id: int, symbol: str, mode: str, direction: str) -> int:
+    _ensure_v50_tables()
+    now = iso(utc_now())
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT direction, confirmations FROM auto_scan_bias_state WHERE user_id=? AND symbol=? AND mode=?",
+            (user_id, symbol, mode),
+        ).fetchone()
+        count = int(row[1] or 0) + 1 if row and row[0] == direction else 1
+        conn.execute(
+            """INSERT INTO auto_scan_bias_state(user_id,symbol,mode,direction,confirmations,updated_at)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(user_id,symbol,mode) DO UPDATE SET
+               direction=excluded.direction, confirmations=excluded.confirmations, updated_at=excluded.updated_at""",
+            (user_id, symbol, mode, direction, count, now),
+        )
+    return count
+
+
 def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, chat_id: int | None = None) -> str:
     """
     Legacy synchronous entry point.
@@ -7480,9 +8037,22 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
     )
 
     raw_output = request_claude_analysis(system_prompt, user_prompt)
-    scored_output, _score_meta = finalize_model_scoring_output(raw_output)
-    output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
+    planner_clean = _remove_rubric_block(raw_output)
+    planner_pred = parse_prediction_from_output(planner_clean)
+    if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
+        review = review_trade_plan_with_flash(_review_market_packet(user_prompt), planner_clean, mode)
+        output = ensure_current_price_line(sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price)
+    else:
+        review = {"score": None, "verdict": "REJECT", "raw": "", "reason": "Planner chọn NO TRADE."}
+        output = ensure_current_price_line(sanitize_user_output(_insert_public_signal_score(planner_clean, None)), current_price)
     pred = parse_prediction_from_output(output)
+    _save_analysis_snapshot(
+        user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="sync",
+        model=get_ai_model_name(), planner_input=user_prompt, planner_output=planner_clean,
+        reviewer_output=review.get("raw"), reviewer_score=review.get("score"),
+        reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
+        current_price=current_price,
+    )
 
     # Model-authoritative flow:
     # - Model tự chọn và chịu trách nhiệm toàn bộ Entry/SL/TP.
@@ -7511,7 +8081,6 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         and pred.get("entry_high") is not None
         and pred.get("sl") is not None
         and pred.get("tp1") is not None
-        and pred.get("tp2") is not None
     )
 
     if can_track:
@@ -7536,7 +8105,7 @@ def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, cha
         missing = []
         if direction not in ("LONG", "SHORT"):
             missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO TRADE.")
-        for field in ("entry_low", "entry_high", "sl", "tp1", "tp2"):
+        for field in ("entry_low", "entry_high", "sl", "tp1"):
             if pred.get(field) is None:
                 missing.append(f"Không parse được {field}.")
         log_hidden_rejection(binance_symbol, mode, pred, missing, output)
@@ -7654,9 +8223,29 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         f"[MANUAL_LLM_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
         flush=True,
     )
-    scored_output, _score_meta = finalize_model_scoring_output(raw_output)
-    output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
+    planner_clean = _remove_rubric_block(raw_output)
+    planner_pred = parse_prediction_from_output(planner_clean)
+    if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
+        review = await asyncio.to_thread(
+            review_trade_plan_with_flash, _review_market_packet(user_prompt), planner_clean, mode
+        )
+        output = ensure_current_price_line(
+            sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
+        )
+    else:
+        review = {"score": None, "verdict": "REJECT", "raw": "", "reason": "Planner chọn NO TRADE."}
+        output = ensure_current_price_line(
+            sanitize_user_output(_insert_public_signal_score(planner_clean, None)), current_price
+        )
     pred = parse_prediction_from_output(output)
+    await asyncio.to_thread(
+        _save_analysis_snapshot,
+        user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="manual",
+        model=get_ai_model_name(), planner_input=user_prompt, planner_output=planner_clean,
+        reviewer_output=review.get("raw"), reviewer_score=review.get("score"),
+        reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
+        current_price=current_price,
+    )
 
     # Model-authoritative flow:
     # - Model tự chọn và chịu trách nhiệm toàn bộ Entry/SL/TP.
@@ -7685,7 +8274,6 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         and pred.get("entry_high") is not None
         and pred.get("sl") is not None
         and pred.get("tp1") is not None
-        and pred.get("tp2") is not None
     )
 
     candidate_id = None
@@ -7712,7 +8300,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         missing = []
         if direction not in ("LONG", "SHORT"):
             missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO TRADE.")
-        for field in ("entry_low", "entry_high", "sl", "tp1", "tp2"):
+        for field in ("entry_low", "entry_high", "sl", "tp1"):
             if pred.get(field) is None:
                 missing.append(f"Không parse được {field}.")
         log_hidden_rejection(binance_symbol, mode, pred, missing, output)
@@ -8652,7 +9240,7 @@ def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
     }
 
 
-def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEEPSEEK_TIMEOUT_SECONDS) -> dict:
+def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEEPSEEK_TIMEOUT_SECONDS, model: str | None = None, max_tokens: int | None = None, temperature: float | None = None) -> dict:
     if not DEEPSEEK_API_KEY:
         raise RuntimeError("Missing DEEPSEEK_API_KEY. Set DEEPSEEK_API_KEY or OPENROUTER_API_KEY in Railway variables.")
     headers = {
@@ -8666,10 +9254,10 @@ def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEE
         payload_messages.append({"role": "system", "content": system})
     payload_messages.extend(messages)
     payload = {
-        "model": DEEPSEEK_MODEL,
+        "model": model or DEEPSEEK_MODEL,
         "messages": payload_messages,
-        "max_tokens": DEEPSEEK_MAX_OUTPUT_TOKENS,
-        "temperature": DEEPSEEK_TEMPERATURE,
+        "max_tokens": int(max_tokens or DEEPSEEK_MAX_OUTPUT_TOKENS),
+        "temperature": DEEPSEEK_TEMPERATURE if temperature is None else float(temperature),
     }
     r = requests.post(f"{DEEPSEEK_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=timeout)
     try:
@@ -8827,10 +9415,24 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     deepseek_reason = gate.get("reason")
 
     if not gate.get("should_call_glm"):
+        await asyncio.to_thread(_reset_auto_scan_bias, user_id, binance_symbol, mode)
         return log_and_return(
             "deepseek",
             "rejected",
             gate.get("reason") or "DeepSeek Flash không thấy ứng viên LONG/SHORT đủ mạnh để gọi AI cuối.",
+            pre_direction=pre_direction,
+            pre_confidence=pre_conf,
+            **prefilter_score_kwargs,
+        )
+
+    confirmations = await asyncio.to_thread(
+        _confirm_auto_scan_bias, user_id, binance_symbol, mode, pre_direction
+    )
+    if confirmations < AUTO_SCAN_DIRECTION_CONFIRMATIONS:
+        return log_and_return(
+            "confirmation",
+            "waiting",
+            f"Bias {pre_direction} mới đạt {confirmations}/{AUTO_SCAN_DIRECTION_CONFIRMATIONS} snapshot liên tiếp; chưa gọi planner.",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
             **prefilter_score_kwargs,
@@ -8849,15 +9451,56 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         "- Lớp lọc nhanh đã đạt điều kiện gọi AI cuối, nhưng điểm LONG/SHORT của Flash không được đưa vào đây để tránh neo hướng.\n"
         "- Bạn phải tự chọn LONG / SHORT / NO TRADE từ dữ liệu đầy đủ bên trên và tự chấm một Điểm tín hiệu duy nhất. Python chỉ parse kết quả và dùng Điểm tín hiệu làm gate duy nhất."
     )
-    raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt + flash_note)
-    scored_output, _score_meta = finalize_model_scoring_output(raw_output)
-    output = ensure_current_price_line(sanitize_user_output(scored_output), current_price)
+    planner_input = user_prompt + flash_note
+    raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, planner_input)
+    planner_clean = _remove_rubric_block(raw_output)
+    planner_pred = parse_prediction_from_output(planner_clean)
+    if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
+        review = await asyncio.to_thread(
+            review_trade_plan_with_flash, _review_market_packet(user_prompt), planner_clean, mode
+        )
+        output = ensure_current_price_line(
+            sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
+        )
+    else:
+        review = {"score": None, "verdict": "REJECT", "raw": "", "reason": "Planner chọn NO TRADE."}
+        output = ensure_current_price_line(
+            sanitize_user_output(_insert_public_signal_score(planner_clean, None)), current_price
+        )
     pred = parse_prediction_from_output(output)
     direction = (pred.get("direction") or "").upper()
+    await asyncio.to_thread(
+        _save_analysis_snapshot,
+        user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="autoscan",
+        model=get_ai_model_name(), prefilter_output=json.dumps(prefilter, ensure_ascii=False),
+        planner_input=planner_input, planner_output=planner_clean,
+        reviewer_output=review.get("raw"), reviewer_score=review.get("score"),
+        reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
+        current_price=current_price,
+    )
     if direction in {"LONG", "SHORT"}:
         pred, output = apply_python_objective_scores(pred, output, timeframe_data, mode, current_price)
-    final_conf = int(pred.get("signal_score") or pred.get("confidence") or _extract_legacy_confidence(output) or 0)
+    final_conf = int(review.get("score") or pred.get("signal_score") or pred.get("confidence") or 0)
     final_data_support = int(pred.get("data_support_score") or 0)
+
+    if review.get("verdict") != "APPROVE" and direction in {"LONG", "SHORT"}:
+        return log_and_return(
+            "reviewer", "rejected",
+            f"Flash reviewer REJECT: {review.get('reason') or 'kế hoạch chưa được dữ liệu hỗ trợ đủ.'}",
+            pre_direction=pre_direction, pre_confidence=pre_conf,
+            final_direction=direction, final_confidence=int(review.get("score") or 0),
+            **prefilter_score_kwargs,
+        )
+
+    setup_status = _extract_setup_status(output)
+    if setup_status == "SETUP_WAITING_TRIGGER":
+        return log_and_return(
+            "trigger", "waiting",
+            "Setup hợp lệ nhưng chưa có trigger; lưu snapshot nội bộ và chưa gửi user.",
+            pre_direction=pre_direction, pre_confidence=pre_conf,
+            final_direction=direction, final_confidence=int(review.get("score") or 0),
+            **prefilter_score_kwargs,
+        )
 
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:
@@ -8904,7 +9547,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
         return log_and_return("guard", "rejected", "guard rejected", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
-    can_track = all(pred.get(k) is not None for k in ("entry_low", "entry_high", "sl", "tp1", "tp2"))
+    can_track = all(pred.get(k) is not None for k in ("entry_low", "entry_high", "sl", "tp1"))
     if not can_track:
         return log_and_return("glm", "rejected", "missing trade levels", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
@@ -9015,3 +9658,53 @@ async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
                     print(f"[AUTO_SCAN] error user={user.get('user_id')} symbol={symbol} mode={mode}: {exc}", flush=True)
     mark_auto_scan_slot_done(slot_info.get("slot") or iso(utc_now()))
     return payload
+
+
+# ─── V50 final overrides (must remain after legacy prefilter definitions) ─────
+
+def build_deepseek_prefilter_text(
+    symbol: str,
+    mode: str,
+    current_price_str: str,
+    feature_snapshot: str | None,
+    feature_block: str | None,
+    decision_snapshot: str | None,
+    open_signal_context: str | None,
+    direction_scorecard: str | None = None,
+) -> str:
+    return "\n".join([
+        f"AUTO SCAN PREFILTER — {symbol} {'SCALP' if mode == 'short' else 'SWING'}",
+        current_price_str,
+        "Chỉ lọc market clarity và hướng nổi bật. Không lập Entry/SL/TP.",
+        "Không dùng history, open plan, ATR, Fibonacci hoặc preferred direction.",
+        decision_snapshot or "LIVE SNAPSHOT: N/A",
+        feature_snapshot or "OBJECTIVE SNAPSHOT: N/A",
+        "",
+        "FORMAT BẮT BUỘC — 14 DÒNG:",
+        "LONG_TREND: <0-25>",
+        "LONG_STRUCTURE: <0-25>",
+        "LONG_MOMENTUM: <0-20>",
+        "LONG_CONFIRMATION: <0-15>",
+        "LONG_SETUP_ROOM: <0-15>",
+        "SHORT_TREND: <0-25>",
+        "SHORT_STRUCTURE: <0-25>",
+        "SHORT_MOMENTUM: <0-20>",
+        "SHORT_CONFIRMATION: <0-15>",
+        "SHORT_SETUP_ROOM: <0-15>",
+        "LONG_SCORE: <0-100>",
+        "SHORT_SCORE: <0-100>",
+        "BEST: LONG hoặc SHORT hoặc NEUTRAL",
+        "REASON: <một câu ngắn>",
+    ])
+
+
+def _reset_auto_scan_bias(user_id: int, symbol: str, mode: str) -> None:
+    try:
+        _ensure_v50_tables()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "DELETE FROM auto_scan_bias_state WHERE user_id=? AND symbol=? AND mode=?",
+                (user_id, symbol, mode),
+            )
+    except Exception:
+        pass
