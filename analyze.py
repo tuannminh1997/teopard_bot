@@ -185,8 +185,9 @@ DEEPSEEK_TIMEOUT_SECONDS = int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "60"))
 DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "3000"))
 DEEPSEEK_TEMPERATURE = _env_float("DEEPSEEK_TEMPERATURE", 0.05)
 DEEPSEEK_REVIEW_MODEL = os.getenv("DEEPSEEK_REVIEW_MODEL", DEEPSEEK_MODEL)
-DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS", "1800"))
+DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS", "6000"))
 DEEPSEEK_REVIEW_TEMPERATURE = _env_float("DEEPSEEK_REVIEW_TEMPERATURE", 0.0)
+DEEPSEEK_REVIEW_REASONING_EFFORT = os.getenv("DEEPSEEK_REVIEW_REASONING_EFFORT", "high").strip().lower() or "high"
 FINAL_REVIEW_MIN_SIGNAL_SCORE = int(os.getenv("FINAL_REVIEW_MIN_SIGNAL_SCORE", os.getenv("AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE", "72")))
 AUTO_SCAN_DIRECTION_CONFIRMATIONS = max(1, int(os.getenv("AUTO_SCAN_DIRECTION_CONFIRMATIONS", "2")))
 ANALYSIS_DATA_VARIANT = os.getenv("ANALYSIS_DATA_VARIANT", "C").strip().upper() or "C"
@@ -7984,8 +7985,10 @@ def _reviewer_format_repair(raw_output: str) -> dict:
         messages=[{"role": "user", "content": repair_prompt}],
         timeout=DEEPSEEK_TIMEOUT_SECONDS,
         model=DEEPSEEK_REVIEW_MODEL,
-        max_tokens=min(600, DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS),
+        max_tokens=min(3000, max(1200, DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS)),
         temperature=0,
+        response_format={"type": "json_object"},
+        reasoning_effort=DEEPSEEK_REVIEW_REASONING_EFFORT,
     )
     repair_raw = (result.get("text") or result.get("reasoning_text") or "").strip()
     parsed = _parse_reviewer_output(repair_raw)
@@ -8019,8 +8022,10 @@ def review_trade_plan_with_flash(market_packet: str, planner_output: str, mode: 
         messages=[{"role": "user", "content": prompt}],
         timeout=DEEPSEEK_TIMEOUT_SECONDS,
         model=DEEPSEEK_REVIEW_MODEL,
-        max_tokens=DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS,
+        max_tokens=max(4000, DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS),
         temperature=DEEPSEEK_REVIEW_TEMPERATURE,
+        response_format={"type": "json_object"},
+        reasoning_effort=DEEPSEEK_REVIEW_REASONING_EFFORT,
     )
     content_raw = (result.get("text") or "").strip()
     reasoning_raw = (result.get("reasoning_text") or "").strip()
@@ -8029,10 +8034,33 @@ def review_trade_plan_with_flash(market_packet: str, planner_output: str, mode: 
     repair_raw = ""
 
     if not parsed.get("parse_ok"):
-        repaired = _reviewer_format_repair(primary_raw)
-        repair_raw = repaired.get("raw") or ""
-        if repaired.get("parse_ok"):
-            parsed = repaired
+        # Thinking mode can consume the output budget before emitting final JSON.
+        # Retry once with a concise instruction and a larger guaranteed budget.
+        retry_prompt = prompt + "\n\nQUAN TRỌNG: Hãy kết thúc reasoning và xuất JSON cuối ngay bây giờ."
+        retry_result = _deepseek_create_once(
+            system=None,
+            messages=[{"role": "user", "content": retry_prompt}],
+            timeout=DEEPSEEK_TIMEOUT_SECONDS,
+            model=DEEPSEEK_REVIEW_MODEL,
+            max_tokens=max(6000, DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS),
+            temperature=DEEPSEEK_REVIEW_TEMPERATURE,
+            response_format={"type": "json_object"},
+            reasoning_effort=DEEPSEEK_REVIEW_REASONING_EFFORT,
+        )
+        retry_content = (retry_result.get("text") or "").strip()
+        retry_reasoning = (retry_result.get("reasoning_text") or "").strip()
+        retry_raw = retry_content or retry_reasoning
+        retry_parsed = _parse_reviewer_output(retry_raw)
+        if retry_parsed.get("parse_ok"):
+            parsed = retry_parsed
+            primary_raw = retry_raw
+            content_raw = retry_content
+            reasoning_raw = retry_reasoning
+        else:
+            repaired = _reviewer_format_repair(primary_raw or retry_raw)
+            repair_raw = repaired.get("raw") or ""
+            if repaired.get("parse_ok"):
+                parsed = repaired
 
     parsed["raw"] = primary_raw
     parsed["raw_content"] = content_raw
@@ -9496,7 +9524,7 @@ def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
     }
 
 
-def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEEPSEEK_TIMEOUT_SECONDS, model: str | None = None, max_tokens: int | None = None, temperature: float | None = None) -> dict:
+def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEEPSEEK_TIMEOUT_SECONDS, model: str | None = None, max_tokens: int | None = None, temperature: float | None = None, response_format: dict | None = None, reasoning_effort: str | None = None) -> dict:
     if not DEEPSEEK_API_KEY:
         raise RuntimeError("Missing DEEPSEEK_API_KEY. Set DEEPSEEK_API_KEY or OPENROUTER_API_KEY in Railway variables.")
     headers = {
@@ -9515,6 +9543,10 @@ def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEE
         "max_tokens": int(max_tokens or DEEPSEEK_MAX_OUTPUT_TOKENS),
         "temperature": DEEPSEEK_TEMPERATURE if temperature is None else float(temperature),
     }
+    if response_format:
+        payload["response_format"] = response_format
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
     r = requests.post(f"{DEEPSEEK_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=timeout)
     try:
         r.raise_for_status()
