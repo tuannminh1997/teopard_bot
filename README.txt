@@ -176,3 +176,10 @@ V50.1 — Reviewer logging fix
 - Reviewer parse lỗi hiển thị PARSE ERROR — REJECT.
 - Auto Scan log tách rõ Prefilter Flash, Planner Pro và Flash reviewer.
 - auto_scan_logs bổ sung reviewer_verdict và tự migrate database cũ.
+
+V50.4 — Robust reviewer response parsing
+- Reviewer được yêu cầu trả một JSON object score/verdict/reason.
+- Parser hỗ trợ JSON, JSON code fence, SCORE/VERDICT/REASON, markdown nhẹ và nhãn tiếng Việt.
+- Đọc riêng content và reasoning_content từ DeepSeek response.
+- Nếu parse lần đầu thất bại, gọi một lượt format-repair ngắn, không phân tích lại thị trường và không đổi điểm.
+- Phân biệt response rỗng với lỗi định dạng; raw content/reasoning/repair được lưu trong reviewer output snapshot.

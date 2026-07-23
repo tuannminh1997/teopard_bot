@@ -7837,40 +7837,118 @@ def _extract_setup_status(output: str | None) -> str:
     return "NO_TRADE" if direction == "NO_TRADE" else "READY_TO_ENTER"
 
 
+def _reviewer_json_candidates(raw: str) -> list[str]:
+    """Return likely JSON snippets from a reviewer response."""
+    candidates: list[str] = []
+    text = (raw or "").strip()
+    if not text:
+        return candidates
+    candidates.append(text)
+    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.I | re.S):
+        candidates.append(match.group(1).strip())
+    first = text.find("{")
+    last = text.rfind("}")
+    if first >= 0 and last > first:
+        candidates.append(text[first:last + 1].strip())
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(candidates))
+
+
+def _normalize_reviewer_verdict(value) -> str | None:
+    text = str(value or "").strip().upper()
+    if text in {"APPROVE", "APPROVED", "ACCEPT", "ACCEPTED", "PASS", "PASSED", "CHẤP NHẬN", "CHAP NHAN", "ĐẠT", "DAT"}:
+        return "APPROVE"
+    if text in {"REJECT", "REJECTED", "DENY", "DENIED", "FAIL", "FAILED", "TỪ CHỐI", "TU CHOI", "KHÔNG ĐẠT", "KHONG DAT"}:
+        return "REJECT"
+    return None
+
+
+def _reviewer_score_value(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            match = re.search(r"-?[0-9]+(?:\.[0-9]+)?", value.replace(",", "."))
+            if not match:
+                return None
+            value = match.group(0)
+        return min(100.0, max(0.0, float(value)))
+    except Exception:
+        return None
+
+
 def _parse_reviewer_output(text: str | None) -> dict:
-    """Parse kết quả reviewer 3 trường; Flash tự suy luận và tự cộng điểm.
+    """Parse reviewer output without asking Python to evaluate the trade.
 
-    Chấp nhận cả dấu ``=`` hoặc ``:``, markdown/bullet nhẹ và SCORE dạng
-    ``67`` hoặc ``67/100``. Python tuyệt đối không tự chấm hay cộng rubric.
+    Accepted forms include JSON, SCORE/VERDICT/REASON lines, Vietnamese labels,
+    light Markdown, bullets, ``67/100`` and compact one-line responses.
     """
-    raw = text or ""
-    parse_text = raw.replace("**", "").replace("__", "")
-
-    score_m = re.search(
-        r"(?im)^\s*[-*#]*\s*\**SCORE\**\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*(?:/\s*100)?",
-        parse_text,
-    )
+    raw = str(text or "").strip()
     score = None
-    if score_m:
+    verdict = None
+    reason = ""
+    parsed_format = None
+
+    # 1) Prefer structured JSON when available.
+    for candidate in _reviewer_json_candidates(raw):
         try:
-            score = min(100.0, max(0.0, float(score_m.group(1))))
+            payload = json.loads(candidate)
         except Exception:
-            score = None
+            continue
+        if not isinstance(payload, dict):
+            continue
+        lowered = {str(k).strip().lower(): v for k, v in payload.items()}
+        score = _reviewer_score_value(
+            lowered.get("score", lowered.get("point", lowered.get("diem", lowered.get("điểm"))))
+        )
+        verdict = _normalize_reviewer_verdict(
+            lowered.get("verdict", lowered.get("decision", lowered.get("ket_luan", lowered.get("kết luận"))))
+        )
+        reason_value = lowered.get("reason", lowered.get("ly_do", lowered.get("lý do", lowered.get("comment"))))
+        reason = str(reason_value or "").strip()
+        if score is not None or verdict is not None or reason:
+            parsed_format = "json"
+            break
 
-    verdict_m = re.search(
-        r"(?im)^\s*[-*#]*\s*\**VERDICT\**\s*[:=]\s*(APPROVE|REJECT)\b",
-        parse_text,
-    )
-    verdict = verdict_m.group(1).upper() if verdict_m else None
+    # 2) Flexible text parser. It is intentionally not anchored to line starts.
+    parse_text = raw.replace("**", "").replace("__", "").replace("`", "")
+    if score is None:
+        score_patterns = [
+            r"(?i)(?:SCORE|FINAL\s*SCORE|REVIEW(?:ER)?\s*SCORE|ĐIỂM(?:\s*ĐÁNH\s*GIÁ)?|DIEM(?:\s*DANH\s*GIA)?)\s*[:=\-]\s*([0-9]+(?:[\.,][0-9]+)?)\s*(?:/\s*100)?",
+            r"(?i)\b([0-9]+(?:[\.,][0-9]+)?)\s*/\s*100\b",
+        ]
+        for pattern in score_patterns:
+            match = re.search(pattern, parse_text)
+            if match:
+                score = _reviewer_score_value(match.group(1))
+                if score is not None:
+                    parsed_format = parsed_format or "text"
+                    break
 
-    reason_m = re.search(
-        r"(?im)^\s*[-*#]*\s*\**REASON\**\s*[:=]\s*(.+)$",
-        parse_text,
-    )
-    reason = reason_m.group(1).strip() if reason_m else ""
+    if verdict is None:
+        verdict_patterns = [
+            r"(?i)(?:VERDICT|KẾT\s*LUẬN|KET\s*LUAN|DECISION)\s*[:=\-]\s*([^\n;,]+)",
+            r"(?i)\b(APPROVE(?:D)?|REJECT(?:ED)?|ACCEPT(?:ED)?|PASS(?:ED)?|FAIL(?:ED)?|CHẤP\s*NHẬN|CHAP\s*NHAN|TỪ\s*CHỐI|TU\s*CHOI|KHÔNG\s*ĐẠT|KHONG\s*DAT)\b",
+        ]
+        for pattern in verdict_patterns:
+            match = re.search(pattern, parse_text)
+            if match:
+                verdict = _normalize_reviewer_verdict(match.group(1))
+                if verdict:
+                    parsed_format = parsed_format or "text"
+                    break
 
-    # Chỉ fallback verdict khi model đã trả được SCORE. Đây là suy ra trạng thái
-    # từ chính điểm model chấm, không phải Python tự đánh giá thị trường.
+    if not reason:
+        reason_match = re.search(
+            r"(?is)(?:REASON|NHẬN\s*XÉT|NHAN\s*XET|LÝ\s*DO|LY\s*DO|COMMENT)\s*[:=\-]\s*(.+?)(?=\n\s*(?:SCORE|VERDICT|KẾT\s*LUẬN|KET\s*LUAN|ĐIỂM|DIEM)\s*[:=\-]|\Z)",
+            parse_text,
+        )
+        if reason_match:
+            reason = " ".join(reason_match.group(1).strip().split())
+            parsed_format = parsed_format or "text"
+
+    # Verdict may be inferred solely from the reviewer's own score. Python is
+    # not assessing market quality here; it only applies the configured gate.
     if verdict is None and score is not None:
         verdict = "APPROVE" if score >= FINAL_REVIEW_MIN_SIGNAL_SCORE else "REJECT"
     if verdict is None:
@@ -7881,17 +7959,49 @@ def _parse_reviewer_output(text: str | None) -> dict:
         "verdict": verdict,
         "breakdown": {},
         "reason": reason,
+        "parse_ok": score is not None,
+        "parsed_format": parsed_format,
     }
 
+
+def _reviewer_format_repair(raw_output: str) -> dict:
+    """Ask Flash to reformat an existing answer; no market re-analysis."""
+    raw = (raw_output or "").strip()
+    if not raw:
+        return {"score": None, "verdict": "REJECT", "reason": "", "parse_ok": False, "raw": ""}
+    repair_prompt = "\n".join([
+        "Chỉ định dạng lại kết quả reviewer bên dưới. Không phân tích lại thị trường, không đổi điểm hoặc kết luận.",
+        "Trả đúng một JSON object hợp lệ, không markdown:",
+        '{"score": 0, "verdict": "REJECT", "reason": "..."}',
+        "score phải là số 0..100; verdict chỉ APPROVE hoặc REJECT.",
+        "Nếu nội dung gốc không có điểm rõ ràng, dùng score=null và verdict=REJECT.",
+        "",
+        "NỘI DUNG GỐC:",
+        raw[:12000],
+    ])
+    result = _deepseek_create_once(
+        system=None,
+        messages=[{"role": "user", "content": repair_prompt}],
+        timeout=DEEPSEEK_TIMEOUT_SECONDS,
+        model=DEEPSEEK_REVIEW_MODEL,
+        max_tokens=min(600, DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS),
+        temperature=0,
+    )
+    repair_raw = (result.get("text") or result.get("reasoning_text") or "").strip()
+    parsed = _parse_reviewer_output(repair_raw)
+    parsed["raw"] = repair_raw
+    return parsed
+
+
 def review_trade_plan_with_flash(market_packet: str, planner_output: str, mode: str) -> dict:
-    """Flash chỉ review; không được sửa direction/Entry/SL/TP."""
+    """Flash reviews the immutable planner plan and self-scores it."""
     prompt = "\n".join([
         "Bạn là reviewer độc lập cho kế hoạch trading do analyst khác tạo.",
         "Không tạo plan mới. Không sửa direction, Entry, SL, TP1, TP2.",
         "Đọc raw market packet và kiểm tra plan có được dữ liệu hỗ trợ hay không.",
         "Không tin lời giải thích nếu không khớp timestamp/OHLCV.",
         "TP2=N/A là hợp lệ và không bị trừ điểm chỉ vì thiếu TP2.",
-        "Nếu plan là SETUP_WAITING_TRIGGER, chấm TRIGGER thấp; không tự đổi thành READY.",
+        "Nếu plan là SETUP_WAITING_TRIGGER, đánh giá trigger tương ứng; không tự đổi thành READY.",
         "",
         "MARKET PACKET:",
         market_packet,
@@ -7900,17 +8010,43 @@ def review_trade_plan_with_flash(market_packet: str, planner_output: str, mode: 
         planner_output,
         "",
         "Tự đánh giá nội bộ theo 6 tiêu chí: luận điểm đa khung, cấu trúc setup, bằng chứng Entry, điểm vô hiệu/SL, bằng chứng mục tiêu, trigger/timing.",
-        "Tự cộng thành một SCORE 0..100. Python không chấm và không cộng thay bạn.",
-        "Chỉ trả đúng 3 dòng sau, không markdown và không thêm nội dung khác:",
-        "SCORE=0..100",
-        "VERDICT=APPROVE|REJECT",
-        "REASON=một câu nêu lỗi lớn nhất hoặc lý do approve",
+        "Tự tổng hợp thành SCORE 0..100. Python không chấm và không cộng thay bạn.",
+        "Trả đúng một JSON object hợp lệ, không markdown và không thêm nội dung khác:",
+        '{"score": 67, "verdict": "REJECT", "reason": "Một câu nêu lỗi lớn nhất hoặc lý do approve."}',
     ])
-    result = _deepseek_create_once(system=None, messages=[{"role": "user", "content": prompt}], timeout=DEEPSEEK_TIMEOUT_SECONDS, model=DEEPSEEK_REVIEW_MODEL, max_tokens=DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS, temperature=DEEPSEEK_REVIEW_TEMPERATURE)
-    parsed = _parse_reviewer_output(result.get("text") or "")
-    parsed["raw"] = result.get("text") or ""
-    return parsed
+    result = _deepseek_create_once(
+        system=None,
+        messages=[{"role": "user", "content": prompt}],
+        timeout=DEEPSEEK_TIMEOUT_SECONDS,
+        model=DEEPSEEK_REVIEW_MODEL,
+        max_tokens=DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS,
+        temperature=DEEPSEEK_REVIEW_TEMPERATURE,
+    )
+    content_raw = (result.get("text") or "").strip()
+    reasoning_raw = (result.get("reasoning_text") or "").strip()
+    primary_raw = content_raw or reasoning_raw
+    parsed = _parse_reviewer_output(primary_raw)
+    repair_raw = ""
 
+    if not parsed.get("parse_ok"):
+        repaired = _reviewer_format_repair(primary_raw)
+        repair_raw = repaired.get("raw") or ""
+        if repaired.get("parse_ok"):
+            parsed = repaired
+
+    parsed["raw"] = primary_raw
+    parsed["raw_content"] = content_raw
+    parsed["raw_reasoning"] = reasoning_raw
+    parsed["repair_raw"] = repair_raw
+    parsed["empty_response"] = not bool(primary_raw)
+    if not parsed.get("parse_ok"):
+        parsed["verdict"] = "REJECT"
+        if not parsed.get("reason"):
+            parsed["reason"] = (
+                "Flash reviewer trả response rỗng." if not primary_raw
+                else "Không đọc được điểm reviewer sau một lần sửa định dạng."
+            )
+    return parsed
 
 def _apply_reviewer_score(output: str, review: dict) -> str:
     """Ghép đúng điểm reviewer vào plan, kể cả khi reviewer REJECT.
@@ -7957,7 +8093,8 @@ def _manual_review_rejection_output(
     score_text = f"{float(score):g}/100" if score is not None else "Không đọc được"
     verdict = review.get("verdict") or "REJECT"
     reason = review.get("reason") or (
-        "Flash reviewer không trả đúng 3 trường SCORE/VERDICT/REASON bắt buộc." if score is None
+        "Flash reviewer trả response rỗng." if review.get("empty_response")
+        else "Không đọc được điểm reviewer sau một lần sửa định dạng." if score is None
         else "Kế hoạch chưa được dữ liệu hỗ trợ đủ."
     )
     breakdown = _review_breakdown_text(review)
@@ -9389,7 +9526,18 @@ def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEE
     content = msg.get("content") or ""
     if isinstance(content, list):
         content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-    return {"text": content, "usage": data.get("usage"), "stop_reason": choice.get("finish_reason")}
+    reasoning_content = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    if isinstance(reasoning_content, list):
+        reasoning_content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in reasoning_content
+        )
+    return {
+        "text": str(content or ""),
+        "reasoning_text": str(reasoning_content or ""),
+        "usage": data.get("usage"),
+        "stop_reason": choice.get("finish_reason"),
+    }
 
 
 def request_deepseek_prefilter(prefilter_text: str) -> dict:
