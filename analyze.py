@@ -9801,6 +9801,34 @@ def _auto_scan_text_header(symbol: str, mode: str) -> str:
     return f"🤖 AUTO SCAN — {symbol} — {mode_label}\n"
 
 
+def _strip_auto_scan_evidence_for_user(output: str) -> str:
+    """Ẩn các khối Bằng chứng khỏi tin nhắn Auto Scan public.
+
+    Planner vẫn trả đầy đủ và full_response vẫn được lưu/gửi cho reviewer;
+    chỉ bản text gửi Telegram bị rút gọn từ sau Kích hoạt tới thẳng Rủi ro.
+    """
+    lines = (output or "").splitlines()
+    kept: list[str] = []
+    skipping = False
+    for line in lines:
+        normalized = line.strip().lower()
+        if not skipping and normalized.startswith("bằng chứng entry"):
+            skipping = True
+            continue
+        if skipping:
+            if normalized.startswith("⚠️ rủi ro") or normalized.startswith("rủi ro"):
+                skipping = False
+                kept.append(line)
+            continue
+        kept.append(line)
+    # Tránh tạo quá nhiều dòng trống sau khi bỏ block dài.
+    compact: list[str] = []
+    for line in kept:
+        if line.strip() or not compact or compact[-1].strip():
+            compact.append(line)
+    return "\n".join(compact).strip()
+
+
 async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_id: int, scan_slot: str | None = None) -> dict:
     """Run 1 symbol/mode for 1 user. Return {send: bool, text: str}."""
     init_prediction_db()
@@ -10058,9 +10086,10 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         )
     else:
         execution_note = "\n\n✅ Trigger đã sẵn sàng; có thể thực thi theo kế hoạch trong vùng Entry."
+    public_output = _strip_auto_scan_evidence_for_user(output)
     text = (
         _auto_scan_text_header(binance_symbol, mode)
-        + output
+        + public_output
         + execution_note
         + "\n\nBot đã tự lưu tín hiệu Auto Scan này để theo dõi. Không cần bấm xác nhận."
     )
