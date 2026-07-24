@@ -9793,15 +9793,10 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         )
 
     setup_status = _extract_setup_status(output)
-    if setup_status == "SETUP_WAITING_TRIGGER":
-        return log_and_return(
-            "trigger", "waiting",
-            "Setup hợp lệ nhưng chưa có trigger; lưu snapshot nội bộ và chưa gửi user.",
-            pre_direction=pre_direction, pre_confidence=pre_conf,
-            final_direction=direction, final_confidence=(int(review.get("score")) if review.get("score") is not None else None),
-            reviewer_verdict=review.get("verdict"),
-            **prefilter_score_kwargs,
-        )
+    # SETUP_WAITING_TRIGGER vẫn là một kế hoạch hợp lệ cần gửi user để họ có thể
+    # đặt lệnh chờ/theo dõi trước. Trạng thái chỉ quyết định cách thực thi,
+    # không còn là gate chặn gửi. Chỉ NO_TRADE hoặc reviewer/gate điểm thất bại
+    # mới bị bỏ qua.
 
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:
@@ -9880,7 +9875,19 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         pass
 
     _record_auto_scan_signal(user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id))
-    text = _auto_scan_text_header(binance_symbol, mode) + output + "\n\nBot đã tự lưu tín hiệu Auto Scan này để theo dõi. Không cần bấm xác nhận."
+    if setup_status == "SETUP_WAITING_TRIGGER":
+        execution_note = (
+            "\n\n⏳ Setup đã được duyệt nhưng đang chờ trigger. "
+            "Bạn có thể đặt lệnh chờ/theo dõi vùng Entry trước; không vào market ngay nếu điều kiện kích hoạt chưa xuất hiện."
+        )
+    else:
+        execution_note = "\n\n✅ Trigger đã sẵn sàng; có thể thực thi theo kế hoạch trong vùng Entry."
+    text = (
+        _auto_scan_text_header(binance_symbol, mode)
+        + output
+        + execution_note
+        + "\n\nBot đã tự lưu tín hiệu Auto Scan này để theo dõi. Không cần bấm xác nhận."
+    )
     return {
         "send": True,
         "text": text,
