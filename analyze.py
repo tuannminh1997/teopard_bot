@@ -8067,6 +8067,7 @@ def _reviewer_format_repair(raw_output: str) -> dict:
         "Trả đúng một JSON object hợp lệ, không markdown:",
         '{"score": 0, "verdict": "REJECT", "reason": "..."}',
         "score phải là số 0..100; verdict chỉ APPROVE hoặc REJECT.",
+        "reason bắt buộc viết bằng tiếng Việt; nếu reason gốc là tiếng Anh thì dịch sang tiếng Việt nhưng không đổi ý.",
         "Nếu nội dung gốc không có điểm rõ ràng, dùng score=null và verdict=REJECT.",
         "",
         "NỘI DUNG GỐC:",
@@ -8106,8 +8107,10 @@ def review_trade_plan_with_flash(market_packet: str, planner_output: str, mode: 
         "",
         "Tự đánh giá nội bộ theo 6 tiêu chí: luận điểm đa khung, cấu trúc setup, bằng chứng Entry, điểm vô hiệu/SL, bằng chứng mục tiêu, trigger/timing.",
         "Tự tổng hợp thành SCORE 0..100. Python không chấm và không cộng thay bạn.",
+        "Mọi nội dung trong trường reason BẮT BUỘC viết bằng tiếng Việt tự nhiên.",
+        "Không dùng tiếng Anh trong reason, kể cả khi market packet hoặc planner output có tiếng Anh.",
         "Trả đúng một JSON object hợp lệ, không markdown và không thêm nội dung khác:",
-        '{"score": 67, "verdict": "REJECT", "reason": "Một câu nêu lỗi lớn nhất hoặc lý do approve."}',
+        '{"score": 67, "verdict": "REJECT", "reason": "Một câu tiếng Việt nêu lỗi lớn nhất hoặc lý do chấp nhận."}',
     ])
     result = _deepseek_create_once(
         system=None,
@@ -8286,10 +8289,15 @@ def _ensure_v50_tables() -> None:
                 mode TEXT NOT NULL,
                 direction TEXT,
                 confirmations INTEGER NOT NULL DEFAULT 0,
+                recent_snapshots TEXT NOT NULL DEFAULT '[]',
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, symbol, mode)
             )
         """)
+        try:
+            conn.execute("ALTER TABLE auto_scan_bias_state ADD COLUMN recent_snapshots TEXT NOT NULL DEFAULT '[]'")
+        except sqlite3.OperationalError:
+            pass
         for table in ("predictions", "trade_candidates"):
             for col, definition in [
                 ("setup_status", "TEXT"),
@@ -8328,23 +8336,63 @@ def _save_analysis_snapshot(**kwargs) -> None:
         print(f"[SNAPSHOT_SAVE_ERROR] {exc}", flush=True)
 
 
-def _confirm_auto_scan_bias(user_id: int, symbol: str, mode: str, direction: str) -> int:
+def _record_auto_scan_bias_snapshot(
+    user_id: int,
+    symbol: str,
+    mode: str,
+    direction: str,
+    qualified: bool,
+) -> dict:
+    """Keep a rolling 3-snapshot bias window.
+
+    A qualified snapshot counts toward planner confirmation. A same-direction
+    snapshot below the score threshold is neutral: it occupies one slot but
+    does not erase prior confirmation. A strong opposite snapshot naturally
+    shifts the rolling window toward the opposite direction.
+    """
     _ensure_v50_tables()
+    direction = str(direction or "NEUTRAL").upper()
+    if direction not in {"LONG", "SHORT"}:
+        direction = "NEUTRAL"
     now = iso(utc_now())
+    item = direction if qualified and direction in {"LONG", "SHORT"} else f"NEUTRAL_{direction}"
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT direction, confirmations FROM auto_scan_bias_state WHERE user_id=? AND symbol=? AND mode=?",
+            "SELECT recent_snapshots FROM auto_scan_bias_state WHERE user_id=? AND symbol=? AND mode=?",
             (user_id, symbol, mode),
         ).fetchone()
-        count = int(row[1] or 0) + 1 if row and row[0] == direction else 1
+        try:
+            history = json.loads(row[0] or "[]") if row else []
+        except Exception:
+            history = []
+        if not isinstance(history, list):
+            history = []
+        history = [str(x) for x in history[-2:]] + [item]
+        long_count = sum(1 for x in history if x == "LONG")
+        short_count = sum(1 for x in history if x == "SHORT")
+        if long_count > short_count:
+            dominant, confirmations = "LONG", long_count
+        elif short_count > long_count:
+            dominant, confirmations = "SHORT", short_count
+        else:
+            dominant, confirmations = (direction if qualified else "NEUTRAL"), max(long_count, short_count)
         conn.execute(
-            """INSERT INTO auto_scan_bias_state(user_id,symbol,mode,direction,confirmations,updated_at)
-               VALUES(?,?,?,?,?,?)
+            """INSERT INTO auto_scan_bias_state(user_id,symbol,mode,direction,confirmations,recent_snapshots,updated_at)
+               VALUES(?,?,?,?,?,?,?)
                ON CONFLICT(user_id,symbol,mode) DO UPDATE SET
-               direction=excluded.direction, confirmations=excluded.confirmations, updated_at=excluded.updated_at""",
-            (user_id, symbol, mode, direction, count, now),
+               direction=excluded.direction, confirmations=excluded.confirmations,
+               recent_snapshots=excluded.recent_snapshots, updated_at=excluded.updated_at""",
+            (user_id, symbol, mode, dominant, confirmations, json.dumps(history), now),
         )
-    return count
+    return {
+        "direction": dominant,
+        "confirmations": confirmations,
+        "history": history,
+        "qualified_for_direction": (
+            direction in {"LONG", "SHORT"}
+            and sum(1 for x in history if x == direction) >= AUTO_SCAN_DIRECTION_CONFIRMATIONS
+        ),
+    }
 
 
 def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, chat_id: int | None = None) -> str:
@@ -9831,8 +9879,17 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     deepseek_conf = pre_conf
     deepseek_reason = gate.get("reason")
 
+    # Rolling confirmation: require 2 qualifying snapshots inside the latest 3.
+    # A parseable same-direction snapshot below threshold is neutral and does
+    # not wipe the previous qualifying bias. Parse errors remain non-evidence.
+    bias_state = None
+    if gate.get("parse_ok") and pre_direction in {"LONG", "SHORT"}:
+        bias_state = await asyncio.to_thread(
+            _record_auto_scan_bias_snapshot,
+            user_id, binance_symbol, mode, pre_direction, bool(gate.get("should_call_glm")),
+        )
+
     if not gate.get("should_call_glm"):
-        await asyncio.to_thread(_reset_auto_scan_bias, user_id, binance_symbol, mode)
         return log_and_return(
             "deepseek",
             "rejected",
@@ -9842,14 +9899,15 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             **prefilter_score_kwargs,
         )
 
-    confirmations = await asyncio.to_thread(
-        _confirm_auto_scan_bias, user_id, binance_symbol, mode, pre_direction
-    )
-    if confirmations < AUTO_SCAN_DIRECTION_CONFIRMATIONS:
+    confirmations = int((bias_state or {}).get("confirmations") or 0)
+    confirmed_for_direction = bool((bias_state or {}).get("qualified_for_direction"))
+    if not confirmed_for_direction:
+        history = (bias_state or {}).get("history") or []
+        history_text = " → ".join(history) if history else "N/A"
         return log_and_return(
             "confirmation",
             "waiting",
-            f"Bias {pre_direction} mới đạt {confirmations}/{AUTO_SCAN_DIRECTION_CONFIRMATIONS} snapshot liên tiếp; chưa gọi planner.",
+            f"Bias {pre_direction} mới đạt {confirmations}/{AUTO_SCAN_DIRECTION_CONFIRMATIONS} snapshot đạt chuẩn trong 3 snapshot gần nhất; chưa gọi planner. Cửa sổ: {history_text}.",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
             **prefilter_score_kwargs,
