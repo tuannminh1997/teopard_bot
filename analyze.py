@@ -5689,6 +5689,93 @@ def _zai_create_once(
 
 
 
+
+def _deepseek_create_once(
+    system: str | None,
+    messages: list,
+    max_tokens: int,
+    timeout: int | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+    response_format: dict | None = None,
+    reasoning_effort: str | None = None,
+) -> dict:
+    """Call DeepSeek Flash/reviewer via the native Chat Completions endpoint.
+
+    This helper is intentionally separate from the Pro planner helper because
+    prefilter/reviewer may use another model, JSON mode and temperature.
+    """
+    api_key = DEEPSEEK_API_KEY or DEEPSEEK_FINAL_API_KEY
+    if not api_key:
+        raise RuntimeError("Missing DEEPSEEK_API_KEY for Flash prefilter/reviewer.")
+
+    payload_messages = []
+    if system:
+        payload_messages.append({"role": "system", "content": system})
+    payload_messages.extend(messages or [])
+
+    effective_model = (model or DEEPSEEK_MODEL or "").strip()
+    if not effective_model:
+        raise RuntimeError("Missing DEEPSEEK_MODEL for Flash prefilter/reviewer.")
+
+    payload = {
+        "model": effective_model,
+        "messages": payload_messages,
+        "max_tokens": int(max_tokens),
+    }
+    if temperature is not None:
+        payload["temperature"] = float(temperature)
+    if response_format:
+        payload["response_format"] = response_format
+
+    effort_norm = (reasoning_effort or "").strip().lower()
+    if effort_norm in {"", "off", "none", "false", "0", "disabled"}:
+        payload["thinking"] = {"type": "disabled"}
+        effective_effort = "off"
+    else:
+        effort = "max" if effort_norm in {"max", "xhigh"} else "high"
+        payload["thinking"] = {"type": "enabled"}
+        payload["reasoning_effort"] = effort
+        effective_effort = effort
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    request_timeout = int(timeout or DEEPSEEK_TIMEOUT_SECONDS)
+    r = requests.post(
+        f"{DEEPSEEK_BASE_URL}/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=request_timeout,
+    )
+    try:
+        r.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"DeepSeek Flash API error: {r.status_code} - {r.text[:1000]}") from exc
+
+    data = r.json()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    reasoning_content = message.get("reasoning_content") or message.get("reasoning") or ""
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    if isinstance(reasoning_content, list):
+        reasoning_content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in reasoning_content
+        )
+
+    return {
+        "text": str(content or ""),
+        "reasoning_text": str(reasoning_content or ""),
+        "stop_reason": choice.get("finish_reason"),
+        "usage": data.get("usage"),
+        "effort": effective_effort,
+        "model": effective_model,
+    }
+
 def _deepseek_final_create_once(
     system: str | None,
     messages: list,
