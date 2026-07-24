@@ -188,6 +188,11 @@ DEEPSEEK_REVIEW_MODEL = os.getenv("DEEPSEEK_REVIEW_MODEL", DEEPSEEK_MODEL)
 DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS", "6000"))
 DEEPSEEK_REVIEW_TEMPERATURE = _env_float("DEEPSEEK_REVIEW_TEMPERATURE", 0.0)
 DEEPSEEK_REVIEW_REASONING_EFFORT = os.getenv("DEEPSEEK_REVIEW_REASONING_EFFORT", "high").strip().lower() or "high"
+# Prefilter cũng phải tự suy luận rubric LONG/SHORT trước khi trả JSON cuối.
+# Format-repair chỉ định dạng lại nên luôn tắt reasoning để tiết kiệm token và tránh content rỗng.
+DEEPSEEK_PREFILTER_REASONING_EFFORT = os.getenv(
+    "DEEPSEEK_PREFILTER_REASONING_EFFORT", "high"
+).strip().lower() or "high"
 FINAL_REVIEW_MIN_SIGNAL_SCORE = int(os.getenv("FINAL_REVIEW_MIN_SIGNAL_SCORE", os.getenv("AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE", "72")))
 AUTO_SCAN_DIRECTION_CONFIRMATIONS = max(1, int(os.getenv("AUTO_SCAN_DIRECTION_CONFIRMATIONS", "2")))
 ANALYSIS_DATA_VARIANT = os.getenv("ANALYSIS_DATA_VARIANT", "C").strip().upper() or "C"
@@ -9394,80 +9399,135 @@ def _parse_prefilter_total_score(raw: str, side: str) -> int | None:
     return None
 
 
+def _normalize_prefilter_direction(value) -> str:
+    text = str(value or "").strip().upper().replace(" ", "_")
+    if text in {"LONG", "SHORT", "NEUTRAL"}:
+        return text
+    return "NEUTRAL"
+
+
+def _normalize_prefilter_verdict(value) -> str | None:
+    text = str(value or "").strip().upper().replace(" ", "_")
+    if text in {"CALL_PLANNER", "CALL_FINAL", "CALL_AI", "CALL_GLM", "YES", "APPROVE"}:
+        return "CALL_PLANNER"
+    if text in {"SKIP", "NO", "REJECT", "NEUTRAL"}:
+        return "SKIP"
+    return None
+
+
+def _prefilter_score_value(value) -> int | None:
+    try:
+        if isinstance(value, str):
+            match = re.search(r"-?[0-9]+(?:[\.,][0-9]+)?", value)
+            if not match:
+                return None
+            value = match.group(0).replace(",", ".")
+        return max(0, min(100, int(round(float(value)))))
+    except Exception:
+        return None
+
+
 def _parse_deepseek_prefilter_text(text: str | None) -> dict:
-    raw = text or ""
-    breakdown: dict[str, dict[str, int]] = {"LONG": {}, "SHORT": {}}
-    found_items = 0
-    for side in ("LONG", "SHORT"):
-        for key, maximum in _DEEPSEEK_MINI_RUBRIC_WEIGHTS.items():
-            value = _parse_prefilter_item(raw, side, key, maximum)
-            if value is not None:
-                found_items += 1
-                breakdown[side][key] = value
-            else:
-                breakdown[side][key] = 0
+    """Parse Flash prefilter totals only; Python never scores rubric items."""
+    raw = str(text or "").strip()
+    long_score = None
+    short_score = None
+    best = "NEUTRAL"
+    verdict = None
+    reason = ""
+    parsed_format = None
 
-    long_total = _parse_prefilter_total_score(raw, "LONG")
-    short_total = _parse_prefilter_total_score(raw, "SHORT")
+    payload = _extract_json_object(raw)
+    if isinstance(payload, dict):
+        lowered = {str(k).strip().lower(): v for k, v in payload.items()}
+        long_score = _prefilter_score_value(lowered.get("long_score", lowered.get("long")))
+        short_score = _prefilter_score_value(lowered.get("short_score", lowered.get("short")))
+        best = _normalize_prefilter_direction(lowered.get("best_direction", lowered.get("best")))
+        verdict = _normalize_prefilter_verdict(lowered.get("verdict", lowered.get("decision")))
+        reason = str(lowered.get("reason", lowered.get("comment", "")) or "").strip()
+        if long_score is not None or short_score is not None:
+            parsed_format = "json"
 
-    rubric_complete = found_items == len(_DEEPSEEK_MINI_RUBRIC_WEIGHTS) * 2
-    used_total_score_fallback = False
-    if rubric_complete:
-        long_score = sum(breakdown["LONG"].values())
-        short_score = sum(breakdown["SHORT"].values())
-    elif long_total is not None and short_total is not None:
-        # Fallback when Flash gave totals but missed per-item labels. This is still
-        # better than logging fake LONG 0 / SHORT 0, and avoids losing a scan only
-        # because of cosmetic formatting drift.
-        long_score = long_total
-        short_score = short_total
-        used_total_score_fallback = True
+    clean = raw.replace("**", "").replace("__", "").replace("`", "")
+    if long_score is None:
+        m = re.search(r"(?i)(?:LONG_SCORE|LONG\s*SCORE|LONG|ĐIỂM\s*LONG|DIEM\s*LONG)\s*[:=\-]\s*([0-9]+(?:[\.,][0-9]+)?)", clean)
+        if m:
+            long_score = _prefilter_score_value(m.group(1)); parsed_format = parsed_format or "text"
+    if short_score is None:
+        m = re.search(r"(?i)(?:SHORT_SCORE|SHORT\s*SCORE|SHORT|ĐIỂM\s*SHORT|DIEM\s*SHORT)\s*[:=\-]\s*([0-9]+(?:[\.,][0-9]+)?)", clean)
+        if m:
+            short_score = _prefilter_score_value(m.group(1)); parsed_format = parsed_format or "text"
+    if best == "NEUTRAL":
+        m = re.search(r"(?i)(?:BEST_DIRECTION|BEST|HƯỚNG\s*TỐT\s*NHẤT|HUONG\s*TOT\s*NHAT)\s*[:=\-]\s*(LONG|SHORT|NEUTRAL)", clean)
+        if m:
+            best = _normalize_prefilter_direction(m.group(1))
+    if verdict is None:
+        m = re.search(r"(?i)(?:VERDICT|DECISION|KẾT\s*LUẬN|KET\s*LUAN)\s*[:=\-]\s*([A-Z_ ]+)", clean)
+        if m:
+            verdict = _normalize_prefilter_verdict(m.group(1))
+    if not reason:
+        m = re.search(r"(?is)(?:REASON|LÝ\s*DO|LY\s*DO|NHẬN\s*XÉT|NHAN\s*XET)\s*[:=\-]\s*(.+)$", clean)
+        if m:
+            reason = " ".join(m.group(1).strip().split())
+
+    parse_ok = long_score is not None and short_score is not None
+    if parse_ok:
+        # Model may return inconsistent BEST/VERDICT. Scores are authoritative inputs;
+        # Python only performs arithmetic and gate checks, not market analysis.
+        if long_score > short_score:
+            computed_best = "LONG"
+        elif short_score > long_score:
+            computed_best = "SHORT"
+        else:
+            computed_best = "NEUTRAL"
+        best = computed_best
+        if verdict is None:
+            verdict = "CALL_PLANNER" if best != "NEUTRAL" else "SKIP"
     else:
-        long_score = 0
-        short_score = 0
+        verdict = "SKIP"
 
-    best_match = re.search(r"BEST\s*[:=]\s*(LONG|SHORT|NEUTRAL)", raw, flags=re.IGNORECASE)
-    best = best_match.group(1).upper() if best_match else "NEUTRAL"
-    call_match = re.search(r"CALL_(?:GLM|FINAL|AI)\s*[:=]\s*(YES|NO)", raw, flags=re.IGNORECASE)
-    model_call_glm = (call_match.group(1).upper() == "YES") if call_match else None
-    reason_match = re.search(r"REASON\s*[:=]\s*(.+)", raw, flags=re.IGNORECASE | re.DOTALL)
-    reason = reason_match.group(1).strip()[:300] if reason_match else raw.strip()[:300]
     return {
         "long_score": long_score,
         "short_score": short_score,
-        "long_breakdown": breakdown["LONG"],
-        "short_breakdown": breakdown["SHORT"],
-        "rubric_complete": rubric_complete,
-        "used_legacy_format": used_total_score_fallback,
-        "used_total_score_fallback": used_total_score_fallback,
         "best_direction": best,
-        "model_should_call_glm": model_call_glm,
-        "best_score": max(long_score, short_score),
+        "model_verdict": verdict,
         "reason": reason,
-        "raw_text": raw[:1600],
-        "found_items": found_items,
+        "parse_ok": parse_ok,
+        "parsed_format": parsed_format,
+        "raw_text": raw[:2000],
+        "rubric_complete": parse_ok,
+        "used_legacy_format": parsed_format == "text",
+        "used_total_score_fallback": False,
     }
 
 
 def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
-    """Python-authoritative gate cho DeepSeek mini-rubric.
+    """Apply thresholds to model-provided final LONG/SHORT scores.
 
-    DeepSeek chỉ chấm các tiêu chí. Python tự cộng, chọn hướng, kiểm tra ngưỡng
-    và độ chênh. Trường BEST/CALL_GLM của model chỉ dùng để debug, không quyết định.
+    Flash performs all qualitative scoring. Python only validates 0..100 values,
+    computes the numeric gap, chooses the larger score, and applies configured gates.
     """
     payload = prefilter if isinstance(prefilter, dict) else {}
+    long_score = _prefilter_score_value(payload.get("long_score"))
+    short_score = _prefilter_score_value(payload.get("short_score"))
+    parse_ok = bool(payload.get("parse_ok") and long_score is not None and short_score is not None)
 
-    def score_value(value) -> int:
-        try:
-            return max(0, min(100, int(round(float(value)))))
-        except Exception:
-            return 0
+    if not parse_ok:
+        raw_preview = str(payload.get("raw_text") or payload.get("reason") or "").replace("\n", " ").strip()
+        if len(raw_preview) > 160:
+            raw_preview = raw_preview[:160] + "..."
+        reason = "Không đọc được điểm LONG/SHORT cuối từ Flash prefilter."
+        if raw_preview:
+            reason += f" Raw đầu: {raw_preview}"
+        return {
+            "long_score": None, "short_score": None, "direction": "NEUTRAL",
+            "raw_direction": "NEUTRAL", "best_score": None, "gap": None,
+            "should_call_glm": False, "reason": reason, "rubric_complete": False,
+            "parse_ok": False, "used_total_score_fallback": False,
+        }
 
-    long_score = score_value(payload.get("long_score"))
-    short_score = score_value(payload.get("short_score"))
     gap = abs(long_score - short_score)
     best_score = max(long_score, short_score)
-
     if long_score > short_score:
         raw_direction = "LONG"
     elif short_score > long_score:
@@ -9478,24 +9538,11 @@ def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
     neutral_by_gap = raw_direction == "NEUTRAL" or gap < AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP
     direction = "NEUTRAL" if neutral_by_gap else raw_direction
     above_threshold = best_score >= AUTO_SCAN_MIN_PREFILTER_CONFIDENCE
-    rubric_complete = bool(payload.get("rubric_complete"))
+    should_call_glm = bool(above_threshold and not neutral_by_gap)
 
-    # Format cũ LONG_SCORE/SHORT_SCORE vẫn được phép chạy để tránh outage khi chuyển bản.
-    # Nhưng format mini-rubric mới mà thiếu tiêu chí sẽ bị reject, không cộng thiếu thành điểm hợp lệ.
-    used_legacy_format = bool(payload.get("used_legacy_format"))
-    parse_ok = rubric_complete or used_legacy_format
-    should_call_glm = bool(parse_ok and above_threshold and not neutral_by_gap)
-
-    if not parse_ok:
-        raw_preview = str(payload.get("raw_text") or payload.get("reason") or "").replace("\n", " ").strip()
-        if len(raw_preview) > 160:
-            raw_preview = raw_preview[:160] + "..."
-        gate_reason = "Không parse được mini-rubric DeepSeek nên chưa gọi AI cuối."
-        if raw_preview:
-            gate_reason += f" Raw đầu: {raw_preview}"
-    elif neutral_by_gap:
+    if neutral_by_gap:
         gate_reason = (
-            f"Mini-rubric gần cân bằng: LONG {long_score}/100, SHORT {short_score}/100; "
+            f"Flash prefilter gần cân bằng: LONG {long_score}/100, SHORT {short_score}/100; "
             f"chênh {gap} điểm, cần tối thiểu {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm."
         )
     elif not above_threshold:
@@ -9506,88 +9553,80 @@ def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
     else:
         gate_reason = (
             f"{raw_direction} đạt {best_score}/100, hướng đối diện "
-            f"{min(long_score, short_score)}/100, chênh {gap} điểm; gọi AI cuối."
+            f"{min(long_score, short_score)}/100, chênh {gap} điểm; gọi planner."
         )
 
     return {
-        "long_score": long_score,
-        "short_score": short_score,
-        "direction": direction,
-        "raw_direction": raw_direction,
-        "best_score": best_score,
-        "gap": gap,
-        "should_call_glm": should_call_glm,
-        "reason": gate_reason,
-        "rubric_complete": rubric_complete,
-        "parse_ok": parse_ok,
-        "used_total_score_fallback": bool(payload.get("used_total_score_fallback")),
+        "long_score": long_score, "short_score": short_score,
+        "direction": direction, "raw_direction": raw_direction,
+        "best_score": best_score, "gap": gap,
+        "should_call_glm": should_call_glm, "reason": gate_reason,
+        "rubric_complete": True, "parse_ok": True,
+        "used_total_score_fallback": False,
     }
 
 
-def _deepseek_create_once(system: str | None, messages: list, timeout: int = DEEPSEEK_TIMEOUT_SECONDS, model: str | None = None, max_tokens: int | None = None, temperature: float | None = None, response_format: dict | None = None, reasoning_effort: str | None = None) -> dict:
-    if not DEEPSEEK_API_KEY:
-        raise RuntimeError("Missing DEEPSEEK_API_KEY. Set DEEPSEEK_API_KEY or OPENROUTER_API_KEY in Railway variables.")
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    if "openrouter.ai" in DEEPSEEK_BASE_URL.lower():
-        headers["X-OpenRouter-Title"] = DEEPSEEK_APP_NAME
-    payload_messages = []
-    if system:
-        payload_messages.append({"role": "system", "content": system})
-    payload_messages.extend(messages)
-    payload = {
-        "model": model or DEEPSEEK_MODEL,
-        "messages": payload_messages,
-        "max_tokens": int(max_tokens or DEEPSEEK_MAX_OUTPUT_TOKENS),
-        "temperature": DEEPSEEK_TEMPERATURE if temperature is None else float(temperature),
-    }
-    if response_format:
-        payload["response_format"] = response_format
-    if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
-    r = requests.post(f"{DEEPSEEK_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=timeout)
-    try:
-        r.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(f"DeepSeek API error: {r.status_code} - {r.text[:1000]}") from exc
-    data = r.json()
-    choice = (data.get("choices") or [{}])[0]
-    msg = choice.get("message") or {}
-    content = msg.get("content") or ""
-    if isinstance(content, list):
-        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-    reasoning_content = msg.get("reasoning_content") or msg.get("reasoning") or ""
-    if isinstance(reasoning_content, list):
-        reasoning_content = "".join(
-            part.get("text", "") if isinstance(part, dict) else str(part)
-            for part in reasoning_content
-        )
-    return {
-        "text": str(content or ""),
-        "reasoning_text": str(reasoning_content or ""),
-        "usage": data.get("usage"),
-        "stop_reason": choice.get("finish_reason"),
-    }
+def _prefilter_format_repair(raw_output: str) -> dict:
+    raw = str(raw_output or "").strip()
+    if not raw:
+        return {"long_score": None, "short_score": None, "parse_ok": False, "raw_text": ""}
+    prompt = "\n".join([
+        "Chỉ định dạng lại kết quả prefilter bên dưới. Không phân tích lại và không đổi điểm.",
+        "Trả đúng một JSON object hợp lệ, không markdown:",
+        '{"long_score": 0, "short_score": 0, "best_direction": "NEUTRAL", "verdict": "SKIP", "reason": "..."}',
+        "Nếu nội dung gốc không có đủ hai điểm, dùng null cho điểm bị thiếu.",
+        "",
+        "NỘI DUNG GỐC:",
+        raw[:10000],
+    ])
+    result = _deepseek_create_once(
+        system=None,
+        messages=[{"role": "user", "content": prompt}],
+        timeout=DEEPSEEK_TIMEOUT_SECONDS,
+        model=DEEPSEEK_MODEL,
+        max_tokens=max(1200, min(3000, DEEPSEEK_MAX_OUTPUT_TOKENS)),
+        temperature=0,
+        response_format={"type": "json_object"},
+        reasoning_effort="off",
+    )
+    repaired_raw = (result.get("text") or result.get("reasoning_text") or "").strip()
+    parsed = _parse_deepseek_prefilter_text(repaired_raw)
+    parsed["raw_text"] = repaired_raw[:2000]
+    return parsed
 
 
 def request_deepseek_prefilter(prefilter_text: str) -> dict:
-    """DeepSeek lọc sơ bộ bằng mini-rubric text, không dùng JSON contract."""
+    """Flash self-scores LONG/SHORT and returns only final totals."""
     prompt = (
         "Bạn là bộ lọc nhanh cho Teopard Auto Scan. Không bịa dữ liệu. "
         "Bạn KHÔNG chốt lệnh và KHÔNG tạo Entry/SL/TP. "
-        "Hãy chấm đủ 5 tiêu chí cho LONG và đủ 5 tiêu chí cho SHORT. "
-        "Bắt buộc trả đúng format text bên dưới, không JSON, không markdown. "
-        "BEST được phép là NEUTRAL khi hai hướng yếu hoặc gần ngang nhau.\n\n"
-        + prefilter_text
+        "Hãy tự đánh giá rubric nội bộ rồi tự cộng thành điểm LONG và SHORT cuối. "
+        "Không xuất điểm từng mục. Trả đúng JSON được yêu cầu.\n\n" + prefilter_text
     )
     retry_count = max(0, LLM_API_RETRIES)
     last_exc = None
     for retry_idx in range(retry_count + 1):
         try:
-            result = _deepseek_create_once(system=None, messages=[{"role": "user", "content": prompt}])
-            return _parse_deepseek_prefilter_text(result.get("text") or "")
+            result = _deepseek_create_once(
+                system=None,
+                messages=[{"role": "user", "content": prompt}],
+                model=DEEPSEEK_MODEL,
+                max_tokens=max(2000, DEEPSEEK_MAX_OUTPUT_TOKENS),
+                temperature=DEEPSEEK_TEMPERATURE,
+                response_format={"type": "json_object"},
+                reasoning_effort=DEEPSEEK_PREFILTER_REASONING_EFFORT,
+            )
+            raw = (result.get("text") or result.get("reasoning_text") or "").strip()
+            parsed = _parse_deepseek_prefilter_text(raw)
+            parsed["usage"] = result.get("usage")
+            parsed["stop_reason"] = result.get("stop_reason")
+            if parsed.get("parse_ok"):
+                return parsed
+            repaired = _prefilter_format_repair(raw)
+            repaired["usage"] = result.get("usage")
+            if repaired.get("parse_ok"):
+                return repaired
+            return parsed
         except Exception as exc:
             last_exc = exc
             if retry_idx >= retry_count or not _is_transient_llm_error(exc):
@@ -9600,18 +9639,10 @@ def request_deepseek_prefilter(prefilter_text: str) -> dict:
     if last_exc:
         raise last_exc
     return {
-        "long_score": 0,
-        "short_score": 0,
-        "long_breakdown": {},
-        "short_breakdown": {},
-        "rubric_complete": False,
-        "used_legacy_format": False,
-        "best_direction": "NEUTRAL",
-        "model_should_call_glm": False,
-        "best_score": 0,
-        "reason": "DeepSeek không trả được kết quả.",
+        "long_score": None, "short_score": None, "best_direction": "NEUTRAL",
+        "model_verdict": "SKIP", "reason": "Flash không trả được kết quả.",
+        "parse_ok": False, "raw_text": "",
     }
-
 
 
 def _payload_confidence(payload: dict | None) -> int | None:
@@ -9991,23 +10022,19 @@ def build_deepseek_prefilter_text(
         decision_snapshot or "LIVE SNAPSHOT: N/A",
         feature_snapshot or "OBJECTIVE SNAPSHOT: N/A",
         "",
-        "FORMAT BẮT BUỘC — 14 DÒNG:",
-        "LONG_TREND: <0-25>",
-        "LONG_STRUCTURE: <0-25>",
-        "LONG_MOMENTUM: <0-20>",
-        "LONG_CONFIRMATION: <0-15>",
-        "LONG_SETUP_ROOM: <0-15>",
-        "SHORT_TREND: <0-25>",
-        "SHORT_STRUCTURE: <0-25>",
-        "SHORT_MOMENTUM: <0-20>",
-        "SHORT_CONFIRMATION: <0-15>",
-        "SHORT_SETUP_ROOM: <0-15>",
-        "LONG_SCORE: <0-100>",
-        "SHORT_SCORE: <0-100>",
-        "BEST: LONG hoặc SHORT hoặc NEUTRAL",
-        "REASON: <một câu ngắn>",
+        "Tự đánh giá nội bộ theo rubric cho cả LONG và SHORT:",
+        "- Xu hướng khung lớn: 0-25",
+        "- Cấu trúc khung setup: 0-25",
+        "- Momentum: 0-20",
+        "- Confirmation/timing: 0-15",
+        "- Setup room và mâu thuẫn: 0-15",
+        "Tự cộng thành LONG_SCORE và SHORT_SCORE từ 0..100.",
+        "Không cần xuất điểm từng mục.",
+        "Trả đúng một JSON object hợp lệ, không markdown và không thêm nội dung khác:",
+        '{"long_score": 28, "short_score": 74, "best_direction": "SHORT", "verdict": "CALL_PLANNER", "reason": "SHORT nổi bật và dữ liệu đủ rõ để phân tích sâu."}',
+        "best_direction chỉ LONG, SHORT hoặc NEUTRAL.",
+        "verdict chỉ CALL_PLANNER hoặc SKIP.",
     ])
-
 
 def _reset_auto_scan_bias(user_id: int, symbol: str, mode: str) -> None:
     try:
